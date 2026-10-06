@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=proxy-for-ubuntu
+Name[ru]=proxy-for-ubuntu
+GenericName=System proxy router
+GenericName[ru]=Системный прокси-роутер
+Comment=Route all system traffic through a proxy server
+Comment[ru]=Маршрутизация всего системного трафика через прокси-сервер
+Exec=proxy-for-ubuntu
+Icon=proxy-for-ubuntu
+Terminal=false
+Categories=Network;
+Keywords=proxy;socks;shadowsocks;vpn;routing;network;
+StartupNotify=true
+StartupWMClass=proxy-for-ubuntu

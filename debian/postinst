@@ -1,0 +1,122 @@
+#!/bin/sh
+# postinst — создаёт пользователя, каталоги и systemd-юниты.
+#
+# Демон намеренно НЕ запускается автоматически: перехват системного трафика
+# включается пользователем осознанно, из GUI. Автостарт при загрузке —
+# отдельная настройка внутри приложения.
+set -e
+
+PFU_USER="proxy-for-ubuntu"
+PFU_GROUP="proxy-for-ubuntu"
+
+case "$1" in
+    configure)
+        # ── системный пользователь ────────────────────────────────────────
+        if ! getent group "$PFU_GROUP" >/dev/null; then
+            addgroup --system "$PFU_GROUP"
+        fi
+        if ! getent passwd "$PFU_USER" >/dev/null; then
+            adduser --system --ingroup "$PFU_GROUP" --home /nonexistent \
+                    --no-create-home --disabled-login --gecos "proxy-for-ubuntu daemon" \
+                    "$PFU_USER"
+        fi
+
+        # ── каталоги ──────────────────────────────────────────────────────
+        install -d -m 0750 -o root -g "$PFU_GROUP" /etc/proxy-for-ubuntu
+        install -d -m 0750 -o root -g "$PFU_GROUP" /etc/proxy-for-ubuntu/profiles
+        install -d -m 0750 -o root -g root      /var/lib/proxy-for-ubuntu
+        install -d -m 0750 -o root -g root      /var/lib/proxy-for-ubuntu/geo
+        install -d -m 0750 -o root -g root      /var/lib/proxy-for-ubuntu/geo/geoip
+        install -d -m 0750 -o root -g root      /var/lib/proxy-for-ubuntu/geo/geosite
+        install -d -m 0750 -o root -g root      /var/lib/proxy-for-ubuntu/rollback
+        install -d -m 0750 -o root -g adm       /var/log/proxy-for-ubuntu
+        install -d -m 0755 -o root -g root      /run/proxy-for-ubuntu
+
+        # ── конфиг по умолчанию ───────────────────────────────────────────
+        if [ ! -f /etc/proxy-for-ubuntu/config.yaml ]; then
+            if [ -f /usr/share/proxy-for-ubuntu/profiles/default.yaml ]; then
+                cp /usr/share/proxy-for-ubuntu/profiles/default.yaml \
+                   /etc/proxy-for-ubuntu/config.yaml
+            else
+                cat > /etc/proxy-for-ubuntu/config.yaml <<'YAML'
+api: 1
+log:
+  level: info
+  journal: true
+dns:
+  strategy: fake-ip
+  servers: [1.1.1.1, 8.8.8.8]
+  fallback: [9.9.9.9, 1.0.0.1]
+intercept:
+  tcp: redirect
+  udp: tproxy
+  bypass_private: true
+  loop_protect: true
+  exclude_ports: ["22"]
+outbounds:
+  - name: DIRECT
+    type: direct
+rules: []
+final: DIRECT
+YAML
+            fi
+            chown root:"$PFU_GROUP" /etc/proxy-for-ubuntu/config.yaml
+            chmod 0640 /etc/proxy-for-ubuntu/config.yaml
+        fi
+
+        # ── env-файл для секретов ─────────────────────────────────────────
+        if [ ! -f /etc/proxy-for-ubuntu/env ]; then
+            cat > /etc/proxy-for-ubuntu/env <<'ENVEOF'
+# Файл для секретов, которые не должны лежать в config.yaml открытым текстом.
+# В конфиге ссылка выглядит так:  password: "${SS_PASSWORD}"
+# Права: 0600, владелец root. Читает только демон.
+ENVEOF
+            chown root:"$PFU_GROUP" /etc/proxy-for-ubuntu/env
+            chmod 0640 /etc/proxy-for-ubuntu/env
+        fi
+
+        # ── systemd ───────────────────────────────────────────────────────
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+            systemctl enable proxy-for-ubuntud.service >/dev/null 2>&1 || true
+        fi
+
+        # ── nftables ──────────────────────────────────────────────────────
+        # Пакет не трогает системные правила пользователя, но убеждается, что
+        # модуль загружен: иначе первый же Apply упадёт с непонятной ошибкой.
+        if [ ! -e /dev/net/tun ] && [ -d /etc/modules-load.d ]; then
+            echo tun > /etc/modules-load.d/proxy-for-ubuntu.conf || true
+        fi
+
+        # ── polkit ────────────────────────────────────────────────────────
+        if [ -x /usr/lib/polkit-1/polkitd ]; then
+            if command -v update-desktop-database >/dev/null 2>&1; then
+                update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+            fi
+        fi
+
+        cat <<'MSG'
+proxy-for-ubuntu установлен.
+
+Что делать дальше:
+  1. Запустить демон:        sudo systemctl start proxy-for-ubuntud
+  2. Открыть приложение:     proxy-for-ubuntu
+  3. Добавить прокси и нажать «Применить».
+
+Демон включён в автозапуск, но перехват трафика не активируется сам —
+это делается тумблером в приложении.
+MSG
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,10 @@
+[Unit]
+Description=proxy-for-ubuntu graphical interface
+After=graphical-session.target proxy-for-ubuntud.service
+PartOf=graphical-session.target
+
+[Service]
+Type=application
+ExecStart=/usr/bin/proxy-for-ubuntu
+Restart=on-failure
+RestartSec=2

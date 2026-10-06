@@ -1,0 +1,81 @@
+name: Сообщение об ошибке
+description: Что-то не работает или работает неправильно
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо, что сообщаете. Чем больше деталей, тем быстрее разберёмся.
+
+        **Перед отправкой**: приложение умеет собирать диагностику сама.
+        `proxy-for-ubuntu → Настройки → Проверить окружение`, а полный лог —
+        `sudo pfu-cli logs` или `journalctl -u proxy-for-ubuntud`.
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия proxy-for-ubuntu
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ubuntu
+    attributes:
+      label: Версия Ubuntu
+      options: ["22.04", "24.04", "другая"]
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Версия ядра
+      description: Вывод команды `uname -r`
+      placeholder: "6.8.0-45-generic"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: proto
+    attributes:
+      label: Тип прокси
+      options: ["socks5 / socks5h", "http", "shadowsocks", "trojan", "vless", "vmess", "ssh", "несколько / группы", "не применимо"]
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что ожидалось
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Что получилось
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи
+      description: |
+        Вывод `sudo pfu-cli logs` или `journalctl -u proxy-for-ubuntud -n 200`.
+        **Проверьте, что в логах нет паролей** — выгружайте профиль с
+        включённой подменой секретов.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Конфигурация
+      description: |
+        Выгрузка профиля с заменой секретов на `***REDACTED***`:
+        «Экспорт» в разделе «Профили» с включённой подменой.
+      render: yaml

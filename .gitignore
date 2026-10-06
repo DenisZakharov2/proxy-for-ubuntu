@@ -1,0 +1,25 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node (не используется в сборке .deb, но остался от предыдущих экспериментов)
+node_modules/
+app/dist/
+app/.vite/
+
+# Сборка
+dist/
+*.deb
+*.sha256
+
+# Прочее
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Сгенерировано Tauri
+app/src-tauri/gen/schemas/
+app/src-tauri/target/

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Форматирование, clippy и тесты
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config patchelf libssl-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Форматирование
+        run: cargo fmt --all -- --check
+        working-directory: app/src-tauri
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: app/src-tauri
+
+      - name: Тесты
+        run: cargo test --all
+        working-directory: app/src-tauri
+
+  ui:
+    name: Фронтенд и упаковка
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Синтаксис app.js
+        run: node --check app/ui/app.js
+
+      - name: Сборка пакета
+        run: ./scripts/build-deb.sh --output dist --skip-tests
+
+      - name: Проверка структуры пакета
+        run: |
+          DEB=$(ls dist/*.deb | head -1)
+          dpkg-deb --info "$DEB" > /dev/null
+          for f in \
+            usr/bin/proxy-for-ubuntu \
+            usr/bin/proxy-for-ubuntud \
+            usr/bin/pfu-cli \
+            lib/systemd/system/proxy-for-ubuntud.service \
+            usr/share/applications/proxy-for-ubuntu.desktop \
+            usr/share/proxy-for-ubuntu/profiles/default.yaml ; do
+            dpkg-deb --contents "$DEB" | grep -q "$f" || { echo "нет $f в пакете"; exit 1; }
+          done
+          echo "структура пакета в порядке"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy-for-ubuntu-deb
+          path: dist/*.deb
+          retention-days: 7

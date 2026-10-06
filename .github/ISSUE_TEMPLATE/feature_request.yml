@@ -1,0 +1,36 @@
+name: Предложение
+description: Новый протокол, набор правил, перевод, доработка
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу это решает
+      description: Опишите ситуацию, а не решение. Это помогает найти вариант лучше предложенного.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Предлагаемое решение
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Область
+      options: ["Протоколы", "Правила и маршрутизация", "Интерфейс", "Geo-наборы", "Установка и пакет", "Документация", "Другое"]
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: context
+    attributes:
+      label: Дополнительно
+      options:
+        - label: Готов реализовать это сам и отправить PR
+        - label: Готов проверить работу на своей машине
+        - label: Готов помочь с тестированием

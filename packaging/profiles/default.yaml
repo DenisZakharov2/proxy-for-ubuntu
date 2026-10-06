@@ -1,0 +1,47 @@
+# Конфигурация по умолчанию.
+#
+# Здесь нет ни одного прокси — приложение работает как обычный прямой
+# маршрутизатор, пока вы не добавите outbound'ы через GUI. Так первый
+# запуск ничего не ломает: перехват включится, но пойдёт в DIRECT.
+api: 1
+
+log:
+  level: info
+  journal: true
+
+dns:
+  # fake-ip не течёт: домен известен движку, клиенту выдаётся синтетический
+  # адрес из 198.18.0.0/16. Для обычных приложений это неотличимо от
+  # настоящего, но локальный резолвер ничего не узнаёт.
+  strategy: fake-ip
+  cache_size: 4096
+  cache_ttl: 300
+  servers: [1.1.1.1, 8.8.8.8]
+  fallback: [9.9.9.9, 1.0.0.1]
+
+intercept:
+  tcp: redirect
+  udp: tproxy
+  # SSH наружу не перехватываем: иначе потеряете доступ к самой машине,
+  # если прокси ляжет.
+  exclude_ports: ["22"]
+  bypass_private: true
+  loop_protect: true
+
+tun:
+  enabled: false
+  device: pfu0
+  mtu: 9000
+
+geo:
+  auto_update: true
+  update_interval_hours: 24
+  sources: []
+
+outbounds:
+  - name: DIRECT
+    type: direct
+
+rules: []
+
+final: DIRECT

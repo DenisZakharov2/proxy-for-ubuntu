@@ -1,0 +1,32 @@
+Section: net
+Priority: optional
+Maintainer: Denis Zakharov <deniszakharov@msn.com>
+Build-Depends:
+ debhelper-compat (= 13),
+Standards-Version: 4.6.2
+Homepage: https://github.com/DenisZakharov2011/proxy-for-ubuntu
+
+Package: proxy-for-ubuntu
+Architecture: amd64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ adduser,
+ nftables,
+ iproute2,
+ openssh-client,
+Policy: net/tun optional
+Description: system-wide proxy routing with a graphical interface
+ proxy-for-ubuntu routes the whole system's TCP and UDP traffic through a
+ proxy server, using nftables to intercept packets and a Clash-like rule
+ engine to decide where each connection goes.
+ .
+ It ships its own implementations of the SOCKS5, HTTP CONNECT, Shadowsocks
+ and Trojan protocols — no external core such as sing-box or Xray is
+ required. DNS is resolved by the daemon itself, so domain names never leak
+ to the local resolver when the selected proxy takes them.
+ .
+ Applying a configuration is transactional: the daemon snapshots the current
+ system state, validates the new configuration, verifies every outbound
+ with a live connection, and rolls everything back if the system does not
+ come up healthy afterwards.

@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Версия пакета, например 0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    name: deb (${{ matrix.target }})
+    runs-on: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ubuntu-22.04, ubuntu-24.04]
+        include:
+          - target: ubuntu-22.04
+            rust: stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Определить версию
+        id: ver
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: webkit2gtk-4.1,libayatana-appindicator3-dev,librsvg2-dev,patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Собрать .deb
+        run: ./scripts/build-deb.sh --output dist --version "${{ steps.ver.outputs.version }}"
+
+      - name: Проверить пакет
+        run: |
+          DEB=$(ls dist/*.deb | head -1)
+          echo "Проверяем $DEB"
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/proxy-for-ubuntud'
+          dpkg-deb --contents "$DEB" | grep -q 'lib/systemd/system/proxy-for-ubuntud.service'
+          # Бинарники должны быть исполняемыми и без динамических зависимостей
+          # на локальные библиотеки — иначе пакет не запустится на чистой машине.
+          ldd dist/*.deb 2>/dev/null || true
+          echo "OK"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.deb.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## proxy-for-ubuntu ${{ steps.ver.outputs.version }}
+
+            Установка:
+            ```bash
+            sudo apt install ./proxy-for-ubuntu_${{ steps.ver.outputs.version }}_amd64.deb
+            ```
+
+            Протоколы `vless` и `vmess` реализованы, но не проверены против
+            живого сервера — см. таблицу в README.

@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>proxy-for-ubuntu</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- ─────────────────────────── Боковая навигация ─────────────────────── -->
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 128 128" aria-hidden="true">
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#4f7cff"/><stop offset="1" stop-color="#8b5cf6"/>
+        </linearGradient></defs>
+        <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#lg)"/>
+        <path d="M64 26 L96 38 V64 c0 20-13 32-32 40 -19-8-32-20-32-40 V38 Z"
+              fill="none" stroke="#fff" stroke-width="6" stroke-linejoin="round" opacity=".95"/>
+        <circle cx="64" cy="58" r="9" fill="#fff"/>
+        <circle cx="64" cy="58" r="16" fill="none" stroke="#fff" stroke-width="3.5" opacity=".5"/>
+        <g stroke="#fff" stroke-width="5" stroke-linecap="round" opacity=".9">
+          <path d="M40 40 L52 50"/><path d="M88 40 L76 50"/><path d="M64 30 L64 42"/>
+        </g>
+      </svg>
+      <div class="brand-text">
+        <strong>proxy-for-ubuntu</strong>
+        <span data-i18n="brand.sub">Системный прокси-роутер</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-route="overview"><span class="ico">◉</span><span data-i18n="nav.overview">Обзор</span></button>
+      <button class="nav-item" data-route="proxies"><span class="ico">⇄</span><span data-i18n="nav.proxies">Прокси</span></button>
+      <button class="nav-item" data-route="rules"><span class="ico">☰</span><span data-i18n="nav.rules">Правила</span></button>
+      <button class="nav-item" data-route="profiles"><span class="ico">▤</span><span data-i18n="nav.profiles">Профили</span></button>
+      <button class="nav-item" data-route="geo"><span class="ico">◎</span><span data-i18n="nav.geo">Geo-наборы</span></button>
+      <button class="nav-item" data-route="logs"><span class="ico">≡</span><span data-i18n="nav.logs">Журнал</span></button>
+      <button class="nav-item" data-route="settings"><span class="ico">⚙</span><span data-i18n="nav.settings">Настройки</span></button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="daemon-state" id="daemonState">
+        <span class="dot"></span><span id="daemonText">проверка…</span>
+      </div>
+      <button class="btn-ghost" id="themeToggle" aria-label="Сменить тему" title="Тема">◐</button>
+    </div>
+  </aside>
+
+  <!-- ─────────────────────────────── Содержимое ───────────────────────── -->
+  <main class="content">
+    <header class="topbar">
+      <h1 id="pageTitle" data-i18n="nav.overview">Обзор</h1>
+      <div class="topbar-right">
+        <div class="traffic" id="trafficChip" hidden>
+          <span class="up">↑ <b id="chipUp">0 Б</b></span>
+          <span class="down">↓ <b id="chipDown">0 Б</b></span>
+        </div>
+        <button class="btn-primary" id="applyBtn" data-i18n="action.apply">Применить</button>
+      </div>
+    </header>
+
+    <div class="pages">
+      <!-- ─────────────────────────── Обзор ──────────────────────────── -->
+      <section class="page active" id="page-overview">
+        <div class="hero" id="hero">
+          <div class="hero-main">
+            <div class="hero-status">
+              <span class="status-dot" id="statusDot"></span>
+              <div>
+                <h2 id="statusTitle" data-i18n="status.disconnected">Не подключено</h2>
+                <p id="statusSub" data-i18n="status.disconnected.sub">Трафик идёт напрямую</p>
+              </div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="powerToggle" />
+              <span class="slider"><span class="knob"></span></span>
+              <span class="sr-only" data-i18n="action.toggle">Переключить</span>
+            </label>
+          </div>
+          <div class="hero-charts">
+            <div class="donut-card">
+              <div class="donut" id="donut">
+                <div class="donut-center">
+                  <b id="donutTotal">0 Б</b>
+                  <span data-i18n="chart.total">всего</span>
+                </div>
+              </div>
+              <div class="donut-legend" id="donutLegend"></div>
+            </div>
+            <div class="stat-cards">
+              <div class="stat"><span data-i18n="stat.up">Отправлено</span><b id="statUp">0 Б</b></div>
+              <div class="stat"><span data-i18n="stat.down">Получено</span><b id="statDown">0 Б</b></div>
+              <div class="stat"><span data-i18n="stat.conns">Соединений</span><b id="statConns">0</b></div>
+              <div class="stat"><span data-i18n="stat.rules">Активных правил</span><b id="statRules">0</b></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3 data-i18n="rules.active">Куда уходит трафик</h3>
+            <span class="muted" id="rulesHint"></span>
+          </div>
+          <div class="table-wrap"><table class="table" id="rulesTraffic"></table></div>
+        </div>
+
+        <div class="card" id="quickActions">
+          <div class="card-head"><h3 data-i18n="quick.title">Быстрые действия</h3></div>
+          <div class="actions">
+            <button class="btn-ghost" data-goto="proxies" data-i18n="quick.addProxy">Добавить прокси</button>
+            <button class="btn-ghost" data-goto="rules" data-i18n="quick.addRule">Добавить правило</button>
+            <button class="btn-ghost" data-goto="settings" data-i18n="quick.doctor">Проверить окружение</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Прокси ──────────────────────────── -->
+      <section class="page" id="page-proxies">
+        <div class="card">
+          <div class="card-head">
+            <h3 data-i18n="proxies.title">Прокси-серверы</h3>
+            <div class="card-actions">
+              <button class="btn-ghost" id="testAll" data-i18n="proxies.testAll">Проверить все</button>
+              <button class="btn-primary" id="addProxy" data-i18n="proxies.add">Добавить</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table class="table" id="proxiesTable"></table></div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Правила ─────────────────────────── -->
+      <section class="page" id="page-rules">
+        <div class="card">
+          <div class="card-head">
+            <h3 data-i18n="rules.title">Правила маршрутизации</h3>
+            <div class="card-actions">
+              <button class="btn-ghost" id="validateRules" data-i18n="rules.validate">Проверить конфиг</button>
+              <button class="btn-primary" id="addRule" data-i18n="rules.add">Добавить правило</button>
+            </div>
+          </div>
+          <p class="hint" data-i18n="rules.hint">Первое совпавшее правило решает. Порядок важен.</p>
+          <div class="table-wrap"><table class="table" id="rulesTable"></table></div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Профили ────────────────────────── -->
+      <section class="page" id="page-profiles">
+        <div class="card">
+          <div class="card-head">
+            <h3 data-i18n="profiles.title">Профили конфигурации</h3>
+            <div class="card-actions">
+              <button class="btn-ghost" id="importProfile" data-i18n="profiles.import">Импорт</button>
+              <button class="btn-primary" id="exportProfile" data-i18n="profiles.export">Экспорт</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table class="table" id="profilesTable"></table></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3 data-i18n="subs.title">Подписки</h3></div>
+          <div class="form-grid">
+            <label><span data-i18n="subs.name">Название</span><input id="subName" type="text" placeholder="Мой конфиг" /></label>
+            <label class="grow"><span data-i18n="subs.url">URL</span><input id="subUrl" type="url" placeholder="https://…" /></label>
+            <button class="btn-primary" id="subUpdate" data-i18n="subs.update">Обновить подписку</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Geo ────────────────────────────── -->
+      <section class="page" id="page-geo">
+        <div class="card">
+          <div class="card-head">
+            <h3 data-i18n="geo.title">Geo-наборы</h3>
+            <button class="btn-primary" id="geoUpdate" data-i18n="geo.update">Обновить</button>
+          </div>
+          <p class="hint" data-i18n="geo.hint">Текстовые списки доменов и CIDR. Хранятся в /var/lib/proxy-for-ubuntu/geo.</p>
+          <div class="table-wrap"><table class="table" id="geoTable"></table></div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Журнал ─────────────────────────── -->
+      <section class="page" id="page-logs">
+        <div class="card">
+          <div class="card-head">
+            <h3 data-i18n="logs.title">Журнал</h3>
+            <div class="card-actions">
+              <select id="logLevel">
+                <option value="">все</option>
+                <option value="info">info</option>
+                <option value="warn">warn</option>
+                <option value="error">error</option>
+              </select>
+              <button class="btn-ghost" id="refreshLogs" data-i18n="logs.refresh">Обновить</button>
+              <button class="btn-ghost" id="exportLogs" data-i18n="logs.export">Экспорт</button>
+              <button class="btn-danger" id="rollback" data-i18n="logs.rollback">Откатить конфиг</button>
+            </div>
+          </div>
+          <pre class="log" id="logView"></pre>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Настройки ───────────────────────── -->
+      <section class="page" id="page-settings">
+        <div class="card">
+          <div class="card-head"><h3 data-i18n="set.diagnose">Проверка окружения</h3>
+            <button class="btn-ghost" id="runDoctor" data-i18n="set.run">Запустить</button>
+          </div>
+          <div id="doctorView"><p class="muted" data-i18n="set.diagnose.hint">Проверит nftables, TUN, права и занятые порты.</p></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3 data-i18n="set.interface">Интерфейс</h3></div>
+          <div class="form-grid">
+            <label><span data-i18n="set.lang">Язык</span>
+              <select id="langSelect"><option value="ru">Русский</option><option value="en">English</option></select></label>
+            <label><span data-i18n="set.theme">Тема</span>
+              <select id="themeSelect">
+                <option value="dark">Тёмная</option><option value="light">Светлая</option><option value="auto">Системная</option>
+              </select></label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3 data-i18n="set.advanced">Параметры перехвата</h3></div>
+          <div class="form-grid">
+            <label><span>TCP</span>
+              <select id="tcpMode"><option value="redirect">redirect</option><option value="tproxy">tproxy</option><option value="off">выключен</option></select></label>
+            <label><span>UDP</span>
+              <select id="udpMode"><option value="tproxy">tproxy</option><option value="off">выключен</option></select></label>
+            <label><span>DNS</span>
+              <select id="dnsStrategy"><option value="fake-ip">fake-ip</option><option value="redir-host">redir-host</option></select></label>
+          </div>
+          <p class="hint" data-i18n="set.intercept.hint">fake-ip не допускает утечки DNS, но ломает ping и часть GeoIP-правил. tproxy нужен для QUIC и игр.</p>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<!-- ───────────────────────────── Модальные окна ──────────────────────────── -->
+<div class="modal-backdrop" id="modalBackdrop" hidden>
+  <div class="modal" id="modal" role="dialog" aria-modal="true">
+    <div class="modal-head"><h3 id="modalTitle"></h3><button class="btn-ghost" id="modalClose" aria-label="Закрыть">✕</button></div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,145 @@
+# Пример конфигурации со всеми типами прокси и разными правилами.
+# Скопируйте его в GUI («Профили → Импорт») и подставьте свои адреса.
+api: 1
+
+log:
+  level: info
+  journal: true
+
+dns:
+  strategy: fake-ip
+  servers: [1.1.1.1, 8.8.8.8]
+  fallback: [9.9.9.9]
+
+intercept:
+  tcp: redirect
+  udp: tproxy
+  exclude_ports: ["22"]
+  bypass_private: true
+  loop_protect: true
+
+geo:
+  auto_update: true
+  update_interval_hours: 24
+  sources:
+    - kind: geosite
+      tag: category-ads-all
+      url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling-adult/hosts"
+    - kind: geoip
+      tag: private
+      url: "https://raw.githubusercontent.com/andrewzhurov/proxy-list/main/private-ips.txt"
+
+outbounds:
+  - name: DIRECT
+    type: direct
+
+  - name: Мой SOCKS5
+    type: socks5h          # h = домен резолвит прокси, DNS не течёт
+    server: 1.2.3.4
+    port: 1080
+    username: ""
+    password: ""
+    udp: true
+
+  - name: Мой Shadowsocks
+    type: shadowsocks
+    server: 5.6.7.8
+    port: 8388
+    method: chacha20-ietf-poly1305
+    password: "${SS_PASSWORD}"    # берётся из /etc/proxy-for-ubuntu/env
+    udp: true
+
+  - name: Мой Trojan
+    type: trojan
+    server: trojan.example
+    port: 443
+    password: "${TROJAN_PASSWORD}"
+    sni: trojan.example
+    alpn: [h2, http/1.1]
+    skip_cert_verify: false
+    udp: true
+
+  - name: Мой HTTP
+    type: http
+    server: proxy.example
+    port: 8080
+    username: user
+    password: "${HTTP_PASSWORD}"
+
+  # ⚠ VLESS и VMess реализованы, но не проверены против живого сервера.
+  # Пользуйтесь на свой страх и риск, GUI помечает их значком ⚠.
+  - name: Мой VLESS
+    type: vless
+    server: vless.example
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    network: tcp
+    tls: true
+    sni: vless.example
+    udp: true
+
+  - name: Мой VMess
+    type: vmess
+    server: vmess.example
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    alter_id: 0
+    security: auto
+    network: ws
+    tls: true
+    sni: vmess.example
+    path: /vmess
+    udp: true
+
+  - name: Через SSH
+    type: ssh
+    server: jump.example
+    port: 22
+    username: tunnel
+    key_file: "~/.ssh/id_ed25519"
+    keepalive: 30
+
+groups:
+  - name: Основной
+    type: select
+    outbounds: [Мой SOCKS5, Мой Shadowsocks, Мой Trojan, DIRECT]
+
+  - name: Авто-выбор
+    type: url-test
+    outbounds: [Мой SOCKS5, Мой Shadowsocks, Мой Trojan]
+    interval_sec: 300
+    url: https://www.gstatic.com/generate_204
+
+  - name: Распределённо
+    type: load-balance
+    outbounds: [Мой SOCKS5, Мой Shadowsocks]
+
+rules:
+  # Порядок важен: первое совпадение выигрывает.
+
+  # 1. Реклама — режем на входе.
+  - GEOSITE,category-ads-all,REJECT
+  - DOMAIN-SUFFIX,doubleclick.net,REJECT
+  - DOMAIN-KEYWORD,adservice,REJECT
+
+  # 2. Служебные адреса и локальная сеть — напрямую.
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+
+  # 3. Явные исключения: то, что не должно идти через прокси.
+  - DOMAIN-SUFFIX,githubusercontent.com,DIRECT
+  - DOMAIN-SUFFIX,mail.ru,DIRECT
+  - PROCESS-NAME,ssh,DIRECT
+  - PROCESS-NAME,systemd-resolved,DIRECT
+
+  # 4. Внутренние и банковские сайты — напрямую.
+  - DOMAIN-SUFFIX,sberbank.ru,DIRECT
+  - DOMAIN-KEYWORD,gosuslugi,DIRECT
+
+  # 5. Всё остальное — через основной прокси.
+  - MATCH,Основной
+
+final: DIRECT

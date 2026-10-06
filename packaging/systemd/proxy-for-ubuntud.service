@@ -1,0 +1,30 @@
+[Unit]
+Description=proxy-for-ubuntu routing daemon
+Documentation=man:proxy-for-ubuntu(8)
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=proxy-for-ubuntu
+ExecStartPre=/usr/bin/proxy-for-ubuntud --check
+ExecStart=/usr/bin/proxy-for-ubuntud --daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+
+# Демон управляет сетевым стеком, поэтому NeedsCapabilities. Остальные
+# Capabilities у него нет: никаких файловых или процессных операций.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_SYS_RESOURCE
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/proxy-for-ubuntu /var/log/proxy-for-ubuntu /run/proxy-for-ubuntu /etc/proxy-for-ubuntu
+RuntimeDirectory=proxy-for-ubuntu
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

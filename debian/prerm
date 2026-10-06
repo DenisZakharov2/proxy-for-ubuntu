@@ -1,0 +1,33 @@
+#!/bin/sh
+# prerm — снимает перехват трафика ДО удаления пакета.
+#
+# Это критично: если оставить правила nftables и маршрут в таблице 100, то
+# после удаления пакета машина останется без интернета, потому что трафик
+# продолжит уходить в сокет, которого больше никто не слушает.
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -x /usr/sbin/nft ]; then
+            nft delete table inet pfu 2>/dev/null || true
+        fi
+        ip rule del fwmark 0x1 lookup 100 priority 100 2>/dev/null || true
+        ip route flush table 100 2>/dev/null || true
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop proxy-for-ubuntud.service >/dev/null 2>&1 || true
+            systemctl disable proxy-for-ubuntud.service >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

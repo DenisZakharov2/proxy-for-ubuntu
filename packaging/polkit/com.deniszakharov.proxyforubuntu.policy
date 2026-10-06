@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>proxy-for-ubuntu</vendor>
+  <vendor_url>https://github.com/DenisZakharov2011/proxy-for-ubuntu</vendor_url>
+
+  <action id="com.deniszakharov.proxyforubuntu.apply">
+    <description>Apply system routing rules</description>
+    <description_xml><p>Apply the proxy configuration to the whole system</p></description_xml>
+    <message>Authentication is required to change system-wide network routing</message>
+    <message_xml><p>Changing system routing requires administrator privileges</p></message_xml>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.deniszakharov.proxyforubuntu.rollback">
+    <description>Roll back system routing rules</description>
+    <message>Authentication is required to restore previous network routing</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.deniszakharov.proxyforubuntu.status">
+    <description>Read proxy status and traffic statistics</description>
+    <defaults>
+      <allow_any>yes</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

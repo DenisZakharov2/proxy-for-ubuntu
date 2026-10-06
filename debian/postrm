@@ -1,0 +1,28 @@
+#!/bin/sh
+# postrm — уборка после удаления. Конфиг и данные НЕ трогаются: если человек
+# случайно снёс пакет, его профили и geo-наборы должны остаться на месте.
+set -e
+
+case "$1" in
+    purge)
+        rm -f  /etc/proxy-for-ubuntu/config.yaml
+        rm -f  /etc/proxy-for-ubuntu/env
+        rm -rf /etc/proxy-for-ubuntu/profiles
+        rm -rf /var/lib/proxy-for-ubuntu
+        rm -rf /var/log/proxy-for-ubuntu
+        rm -f  /etc/modules-load.d/proxy-for-ubuntu.conf
+        if getent passwd proxy-for-ubuntu >/dev/null 2>&1; then
+            deluser --system proxy-for-ubuntu >/dev/null 2>&1 || true
+        fi
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+        fi
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        rm -rf /run/proxy-for-ubuntu
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
