@@ -5,7 +5,7 @@
 <policyconfig>
 
   <vendor>proxy-for-ubuntu</vendor>
-  <vendor_url>https://github.com/DenisZakharov2011/proxy-for-ubuntu</vendor_url>
+  <vendor_url>https://github.com/DenisZakharov2/proxy-for-ubuntu</vendor_url>
 
   <action id="com.deniszakharov.proxyforubuntu.apply">
     <description>Apply system routing rules</description>

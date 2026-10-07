@@ -211,7 +211,7 @@ Full checklist: [docs/TESTING.md](docs/TESTING.md).
 ```bash
 sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev \
      libayatana-appindicator3-dev librsvg2-dev nftables
-git clone https://github.com/DenisZakharov2011/proxy-for-ubuntu
+git clone https://github.com/DenisZakharov2/proxy-for-ubuntu
 cd proxy-for-ubuntu
 ./scripts/build-deb.sh --output dist
 sudo apt install ./dist/proxy-for-ubuntu_0.1.0_amd64.deb

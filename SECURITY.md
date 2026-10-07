@@ -13,7 +13,7 @@
 
 **Не открывайте публичный issue.** Используйте GitHub Security Advisories:
 
-    https://github.com/DenisZakharov2011/proxy-for-ubuntu/security/advisories/new
+    https://github.com/DenisZakharov2/proxy-for-ubuntu/security/advisories/new
 
 Также можно написать напрямую: deniszakharov@msn.com
 

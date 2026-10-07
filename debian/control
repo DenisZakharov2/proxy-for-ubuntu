@@ -4,7 +4,7 @@ Maintainer: Denis Zakharov <deniszakharov@msn.com>
 Build-Depends:
  debhelper-compat (= 13),
 Standards-Version: 4.6.2
-Homepage: https://github.com/DenisZakharov2011/proxy-for-ubuntu
+Homepage: https://github.com/DenisZakharov2/proxy-for-ubuntu
 
 Package: proxy-for-ubuntu
 Architecture: amd64

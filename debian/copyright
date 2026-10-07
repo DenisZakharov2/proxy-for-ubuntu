@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: proxy-for-ubuntu
-Source: https://github.com/DenisZakharov2011/proxy-for-ubuntu
+Source: https://github.com/DenisZakharov2/proxy-for-ubuntu
 
 Files: *
 Copyright: 2026 Denis Zakharov <deniszakharov@msn.com>

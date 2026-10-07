@@ -147,7 +147,7 @@ Maintainer: Denis Zakharov <deniszakharov@msn.com>
 Installed-Size: $(du -ks "$STAGE" | cut -f1)
 Depends: libc6, adduser, nftables, iproute2, openssh-client
 Recommends: policykit-1
-Homepage: https://github.com/DenisZakharov2011/proxy-for-ubuntu
+Homepage: https://github.com/DenisZakharov2/proxy-for-ubuntu
 Description: system-wide proxy routing with a graphical interface
  proxy-for-ubuntu routes the whole system's TCP and UDP traffic through a
  proxy server, using nftables to intercept packets and a Clash-like rule
