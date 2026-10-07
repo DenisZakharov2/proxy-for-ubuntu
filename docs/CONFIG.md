@@ -5,7 +5,7 @@
 импортируются один в один: конвертер `pfu-cli convert clash.yaml` переносит
 `proxies` → `outbounds` и `proxy-groups` → `groups`.
 
-Полный пример — [`/usr/share/proxy-for-ubuntu/profiles/example.yaml`](../../app/src-tauri/profiles/example.yaml).
+Полный пример — [`/usr/share/proxy-for-ubuntu/profiles/example.yaml`](../packaging/profiles/example.yaml).
 
 ## Верхний уровень
 

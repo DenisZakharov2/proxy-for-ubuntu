@@ -46,7 +46,10 @@ const I18N = {
     'set.diagnose.hint': 'Проверит nftables, TUN, права и занятые порты.',
     'set.intercept.hint': 'fake-ip не допускает утечки DNS, но ломает ping и часть GeoIP-правил. tproxy нужен для QUIC и игр.',
     'err.daemon': 'Демон недоступен', 'err.daemon.hint': 'sudo systemctl start proxy-for-ubuntud',
-    'err.generic': 'Что-то пошло не так', 'err.noProxies': 'Прокси ещё не настроены',
+    'err.generic': 'Что-то пошло не так',
+    'err.untouched': 'Системные правила не менялись — откатывать было нечего.',
+    'err.rolledBack': 'Системные правила и конфигурация возвращены в прежнее состояние.',
+    'err.rollbackFailed': 'Откат не удался: проверьте правила вручную (sudo nft list table inet pfu).', 'err.noProxies': 'Прокси ещё не настроены',
     'err.noProxies.hint': 'Добавьте хотя бы один прокси — иначе весь трафик пойдёт напрямую.',
     'empty.rules': 'Правил нет', 'empty.rules.hint': 'Весь трафик идёт по правилу final',
     'empty.profiles': 'Профилей нет',
@@ -92,7 +95,10 @@ const I18N = {
     'set.diagnose.hint': 'Checks nftables, TUN, privileges and busy ports.',
     'set.intercept.hint': 'fake-ip prevents DNS leaks but breaks ping and some GeoIP rules. tproxy is required for QUIC and games.',
     'err.daemon': 'Daemon unavailable', 'err.daemon.hint': 'sudo systemctl start proxy-for-ubuntud',
-    'err.generic': 'Something went wrong', 'err.noProxies': 'No proxies configured yet',
+    'err.generic': 'Something went wrong',
+    'err.untouched': 'System rules were never changed — there was nothing to roll back.',
+    'err.rolledBack': 'System rules and configuration were restored to their previous state.',
+    'err.rollbackFailed': 'Rollback failed: check the rules manually (sudo nft list table inet pfu).', 'err.noProxies': 'No proxies configured yet',
     'err.noProxies.hint': 'Add at least one proxy, otherwise all traffic goes out directly.',
     'empty.rules': 'No rules', 'empty.rules.hint': 'All traffic follows the final rule',
     'empty.profiles': 'No profiles',
@@ -717,9 +723,20 @@ async function doApply() {
       toast(t('rules.applied'), (r.warnings || []).map(esc).join('<br>'), (r.warnings || []).length ? 'warn' : 'ok');
       await loadConfig();
     } else {
+      // Три разных исхода, и путать их нельзя: на validate/probe система
+      // не тронута, на commit+health-check откат выполняется, а если
+      // откат не сработал — это совсем другая история и ручное вмешательство.
+      let note;
+      if (!r.system_touched) {
+        note = t('err.untouched');
+      } else if (r.rolled_back) {
+        note = t('err.rolledBack');
+      } else {
+        note = t('err.rollbackFailed');
+      }
       toast(t('rules.rolled'), `<b>${esc(r.stage || '')}</b><br>${esc(r.message || '')}` +
         (r.errors || []).map(e => `<br>· ${esc(e)}`).join('') +
-        (r.rolled_back ? `<br><br>${esc(t('logs.rollback'))}` : ''), 'err');
+        `<br><br>${esc(note)}`, 'err');
     }
     renderOverview();
   } catch (e) {

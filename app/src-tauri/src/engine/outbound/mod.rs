@@ -39,7 +39,13 @@ pub struct Request {
 
 impl Request {
     pub fn tcp(host: impl Into<String>, port: u16) -> Self {
-        Self { target: Target { host: host.into(), port, is_tcp: true } }
+        Self {
+            target: Target {
+                host: host.into(),
+                port,
+                is_tcp: true,
+            },
+        }
     }
 }
 
@@ -126,7 +132,10 @@ pub async fn connect_proxy(server: std::net::SocketAddr, timeout: Duration) -> R
             proto: "connect",
             message: format!("не удалось подключиться к {server}: {e}"),
         }),
-        Err(_) => Err(Error::Timeout(format!("сервер прокси {server} не ответил за {}", humantime(timeout)))),
+        Err(_) => Err(Error::Timeout(format!(
+            "сервер прокси {server} не ответил за {}",
+            humantime(timeout)
+        ))),
     }
 }
 
@@ -160,7 +169,10 @@ pub fn socks_addr_bytes(host: &str, port: u16) -> Result<Vec<u8>> {
         }
         Err(_) => {
             if host.len() > 255 {
-                return Err(Error::protocol("socks", format!("домен {host:?} длиннее 255 байт")));
+                return Err(Error::protocol(
+                    "socks",
+                    format!("домен {host:?} длиннее 255 байт"),
+                ));
             }
             out.push(0x03);
             out.push(host.len() as u8);
@@ -173,7 +185,7 @@ pub fn socks_addr_bytes(host: &str, port: u16) -> Result<Vec<u8>> {
 
 /// Разбор адреса из ответа SOCKS5-сервера.
 pub fn parse_socks_addr(buf: &[u8]) -> Result<(String, u16)> {
-    if buf.len() < 1 {
+    if buf.is_empty() {
         return Err(Error::protocol("socks", "пустой ответ"));
     }
     let host = match buf[0] {
@@ -192,14 +204,20 @@ pub fn parse_socks_addr(buf: &[u8]) -> Result<(String, u16)> {
             std::net::Ipv6Addr::from(o).to_string()
         }
         0x03 => {
-            let len = *buf.get(1).ok_or_else(|| Error::protocol("socks", "нет длины домена"))? as usize;
+            let len = *buf
+                .get(1)
+                .ok_or_else(|| Error::protocol("socks", "нет длины домена"))?
+                as usize;
             if buf.len() < 2 + len {
                 return Err(Error::protocol("socks", "обрезанный домен в ответе"));
             }
             String::from_utf8_lossy(&buf[2..2 + len]).to_string()
         }
         other => {
-            return Err(Error::protocol("socks", format!("неизвестный тип адреса {other:#x}")))
+            return Err(Error::protocol(
+                "socks",
+                format!("неизвестный тип адреса {other:#x}"),
+            ))
         }
     };
     if buf.len() < 2 + host_port_len(buf) {
@@ -243,7 +261,9 @@ pub fn describe(cfg: &OutboundConfig) -> String {
             o.server,
             o.port
         ),
-        OutboundConfig::Shadowsocks(o) => format!("Shadowsocks ({}) {}:{}", o.method, o.server, o.port),
+        OutboundConfig::Shadowsocks(o) => {
+            format!("Shadowsocks ({}) {}:{}", o.method, o.server, o.port)
+        }
         OutboundConfig::Trojan(o) => format!("Trojan {}:{} sni={}", o.server, o.port, o.sni),
         OutboundConfig::Vless(o) => format!("VLESS {}:{} tls={}", o.server, o.port, o.tls),
         OutboundConfig::Vmess(o) => format!("VMess {}:{} alterId={}", o.server, o.port, o.alter_id),
@@ -290,7 +310,11 @@ mod tests {
 
     #[test]
     fn roundtrip_parse_addr() {
-        for (host, port) in [("1.2.3.4", 443u16), ("2001:db8::1", 80), ("example.com", 8080)] {
+        for (host, port) in [
+            ("1.2.3.4", 443u16),
+            ("2001:db8::1", 80),
+            ("example.com", 8080),
+        ] {
             let b = socks_addr_bytes(host, port).unwrap();
             let (h, p) = parse_socks_addr(&b).unwrap();
             assert_eq!(h, host);

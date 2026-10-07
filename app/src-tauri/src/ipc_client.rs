@@ -22,9 +22,9 @@ pub async fn call(method: &str, params: Value) -> Result<Value> {
         )));
     }
 
-    let stream = tokio::net::UnixStream::connect(&path)
-        .await
-        .map_err(|e| Error::NoDaemon(format!("не удалось подключиться к {}: {e}", path.display())))?;
+    let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
+        Error::NoDaemon(format!("не удалось подключиться к {}: {e}", path.display()))
+    })?;
 
     let (read, mut write) = stream.into_split();
     let request = serde_json::json!({ "method": method, "params": params });
@@ -41,7 +41,11 @@ pub async fn call(method: &str, params: Value) -> Result<Value> {
         .ok_or_else(|| Error::NoDaemon("демон закрыл соединение без ответа".into()))?;
 
     let resp: Value = serde_json::from_str(&line)?;
-    if resp.get("api").and_then(Value::as_u64).is_some_and(|v| v > crate::API_VERSION as u64) {
+    if resp
+        .get("api")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v > crate::API_VERSION as u64)
+    {
         tracing::warn!("демон новее GUI: обновите пакет");
     }
     if resp.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -54,13 +58,20 @@ pub async fn call(method: &str, params: Value) -> Result<Value> {
 /// подсказку и код этапа, а не голый текст.
 fn decode_error(resp: &Value) -> Error {
     let e = resp.get("error").cloned().unwrap_or(Value::Null);
-    let code = e.get("code").and_then(Value::as_str).unwrap_or("E_INTERNAL");
+    let code = e
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("E_INTERNAL");
     let msg = e
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("неизвестная ошибка демона")
         .to_string();
-    let hint = e.get("hint").and_then(Value::as_str).unwrap_or("").to_string();
+    let hint = e
+        .get("hint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     let base = match code {
         "E_NO_DAEMON" => Error::NoDaemon(msg),
@@ -108,7 +119,8 @@ mod tests {
 
     #[test]
     fn unknown_code_degrades_to_internal() {
-        let resp = serde_json::json!({ "ok": false, "error": { "code": "E_WHAT", "message": "?" } });
+        let resp =
+            serde_json::json!({ "ok": false, "error": { "code": "E_WHAT", "message": "?" } });
         assert!(matches!(decode_error(&resp), Error::Internal(_)));
     }
 

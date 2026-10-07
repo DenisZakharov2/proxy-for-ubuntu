@@ -32,6 +32,13 @@ pub struct ApplyReport {
     pub stage: String,
     pub message: String,
     pub rolled_back: bool,
+    /// Были ли вообще изменены системные правила.
+    ///
+    /// Это не то же, что `rolled_back`. На этапах `validate` и `probe`
+    /// система не тронута — откатывать нечего, и `rolled_back` будет `false`.
+    /// GUI обязан различать эти случаи: говорить «система возвращена в
+    /// прежнее состояние» там, где ничего не менялось, — враньё.
+    pub system_touched: bool,
     pub backup: Option<String>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
@@ -84,24 +91,39 @@ impl Supervisor {
 
     /// Список сохранённых точек отката, свежие первыми.
     pub fn rollback_points(&self) -> Vec<RollbackPoint> {
-        let Ok(rd) = std::fs::read_dir(paths::rollback_dir()) else { return Vec::new() };
+        let Ok(rd) = std::fs::read_dir(paths::rollback_dir()) else {
+            return Vec::new();
+        };
         let mut v: Vec<RollbackPoint> = rd
             .flatten()
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml"))
-            .filter_map(|e| {
-                let id = e.file_name().to_string_lossy().trim_end_matches(".yaml").to_string();
-                let reason = std::fs::read_to_string(paths::rollback_dir().join(format!("{id}.reason")))
-                    .unwrap_or_default();
-                let created_at = std::fs::metadata(&e.path())
+            // `flatten()` выше уже отсекает ошибки чтения каталога,
+            // а `filter` — всё, кроме .yaml, поэтому дальше `map`,
+            // а не `filter_map`.
+            .map(|e| {
+                let id = e
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".yaml")
+                    .to_string();
+                let reason =
+                    std::fs::read_to_string(paths::rollback_dir().join(format!("{id}.reason")))
+                        .unwrap_or_default();
+                let created_at = std::fs::metadata(e.path())
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                Some(RollbackPoint { id, created_at, config_path: e.path().display().to_string(), reason })
+                RollbackPoint {
+                    id,
+                    created_at,
+                    config_path: e.path().display().to_string(),
+                    reason,
+                }
             })
             .collect();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.sort_by_key(|p| std::cmp::Reverse(p.created_at));
         v
     }
 
@@ -120,6 +142,7 @@ impl Supervisor {
                     stage: "validate".into(),
                     message: format!("не удалось создать точку отката: {e}"),
                     rolled_back: false,
+                    system_touched: false,
                     backup: None,
                     errors: vec![e.to_string()],
                     warnings,
@@ -135,6 +158,7 @@ impl Supervisor {
                 stage: "validate".into(),
                 message: e.to_string(),
                 rolled_back: false,
+                system_touched: false,
                 backup,
                 errors: vec![e.to_string()],
                 warnings,
@@ -152,6 +176,7 @@ impl Supervisor {
                     stage: "validate".into(),
                     message: e.to_string(),
                     rolled_back: false,
+                    system_touched: false,
                     backup,
                     errors: vec![e.to_string()],
                     warnings,
@@ -181,6 +206,7 @@ impl Supervisor {
                 stage: "probe".into(),
                 message: "проверка соединения не пройдена".into(),
                 rolled_back: false,
+                system_touched: false,
                 backup,
                 errors,
                 warnings,
@@ -188,10 +214,16 @@ impl Supervisor {
         }
 
         for (raw, policy) in describe_rules(&config) {
-            if config.find_outbound(&policy).is_none() && config.find_group(&policy).is_none()
-                && !matches!(policy.as_str(), "DIRECT" | "REJECT" | "REJECT-DROP" | "HIJACK-DNS")
+            if config.find_outbound(&policy).is_none()
+                && config.find_group(&policy).is_none()
+                && !matches!(
+                    policy.as_str(),
+                    "DIRECT" | "REJECT" | "REJECT-DROP" | "HIJACK-DNS"
+                )
             {
-                warnings.push(format!("правило {raw} ссылается на неизвестный outbound {policy}"));
+                warnings.push(format!(
+                    "правило {raw} ссылается на неизвестный outbound {policy}"
+                ));
             }
         }
 
@@ -204,6 +236,7 @@ impl Supervisor {
                     stage: "commit".into(),
                     message: format!("не удалось сериализовать конфиг: {e}"),
                     rolled_back: false,
+                    system_touched: false,
                     backup,
                     errors: vec![e.to_string()],
                     warnings,
@@ -216,6 +249,7 @@ impl Supervisor {
                 stage: "commit".into(),
                 message: e.to_string(),
                 rolled_back: false,
+                system_touched: false,
                 backup,
                 errors: vec![e.to_string()],
                 warnings,
@@ -236,9 +270,13 @@ impl Supervisor {
                 message: if restored {
                     e.to_string()
                 } else {
-                    format!("{e}\n  не удалось вернуть прежний конфиг: {}", point.config_path)
+                    format!(
+                        "{e}\n  не удалось вернуть прежний конфиг: {}",
+                        point.config_path
+                    )
                 },
                 rolled_back: rb,
+                system_touched: true,
                 backup,
                 errors,
                 warnings,
@@ -256,6 +294,7 @@ impl Supervisor {
                 stage: "health-check".into(),
                 message: format!("после применения система не отвечает как ожидается: {e}"),
                 rolled_back: rb,
+                system_touched: true,
                 backup,
                 errors,
                 warnings,
@@ -267,6 +306,7 @@ impl Supervisor {
             stage: "done".into(),
             message: "применено".into(),
             rolled_back: false,
+            system_touched: false,
             backup,
             errors,
             warnings,
@@ -277,7 +317,7 @@ impl Supervisor {
     pub fn write_config(&self, yaml: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         paths::atomic_write(&paths::config_path(), yaml.as_bytes())?;
-        std::fs::set_permissions(&paths::config_path(), std::fs::Permissions::from_mode(0o640))?;
+        std::fs::set_permissions(paths::config_path(), std::fs::Permissions::from_mode(0o640))?;
         Ok(())
     }
 
@@ -313,7 +353,8 @@ impl Supervisor {
     /// и открывается ли соединение.
     async fn health_check(&self, engine: &Arc<Engine>) -> Result<()> {
         let resolver = crate::engine::dns::Resolver::new(engine.config.dns.clone())?;
-        match tokio::time::timeout(Duration::from_secs(5), resolver.resolve("cloudflare.com")).await {
+        match tokio::time::timeout(Duration::from_secs(5), resolver.resolve("cloudflare.com")).await
+        {
             Ok(Ok(addrs)) if !addrs.is_empty() => {}
             Ok(Ok(_)) => return Err(Error::Internal("DNS вернул пустой ответ".into())),
             Ok(Err(e)) => return Err(e),
@@ -327,10 +368,17 @@ impl Supervisor {
             domain_confident: true,
             ..Default::default()
         };
-        let target = crate::engine::rules::Target { host: "cloudflare.com".into(), port: 443, is_tcp: true };
-        tokio::time::timeout(crate::engine::router::CONNECT_TIMEOUT, engine.open(&target, &flow))
-            .await
-            .map_err(|_| Error::Timeout("проверочное соединение не установилось".into()))??;
+        let target = crate::engine::rules::Target {
+            host: "cloudflare.com".into(),
+            port: 443,
+            is_tcp: true,
+        };
+        tokio::time::timeout(
+            crate::engine::router::CONNECT_TIMEOUT,
+            engine.open(&target, &flow),
+        )
+        .await
+        .map_err(|_| Error::Timeout("проверочное соединение не установилось".into()))??;
         Ok(())
     }
 }
@@ -363,7 +411,9 @@ fn needed_geo_sets(config: &Config) -> Vec<(GeoKind, String)> {
         if let Ok(p) = crate::config::Rule::parse(r.raw()) {
             match p.kind {
                 crate::config::RuleKind::Geoip => v.push((GeoKind::Geoip, p.arg(0).to_string())),
-                crate::config::RuleKind::Geosite => v.push((GeoKind::Geosite, p.arg(0).to_string())),
+                crate::config::RuleKind::Geosite => {
+                    v.push((GeoKind::Geosite, p.arg(0).to_string()))
+                }
                 _ => {}
             }
         }
@@ -404,8 +454,7 @@ rules:
 
     #[test]
     fn needed_geo_sets_deduplicates() {
-        let c = cfg(
-            r#"
+        let c = cfg(r#"
 outbounds:
   - {name: DIRECT, type: direct}
   - {name: S, type: socks5, server: 1.2.3.4, port: 1}
@@ -414,8 +463,7 @@ rules:
   - GEOIP,cn,DIRECT
   - GEOSITE,ads,REJECT
   - MATCH,S
-"#,
-        );
+"#);
         let v = needed_geo_sets(&c);
         assert_eq!(v.len(), 2, "повторы должны схлопываться");
         assert!(v.contains(&(GeoKind::Geoip, "cn".into())));
@@ -435,7 +483,11 @@ rules:
         // Невалидный конфиг обязан отсеяться до любых системных изменений.
         let mut c = Config::default();
         c.outbounds.push(crate::config::Outbound::Direct(
-            crate::config::OutboundDirect { name: "X".into(), test_url: None, test_timeout_ms: None },
+            crate::config::OutboundDirect {
+                name: "X".into(),
+                test_url: None,
+                test_timeout_ms: None,
+            },
         ));
         c.rules = vec![crate::config::Rule::Plain("MATCH,НЕТ_ТАКОГО".into())];
         let report = Supervisor::new().apply(c, "test").await;

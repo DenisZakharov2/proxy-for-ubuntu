@@ -91,8 +91,8 @@ impl Config {
     /// Разбирает YAML с подстановкой переменных окружения.
     pub fn parse(text: &str, env: &HashMap<String, String>) -> Result<Self> {
         let expanded = expand_env(text, env);
-        let cfg: Config = serde_yaml::from_str(&expanded)
-            .map_err(|e| Error::ConfigInvalid(format!("{e}")))?;
+        let cfg: Config =
+            serde_yaml::from_str(&expanded).map_err(|e| Error::ConfigInvalid(format!("{e}")))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -111,8 +111,8 @@ impl Config {
             Error::ConfigInvalid(format!("не удалось прочитать {}: {e}", path.display()))
         })?;
         let expanded = expand_env(&text, env);
-        let cfg: Config = serde_yaml::from_str(&expanded)
-            .map_err(|e| Error::ConfigInvalid(format!("{e}")))?;
+        let cfg: Config =
+            serde_yaml::from_str(&expanded).map_err(|e| Error::ConfigInvalid(format!("{e}")))?;
         cfg.validate_for_read()?;
         Ok(cfg)
     }
@@ -180,7 +180,10 @@ impl Config {
         let mut group_names: HashSet<String> = HashSet::new();
         for g in &self.groups {
             if !group_names.insert(g.name.clone()) {
-                return Err(Error::ConfigInvalid(format!("дубль имени группы: {:?}", g.name)));
+                return Err(Error::ConfigInvalid(format!(
+                    "дубль имени группы: {:?}",
+                    g.name
+                )));
             }
             if g.outbounds.is_empty() {
                 return Err(Error::ConfigInvalid(format!(
@@ -241,7 +244,11 @@ impl Config {
 
     /// Имена всех исходящих соединений, включая вложенные группы — для UI.
     pub fn all_outbound_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.outbounds.iter().map(|o| o.name().to_string()).collect();
+        let mut v: Vec<String> = self
+            .outbounds
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
         v.extend(self.groups.iter().map(|g| g.name.clone()));
         v
     }
@@ -277,7 +284,11 @@ fn default_true() -> bool {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: default_log_level(), journal: true, file: None }
+        Self {
+            level: default_log_level(),
+            journal: true,
+            file: None,
+        }
     }
 }
 
@@ -285,20 +296,16 @@ impl Default for LogConfig {
 // Имена со знаком дефиса: `fake-ip`, `redir-host`. С `lowercase` serde
 // выдало бы `fakeip`, и конфиг не прошёл бы собственную валидацию.
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum DnsStrategy {
     /// Выдаёт синтетический 198.18.0.0/16 и держит маппинг имя↔IP в демоне.
     /// Самая надёжная схема против утечек, но ломает `ping` и GeoIP-правила
     /// по реальному адресу.
+    #[default]
     FakeIp,
     /// Перехватывает DNS и подставляет реальный адрес. Совместимо, но при
     /// кэшировании на стороне клиента возможна утечка через CNAME.
     RedirHost,
-}
-
-impl Default for DnsStrategy {
-    fn default() -> Self {
-        DnsStrategy::FakeIp
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,7 +426,12 @@ fn default_mtu() -> u16 {
 
 impl Default for TunConfig {
     fn default() -> Self {
-        Self { enabled: false, device: default_tun_device(), mtu: default_mtu(), strict_route: true }
+        Self {
+            enabled: false,
+            device: default_tun_device(),
+            mtu: default_mtu(),
+            strict_route: true,
+        }
     }
 }
 
@@ -458,7 +470,11 @@ fn default_geo_interval() -> u64 {
 
 impl Default for GeoConfig {
     fn default() -> Self {
-        Self { auto_update: true, update_interval_hours: default_geo_interval(), sources: Vec::new() }
+        Self {
+            auto_update: true,
+            update_interval_hours: default_geo_interval(),
+            sources: Vec::new(),
+        }
     }
 }
 
@@ -466,17 +482,13 @@ impl Default for GeoConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum GroupType {
+    #[default]
     Select,
     UrlTest,
     Fallback,
     LoadBalance,
-}
-
-impl Default for GroupType {
-    fn default() -> Self {
-        GroupType::Select
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,14 +611,38 @@ impl Outbound {
 
     pub fn test_url(&self) -> &str {
         match self {
-            Outbound::Direct(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
-            Outbound::Http(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
-            Outbound::Socks(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
-            Outbound::Shadowsocks(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
-            Outbound::Trojan(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
-            Outbound::Vless(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
-            Outbound::Vmess(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
-            Outbound::Ssh(o) => o.test_url.as_deref().unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Direct(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Http(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Socks(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Shadowsocks(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Trojan(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Vless(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Vmess(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
+            Outbound::Ssh(o) => o
+                .test_url
+                .as_deref()
+                .unwrap_or("https://www.gstatic.com/generate_204"),
         }
     }
 
@@ -615,7 +651,9 @@ impl Outbound {
         let host = self.server();
         if let Some(h) = host {
             if h.trim().is_empty() {
-                return Err(Error::ConfigInvalid(format!("outbound {n:?}: пустой server")));
+                return Err(Error::ConfigInvalid(format!(
+                    "outbound {n:?}: пустой server"
+                )));
             }
             if h.contains(char::is_whitespace) {
                 return Err(Error::ConfigInvalid(format!(
@@ -693,12 +731,12 @@ impl Outbound {
                     }
                 }
             }
-            Outbound::Ssh(o) => {
-                if o.password.is_empty() && o.key_file.as_deref().unwrap_or("").is_empty() {
-                    return Err(Error::ConfigInvalid(format!(
-                        "outbound {n:?}: укажите password или key_file"
-                    )));
-                }
+            Outbound::Ssh(o)
+                if o.password.is_empty() && o.key_file.as_deref().unwrap_or("").is_empty() =>
+            {
+                return Err(Error::ConfigInvalid(format!(
+                    "outbound {n:?}: укажите password или key_file"
+                )));
             }
             _ => {}
         }
@@ -734,9 +772,9 @@ impl Outbound {
     /// `host:port` для исходящего соединения.
     pub fn server_addr(&self) -> Result<SocketAddr> {
         use std::net::ToSocketAddrs;
-        let host = self
-            .server()
-            .ok_or_else(|| Error::ConfigInvalid(format!("outbound {:?}: нет server", self.name())))?;
+        let host = self.server().ok_or_else(|| {
+            Error::ConfigInvalid(format!("outbound {:?}: нет server", self.name()))
+        })?;
         let port = self
             .port()
             .ok_or_else(|| Error::ConfigInvalid(format!("outbound {:?}: нет port", self.name())))?;
@@ -873,15 +911,11 @@ fn default_alpn() -> Vec<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Transport {
+    #[default]
     Tcp,
     Ws,
-}
-
-impl Default for Transport {
-    fn default() -> Self {
-        Transport::Tcp
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -979,19 +1013,32 @@ fn default_ssh_keepalive() -> u64 {
     30
 }
 fn default_host_key_algorithms() -> Vec<String> {
-    vec!["ssh-ed25519".into(), "rsa-sha2-512".into(), "ecdsa-sha2-nistp256".into()]
+    vec![
+        "ssh-ed25519".into(),
+        "rsa-sha2-512".into(),
+        "ecdsa-sha2-nistp256".into(),
+    ]
 }
 
 // ──────────────────────────────── правила ────────────────────────────────
 
 /// Что делать с соединением.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
     Direct,
     Reject,
     RejectDrop,
     HijackDns,
     Named(String),
+}
+
+/// Сериализуем в имена Clash-формата, а не в имена вариантов Rust. Иначе
+/// сохранённый конфиг содержал бы `final: Direct`, и пользователь, который
+/// откроет его в редакторе, увидит нечто, чего нигде не документировано.
+impl Serialize for Policy {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
 }
 
 /// Разбор вручную, а не через `#[serde(untagged)]`: в untagged-энуме
@@ -1221,7 +1268,10 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -1342,7 +1392,10 @@ final: DIRECT
         // Регрессия: `rules: [MATCH, Битый]` даёт две строки без запятых,
         // и разбор падал на `parts[1..0]`.
         for raw in ["MATCH", "", ",", "  ,  "] {
-            assert!(Rule::parse(raw).is_err(), "правило {raw:?} должно отвергаться");
+            assert!(
+                Rule::parse(raw).is_err(),
+                "правило {raw:?} должно отвергаться"
+            );
         }
         let yaml = r#"
 outbounds:
@@ -1352,6 +1405,24 @@ rules: [MATCH, Битый]
 "#;
         let e = Config::parse(yaml, &HashMap::new()).unwrap_err();
         assert!(e.to_string().contains("правило"), "{e}");
+    }
+
+    #[test]
+    fn policy_serializes_as_clash_names() {
+        use crate::config::Policy;
+        for (p, want) in [
+            (Policy::Direct, "\"DIRECT\""),
+            (Policy::Reject, "\"REJECT\""),
+            (Policy::RejectDrop, "\"REJECT-DROP\""),
+            (Policy::HijackDns, "\"HIJACK-DNS\""),
+        ] {
+            let got = serde_json::to_string(&p).unwrap();
+            assert_eq!(got, want, "сериализация {:?} дала {got}", p);
+        }
+        assert_eq!(
+            serde_json::to_string(&Policy::Named("Работа".into())).unwrap(),
+            "\"Работа\""
+        );
     }
 
     #[test]
@@ -1403,9 +1474,12 @@ outbounds:
         // а для показа конфигурации — обычное состояние.
         let yaml = "outbounds:\n  - {name: DIRECT, type: direct}\n";
         let strict = Config::parse(yaml, &HashMap::new());
-        assert!(matches!(strict, Err(Error::NoOutbound)), "apply должен отвергнуть");
+        assert!(
+            matches!(strict, Err(Error::NoOutbound)),
+            "apply должен отвергнуть"
+        );
 
-        let mut cfg = Config::default();
+        let cfg = Config::default();
         cfg.validate_for_read().expect("чтение должно проходить");
     }
 
@@ -1438,7 +1512,10 @@ outbounds:
         }));
         cfg.rules = vec![Rule::Plain("DOMAIN,example.com,S".into())];
         let yaml = cfg.to_yaml().unwrap();
-        assert!(yaml.contains("DOMAIN,example.com,S"), "правило должно сериализоваться строкой");
+        assert!(
+            yaml.contains("DOMAIN,example.com,S"),
+            "правило должно сериализоваться строкой"
+        );
         let back = Config::parse(&yaml, &HashMap::new()).unwrap();
         assert_eq!(back.outbounds.len(), cfg.outbounds.len());
         assert_eq!(back.final_policy, Policy::Direct);

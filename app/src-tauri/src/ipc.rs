@@ -219,7 +219,10 @@ impl Server {
 
     async fn daemon_status(self: &Arc<Self>) -> Result<Value> {
         let engine = self.engine.read().await;
-        let config_valid = engine.as_ref().map(|e| e.config.validate().is_ok()).unwrap_or(false);
+        let config_valid = engine
+            .as_ref()
+            .map(|e| e.config.validate().is_ok())
+            .unwrap_or(false);
         Ok(json!({
             "daemon": "running",
             "version": crate::VERSION,
@@ -254,8 +257,9 @@ impl Server {
     }
 
     fn config_validate(&self, params: &Value) -> Result<Value> {
-        let cfg: Config = serde_json::from_value(params.get("config").cloned().unwrap_or(json!({})))
-            .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+        let cfg: Config =
+            serde_json::from_value(params.get("config").cloned().unwrap_or(json!({})))
+                .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
         let mut warnings = Vec::new();
         match cfg.validate() {
             Ok(()) => {
@@ -265,8 +269,12 @@ impl Server {
                         .iter()
                         .filter_map(|r| crate::config::Rule::parse(r.raw()).ok())
                         .filter_map(|p| match p.kind {
-                            crate::config::RuleKind::Geoip => Some((GeoKind::Geoip, p.arg(0).to_string())),
-                            crate::config::RuleKind::Geosite => Some((GeoKind::Geosite, p.arg(0).to_string())),
+                            crate::config::RuleKind::Geoip => {
+                                Some((GeoKind::Geoip, p.arg(0).to_string()))
+                            }
+                            crate::config::RuleKind::Geosite => {
+                                Some((GeoKind::Geosite, p.arg(0).to_string()))
+                            }
                             _ => None,
                         })
                         .collect();
@@ -306,9 +314,13 @@ impl Server {
     }
 
     async fn config_apply(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let cfg: Config = serde_json::from_value(params.get("config").cloned().unwrap_or(json!({})))
-            .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
-        let reason = params.get("reason").and_then(Value::as_str).unwrap_or("user");
+        let cfg: Config =
+            serde_json::from_value(params.get("config").cloned().unwrap_or(json!({})))
+                .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+        let reason = params
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
         let report: ApplyReport = self.supervisor.apply(cfg, reason).await;
 
         if report.ok {
@@ -317,7 +329,9 @@ impl Server {
             if let Ok((loaded, _)) = self.load_config() {
                 let geo = GeoRegistry::load(&[]);
                 if let Ok(engine) = Engine::build(loaded, &geo) {
-                    engine.enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    engine
+                        .enabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     *self.engine.write().await = Some(engine);
                 }
             }
@@ -336,18 +350,24 @@ impl Server {
     }
 
     async fn system_toggle(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let enabled = params.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let enabled = params
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let mut guard = self.engine.write().await;
 
         if enabled && guard.is_none() {
             let (cfg, _) = self.load_config()?;
             let geo = GeoRegistry::load(&[]);
             let engine = Engine::build(cfg, &geo)?;
-            engine.enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+            engine
+                .enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             *guard = Some(engine);
         }
         if let Some(e) = guard.as_ref() {
-            e.enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+            e.enabled
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
             if enabled {
                 let plan = nft::build_plan(&e.config);
                 if let Err(err) = nft::apply(&plan).await {
@@ -439,13 +459,15 @@ impl Server {
     }
 
     async fn outbound_test(&self, params: &Value) -> Result<Value> {
-        let ob_cfg: crate::config::Outbound = serde_json::from_value(
-            params.get("outbound").cloned().unwrap_or(json!({})),
-        )
-        .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+        let ob_cfg: crate::config::Outbound =
+            serde_json::from_value(params.get("outbound").cloned().unwrap_or(json!({})))
+                .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
 
         let _target_note = "цель проверки берётся из probe(), если не задана явно";
-        let timeout_ms = params.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000);
+        let timeout_ms = params
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(5000);
 
         let ob = crate::engine::outbound::build(&ob_cfg)?;
         if let Some(h) = params
@@ -497,7 +519,8 @@ impl Server {
                 GeoKind::Geosite => "geosite",
             })
             .join(format!("{}.txt", tag.replace(['/', '.', ':'], "_")));
-        let text = std::fs::read_to_string(p).map_err(|e| Error::NotFound(format!("{tag}: {e}")))?;
+        let text =
+            std::fs::read_to_string(p).map_err(|e| Error::NotFound(format!("{tag}: {e}")))?;
         let lines: Vec<&str> = text
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
@@ -508,21 +531,30 @@ impl Server {
 
     fn profile_list(&self) -> Result<Value> {
         let mut profiles = Vec::new();
-        for (dir, builtin) in [(paths::builtin_profiles_dir(), true), (paths::user_profiles_dir(), false)] {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for (dir, builtin) in [
+            (paths::builtin_profiles_dir(), true),
+            (paths::user_profiles_dir(), false),
+        ] {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.extension().and_then(|x| x.to_str()) != Some("yaml") {
                     continue;
                 }
-                let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 let updated_at = std::fs::metadata(&p)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                profiles.push(json!({ "name": name, "builtin": builtin, "updated_at": updated_at }));
+                profiles
+                    .push(json!({ "name": name, "builtin": builtin, "updated_at": updated_at }));
             }
         }
         Ok(json!({ "profiles": profiles }))
@@ -532,7 +564,8 @@ impl Server {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let (path, _) = resolve_profile_path(name)?;
         let env = crate::config::read_env_file(&paths::env_file());
-        let text = std::fs::read_to_string(&path).map_err(|e| Error::NotFound(format!("{name}: {e}")))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| Error::NotFound(format!("{name}: {e}")))?;
         let expanded = crate::config::expand_env(&text, &env);
         let cfg: Config = serde_yaml::from_str(&expanded)
             .map_err(|e| Error::ConfigInvalid(format!("{name}: {e}")))?;
@@ -544,8 +577,9 @@ impl Server {
         if name.is_empty() {
             return Err(Error::ConfigInvalid("имя профиля не указано".into()));
         }
-        let cfg: Config = serde_json::from_value(params.get("config").cloned().unwrap_or(json!({})))
-            .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+        let cfg: Config =
+            serde_json::from_value(params.get("config").cloned().unwrap_or(json!({})))
+                .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
         cfg.validate()?;
         let (path, builtin) = resolve_profile_path(name)?;
         if builtin {
@@ -562,7 +596,9 @@ impl Server {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let (path, builtin) = resolve_profile_path(name)?;
         if builtin {
-            return Err(Error::Permission("встроенный профиль удалить нельзя".into()));
+            return Err(Error::Permission(
+                "встроенный профиль удалить нельзя".into(),
+            ));
         }
         std::fs::remove_file(&path).map_err(|e| Error::NotFound(format!("{name}: {e}")))?;
         Ok(json!({ "ok": true }))
@@ -573,12 +609,17 @@ impl Server {
         let (path, _) = resolve_profile_path(name)?;
         let env = crate::config::read_env_file(&paths::env_file());
         let cfg = Config::load(&path, &env)?;
-        let report = self.supervisor.apply(cfg, &format!("активация профиля {name}")).await;
+        let report = self
+            .supervisor
+            .apply(cfg, &format!("активация профиля {name}"))
+            .await;
         let result = serde_json::to_value(&report)?;
         if report.ok {
             let geo = GeoRegistry::load(&[]);
             if let Ok(engine) = Engine::build(self.load_config()?.0, &geo) {
-                engine.enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+                engine
+                    .enabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 *self.engine.write().await = Some(engine);
             }
         }
@@ -586,7 +627,10 @@ impl Server {
     }
 
     fn profile_import(&self, params: &Value) -> Result<Value> {
-        let name = params.get("name").and_then(Value::as_str).unwrap_or("imported");
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("imported");
         let yaml = params.get("yaml").and_then(Value::as_str).unwrap_or("");
         let env = crate::config::read_env_file(&paths::env_file());
         let cfg = Config::parse(yaml, &env)?;
@@ -596,7 +640,10 @@ impl Server {
         let mut warnings = Vec::new();
         for ob in &cfg.outbounds {
             if ob.is_experimental() {
-                warnings.push(format!("outbound {:?} не проверен на живом сервере", ob.name()));
+                warnings.push(format!(
+                    "outbound {:?} не проверен на живом сервере",
+                    ob.name()
+                ));
             }
         }
         Ok(json!({ "ok": true, "warnings": warnings, "errors": [] }))
@@ -604,9 +651,13 @@ impl Server {
 
     fn profile_export(&self, params: &Value) -> Result<Value> {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-        let redact = params.get("redact_secrets").and_then(Value::as_bool).unwrap_or(false);
+        let redact = params
+            .get("redact_secrets")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (path, _) = resolve_profile_path(name)?;
-        let mut text = std::fs::read_to_string(&path).map_err(|e| Error::NotFound(format!("{name}: {e}")))?;
+        let mut text =
+            std::fs::read_to_string(&path).map_err(|e| Error::NotFound(format!("{name}: {e}")))?;
         if redact {
             text = redact_secrets(&text);
         }
@@ -615,7 +666,10 @@ impl Server {
 
     async fn subscription_update(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let url = params.get("url").and_then(Value::as_str).unwrap_or("");
-        let name = params.get("name").and_then(Value::as_str).unwrap_or("subscription");
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("subscription");
         if url.is_empty() {
             return Err(Error::ConfigInvalid("URL подписки не указан".into()));
         }
@@ -643,7 +697,9 @@ impl Server {
 
         let env = crate::config::read_env_file(&paths::env_file());
         let cfg = Config::parse(&yaml, &env).map_err(|e| {
-            Error::ConfigInvalid(format!("подписка не похожа на конфиг proxy-for-ubuntu: {e}"))
+            Error::ConfigInvalid(format!(
+                "подписка не похожа на конфиг proxy-for-ubuntu: {e}"
+            ))
         })?;
         let outbounds_found = cfg.outbounds.len();
         let rules_found = cfg.rules.len();
@@ -654,7 +710,11 @@ impl Server {
         )?;
 
         let mut activated = false;
-        if params.get("auto_activate").and_then(Value::as_bool).unwrap_or(false) {
+        if params
+            .get("auto_activate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             let report = self.supervisor.apply(cfg, "подписка").await;
             activated = report.ok;
         }
@@ -692,10 +752,13 @@ impl Server {
         let mut out = String::new();
         for e in g.iter() {
             if level.map(|l| e.level == l).unwrap_or(true) {
-                out.push_str(&format!("[{}] {:5} {}: {}\n", e.ts, e.level, e.target, e.message));
+                out.push_str(&format!(
+                    "[{}] {:5} {}: {}\n",
+                    e.ts, e.level, e.target, e.message
+                ));
             }
         }
-        paths::ensure_dir(&path.parent().unwrap())?;
+        paths::ensure_dir(path.parent().unwrap())?;
         paths::atomic_write(&path, out.as_bytes())?;
         Ok(json!({ "ok": true, "path": path.display().to_string() }))
     }
@@ -766,7 +829,13 @@ fn resolve_profile_path(name: &str) -> Result<(PathBuf, bool)> {
 fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let cleaned = cleaned.trim().to_string();
     if cleaned.is_empty() {
@@ -779,7 +848,14 @@ fn sanitize_name(name: &str) -> String {
 /// Заменяет значения секретных полей. Работает по тексту, а не по
 /// структуре, потому что нужен и для сырого импортированного YAML.
 fn redact_secrets(yaml: &str) -> String {
-    const KEYS: [&str; 6] = ["password", "passphrase", "uuid", "key_file", "secret", "token"];
+    const KEYS: [&str; 6] = [
+        "password",
+        "passphrase",
+        "uuid",
+        "key_file",
+        "secret",
+        "token",
+    ];
     let mut out = String::with_capacity(yaml.len());
     for line in yaml.lines() {
         let trimmed = line.trim_start();
@@ -801,7 +877,12 @@ fn redact_secrets(yaml: &str) -> String {
 
 fn version_ge(v: &str, maj: u32, min: u32, patch: u32) -> bool {
     let it = v.split(['-', '.']);
-    let p = |i: usize| it.clone().nth(i).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let p = |i: usize| {
+        it.clone()
+            .nth(i)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
     let (a, b, c) = (p(0), p(1), p(2));
     (a, b, c) >= (maj, min, patch)
 }
@@ -814,7 +895,10 @@ mod tests {
     fn sanitize_name_blocks_traversal() {
         assert_eq!(sanitize_name("Мой профиль"), "Мой профиль");
         // "../../.ssh/" — семь символов, каждый заменяется подчёркиванием.
-        assert_eq!(sanitize_name("../../.ssh/authorized_keys"), "_______ssh_authorized_keys");
+        assert_eq!(
+            sanitize_name("../../.ssh/authorized_keys"),
+            "_______ssh_authorized_keys"
+        );
         assert!(!sanitize_name("..\\..\\etc\\passwd").contains('\\'));
         assert!(!sanitize_name("a/b\0c").contains('/'));
         assert_eq!(sanitize_name(""), "unnamed");
@@ -826,7 +910,10 @@ mod tests {
         let r = redact_secrets(y);
         assert!(!r.contains("hunter2"), "пароль утёк: {r}");
         assert!(r.contains("REDACTED"));
-        assert!(r.contains("username: bob"), "логин не секрет, его можно оставить");
+        assert!(
+            r.contains("username: bob"),
+            "логин не секрет, его можно оставить"
+        );
         assert!(r.contains("server: a"));
     }
 
@@ -842,7 +929,9 @@ mod tests {
     fn unknown_method_is_not_found() {
         let s = Arc::new(Server::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(s.handle("нет.такого.метода", json!({}))).unwrap_err();
+        let err = rt
+            .block_on(s.handle("нет.такого.метода", json!({})))
+            .unwrap_err();
         assert_eq!(err.code(), "E_NOT_FOUND");
     }
 

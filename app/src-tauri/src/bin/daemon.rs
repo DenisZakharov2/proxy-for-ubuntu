@@ -17,7 +17,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("--daemon");
 
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("не удалось создать runtime: {e}");
@@ -30,7 +33,11 @@ fn main() -> ExitCode {
             "--daemon" | "-d" => run_daemon().await,
             "--check" => run_check().await,
             "--version" | "-V" => {
-                println!("proxy-for-ubuntud {} (api {})", pfu::VERSION, pfu::API_VERSION);
+                println!(
+                    "proxy-for-ubuntud {} (api {})",
+                    pfu::VERSION,
+                    pfu::API_VERSION
+                );
                 Ok(())
             }
             "--help" | "-h" => {
@@ -40,7 +47,9 @@ fn main() -> ExitCode {
             other => {
                 eprintln!("неизвестный аргумент: {other}");
                 print_help();
-                Err(pfu::Error::ConfigInvalid(format!("неизвестный аргумент {other}")))
+                Err(pfu::Error::ConfigInvalid(format!(
+                    "неизвестный аргумент {other}"
+                )))
             }
         }
     });
@@ -84,31 +93,48 @@ fn init_logging() -> Result<()> {
         &pfu::config::read_env_file(&paths::env_file()),
     )
     .ok();
-    let level = cfg.as_ref().map(|c| c.log.level.clone()).unwrap_or_else(|| "info".into());
+    let level = cfg
+        .as_ref()
+        .map(|c| c.log.level.clone())
+        .unwrap_or_else(|| "info".into());
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("pfu={0},proxy_for_ubuntu={0}", level)));
 
     // Слои разных типов (файл и stderr) складываем как trait-объекты.
-    let mut layers: Vec<Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>> =
-        Vec::new();
+    let mut layers: Vec<
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+    > = Vec::new();
     if let Some(file) = cfg.and_then(|c| c.log.file) {
         // rolling::never принимает каталог и префикс, а не готовый путь.
         let path = std::path::PathBuf::from(&file);
-        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
-        let prefix = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "engine".into());
+        let dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let prefix = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "engine".into());
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!("не удалось создать каталог для лога {}: {e}", dir.display());
         } else {
             let appender = tracing_appender::rolling::never(&dir, prefix);
             layers.push(Box::new(
-                tracing_subscriber::fmt::layer().with_ansi(false).with_writer(appender),
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(appender),
             ));
         }
     }
     // stderr перехватывает systemd и уходит в journald.
-    layers.push(Box::new(tracing_subscriber::fmt::layer().with_writer(std::io::stderr)));
+    layers.push(Box::new(
+        tracing_subscriber::fmt::layer().with_writer(std::io::stderr),
+    ));
 
-    tracing_subscriber::registry().with(layers).with(filter).init();
+    tracing_subscriber::registry()
+        .with(layers)
+        .with(filter)
+        .init();
     Ok(())
 }
 
@@ -119,7 +145,9 @@ async fn run_daemon() -> Result<()> {
              Он управляет TUN, nftables и маршрутами — обычному пользователю это недоступно.\n\
              Запустите: sudo systemctl start proxy-for-ubuntud"
         );
-        return Err(pfu::Error::Permission("демон должен работать от root".into()));
+        return Err(pfu::Error::Permission(
+            "демон должен работать от root".into(),
+        ));
     }
 
     init_logging()?;
@@ -154,7 +182,10 @@ async fn run_check() -> Result<()> {
     let mut problems = 0;
 
     let (nft_ok, nft_ver) = nft::check_available().await;
-    println!("nftables: {} ({nft_ver})", if nft_ok { "есть" } else { "НЕТ" });
+    println!(
+        "nftables: {} ({nft_ver})",
+        if nft_ok { "есть" } else { "НЕТ" }
+    );
     if !nft_ok {
         problems += 1;
     }
@@ -172,7 +203,11 @@ async fn run_check() -> Result<()> {
     println!(
         "конфиг: {} ({})",
         config.display(),
-        if config.exists() { "есть" } else { "будет создан при первом запуске" }
+        if config.exists() {
+            "есть"
+        } else {
+            "будет создан при первом запуске"
+        }
     );
 
     for (id, name, port) in [
@@ -183,13 +218,19 @@ async fn run_check() -> Result<()> {
         let free = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
         println!(
             "порт {port} ({name}): {}",
-            if free { "свободен" } else { "ЗАНЯТ" }
+            if free {
+                "свободен"
+            } else {
+                "ЗАНЯТ"
+            }
         );
     }
 
     if problems > 0 {
         eprintln!("\nОбнаружены проблемы: {problems}. Запуск будет невозможен.");
-        return Err(pfu::Error::Internal(format!("проблем в окружении: {problems}")));
+        return Err(pfu::Error::Internal(format!(
+            "проблем в окружении: {problems}"
+        )));
     }
     println!("\nОкружение готово.");
     Ok(())
@@ -233,7 +274,9 @@ fn clear_stale_socket() {
 }
 
 /// Периодическая уборка кэшей DNS. Живёт, пока жив демон.
-pub fn spawn_gc_task(resolver: std::sync::Arc<dyn Fn() + Send + Sync>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_gc_task(
+    resolver: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {

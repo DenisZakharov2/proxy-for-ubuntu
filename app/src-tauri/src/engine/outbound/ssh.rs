@@ -63,18 +63,26 @@ impl SshTunnel {
         let key = key.display().to_string();
 
         let mut args = vec![
-            "-N".to_string(),            // без команды
-            "-o".into(), "BatchMode=no".into(),
-            "-o".into(), "ExitOnForwardFailure=yes".into(),
-            "-o".into(), "ServerAliveInterval=30".into(),
-            "-o".into(), "ServerAliveCountMax=3".into(),
+            "-N".to_string(), // без команды
+            "-o".into(),
+            "BatchMode=no".into(),
+            "-o".into(),
+            "ExitOnForwardFailure=yes".into(),
+            "-o".into(),
+            "ServerAliveInterval=30".into(),
+            "-o".into(),
+            "ServerAliveCountMax=3".into(),
             // Не спрашивать ничего интерактивно: неоткрытый ключ должен
             // падать сразу, а не висеть с вводом пароля.
-            "-o".into(), "StrictHostKeyChecking=accept-new".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
         ];
         if !cfg.host_key_algorithms.is_empty() {
             args.push("-o".into());
-            args.push(format!("HostKeyAlgorithms={}", cfg.host_key_algorithms.join(",")));
+            args.push(format!(
+                "HostKeyAlgorithms={}",
+                cfg.host_key_algorithms.join(",")
+            ));
         }
         if !cfg.password.is_empty() {
             // sshpass не входит в зависимости пакета: без него парольный
@@ -146,7 +154,9 @@ impl SshTunnel {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = cmd.spawn().map_err(|e| {
-            Error::Internal(format!("не удалось запустить ssh: {e}. Установлен ли openssh-client?"))
+            Error::Internal(format!(
+                "не удалось запустить ssh: {e}. Установлен ли openssh-client?"
+            ))
         })?;
 
         // ssh поднимает сокет почти мгновенно; если он не смог, он сам
@@ -156,10 +166,13 @@ impl SshTunnel {
                 break;
             }
             if let Ok(Some(_)) = child.try_wait() {
-                return Err(Error::protocol("ssh", format!(
-                    "ssh завершился сразу. Проверьте доступ к {}@{} и ключ",
-                    self.username, self.server
-                )));
+                return Err(Error::protocol(
+                    "ssh",
+                    format!(
+                        "ssh завершился сразу. Проверьте доступ к {}@{} и ключ",
+                        self.username, self.server
+                    ),
+                ));
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
@@ -225,9 +238,11 @@ impl Outbound for SshTunnel {
         // Клонируем Arc и отпускаем guard до await: RwLockReadGuard не Send,
         // и его удержание сделало бы весь обработчик соединения не-Send.
         let proxy = {
-            let g = self.inner.proxy.read().map_err(|_| {
-                Error::Internal("состояние SSH-туннеля заблокировано".into())
-            })?;
+            let g = self
+                .inner
+                .proxy
+                .read()
+                .map_err(|_| Error::Internal("состояние SSH-туннеля заблокировано".into()))?;
             g.clone()
         }
         .ok_or_else(|| Error::Internal("SSH-туннель не поднят".into()))?;

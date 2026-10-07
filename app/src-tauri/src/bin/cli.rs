@@ -29,7 +29,7 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<ExitCode> {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
-    let rest = &args[args.len().min(1)..];
+    let _rest = &args[args.len().min(1)..];
 
     match cmd {
         "help" | "-h" | "--help" => {
@@ -37,7 +37,12 @@ fn run(args: &[String]) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         "version" | "-V" | "--version" => {
-            println!("pfu-cli {} (IPC api {}, протокол {})", pfu::VERSION, pfu::API_VERSION, crate_version());
+            println!(
+                "pfu-cli {} (IPC api {}, протокол {})",
+                pfu::VERSION,
+                pfu::API_VERSION,
+                crate_version()
+            );
             Ok(ExitCode::SUCCESS)
         }
         "status" => simple("daemon.status", serde_json::json!({})),
@@ -122,41 +127,82 @@ fn apply(yaml: &str) -> Result<ExitCode> {
         cfg.rules.len()
     );
     let json = serde_json::to_value(&cfg)?;
-    let out = call("config.apply", serde_json::json!({ "config": json, "reason": "cli" }))?;
+    let out = call(
+        "config.apply",
+        serde_json::json!({ "config": json, "reason": "cli" }),
+    )?;
 
     let ok = out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let stage = out.get("stage").and_then(|v| v.as_str()).unwrap_or("?");
     let msg = out.get("message").and_then(|v| v.as_str()).unwrap_or("");
-    let rolled = out.get("rolled_back").and_then(|v| v.as_bool()).unwrap_or(false);
+    let rolled = out
+        .get("rolled_back")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // `system_touched` отличает «ничего не менялось» от «откат выполнен»:
+    // на validate и probe система не тронута, и откатывать нечего.
+    let touched = out
+        .get("system_touched")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     println!("этап: {stage}");
     println!("{msg}");
-    for w in out.get("warnings").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+    for w in out
+        .get("warnings")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&vec![])
+    {
         println!("предупреждение: {w}");
     }
-    for e in out.get("errors").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+    for e in out
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&vec![])
+    {
         eprintln!("ошибка: {e}");
     }
     if ok {
         println!("\nприменено.");
-        Ok(ExitCode::SUCCESS)
-    } else {
-        if rolled {
-            eprintln!("\nИзменения не применились, система возвращена в прежнее состояние.");
-        }
-        Ok(ExitCode::FAILURE)
+        return Ok(ExitCode::SUCCESS);
     }
+    // Различаем три исхода: система не тронута, откат выполнен, откат не
+    // сработал. Формулировка «система возвращена» была бы неправдой в
+    // первом случае.
+    if !touched {
+        eprintln!("\nСистемные правила не менялись — откатывать было нечего.");
+    } else if rolled {
+        eprintln!("\nСистемные правила и конфигурация возвращены в прежнее состояние.");
+    } else {
+        eprintln!("\nОТКАТ НЕ УДАЛСЯ. Проверьте правила вручную:");
+        eprintln!("  sudo nft list table inet pfu");
+        eprintln!("  sudo ip rule del fwmark 0x1 lookup 100");
+        eprintln!("  sudo ip route flush table 100");
+    }
+    Ok(ExitCode::FAILURE)
 }
 
 fn print_rules() -> Result<ExitCode> {
-    let cfg = call("config.get", serde_json::json!({}))
-        .map_err(|e| if e.code() == "E_NO_OUTBOUND" { Error::NoOutbound } else { e })?;
-    let c = cfg.get("config").cloned().unwrap_or(serde_json::Value::Null);
-    let rules = c.get("rules").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let cfg = call("config.get", serde_json::json!({})).map_err(|e| {
+        if e.code() == "E_NO_OUTBOUND" {
+            Error::NoOutbound
+        } else {
+            e
+        }
+    })?;
+    let c = cfg
+        .get("config")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let rules = c
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     if rules.is_empty() {
         println!("Правил нет: весь трафик идёт по правилу final.");
     } else {
-        println!("{:<4} {:<48} {}", "№", "УСЛОВИЕ", "ДЕЙСТВИЕ");
+        println!("{:<4} {:<48} ДЕЙСТВИЕ", "№", "УСЛОВИЕ");
         for (i, r) in rules.iter().enumerate() {
             let raw = match r {
                 serde_json::Value::String(s) => s.clone(),
@@ -170,21 +216,25 @@ fn print_rules() -> Result<ExitCode> {
             let kind = parts.next().unwrap_or("");
             let arg = parts.next().unwrap_or("");
             let policy = raw.rsplit(',').next().unwrap_or("");
-            let cond = if arg.is_empty() { kind.to_string() } else { format!("{kind} {arg}") };
+            let cond = if arg.is_empty() {
+                kind.to_string()
+            } else {
+                format!("{kind} {arg}")
+            };
             println!("{:<4} {:<48} {}", i + 1, cond, policy);
         }
     }
-    let final_policy = c
-        .get("final")
-        .and_then(|v| v.as_str())
-        .unwrap_or("DIRECT");
+    let final_policy = c.get("final").and_then(|v| v.as_str()).unwrap_or("DIRECT");
     println!("\nВсё остальное: {final_policy}");
     Ok(ExitCode::SUCCESS)
 }
 
 fn print_proxies() -> Result<ExitCode> {
     let cfg = call("config.get", serde_json::json!({}))?;
-    let c = cfg.get("config").cloned().unwrap_or(serde_json::Value::Null);
+    let c = cfg
+        .get("config")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let outs = c
         .get("outbounds")
         .and_then(|v| v.as_array())
@@ -194,7 +244,7 @@ fn print_proxies() -> Result<ExitCode> {
         println!("Прокси не настроены.");
         return Ok(ExitCode::SUCCESS);
     }
-    println!("{:<24} {:<14} {}", "ИМЯ", "ТИП", "АДРЕС");
+    println!("{:<24} {:<14} АДРЕС", "ИМЯ", "ТИП");
     for o in &outs {
         let name = o.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let ty = o.get("type").and_then(|v| v.as_str()).unwrap_or("?");

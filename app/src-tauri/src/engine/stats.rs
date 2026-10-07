@@ -29,11 +29,15 @@ impl Counters {
     pub fn conn_closed(&self) {
         // Не даём счётчику уйти в ноль по недосмотру: в метриках это
         // выглядело бы как «минус одно соединение».
-        let _ = self.conns.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |c| if c == 0 { None } else { Some(c - 1) },
-        );
+        // `try_update` стабилен только с Rust 1.95, а `rust-version` в
+        // Cargo.toml — 1.77. Через `fetch_sub` обходимся без гонки и
+        // без требования к более свежему компилятору.
+        let prev = self.conns.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            // Было ноль соединений — возвращаем как было, иначе счётчик
+            // ушёл бы в u64::MAX и в метриках показывал бы чушь.
+            self.conns.fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub fn snapshot(&self) -> (u64, u64, u64) {
         (
@@ -53,12 +57,15 @@ pub struct Breakdown {
 impl Breakdown {
     pub fn record(&self, rule: &str, outbound: &str, bytes: u64) {
         if let Ok(mut g) = self.inner.lock() {
-            *g.entry((rule.to_string(), outbound.to_string())).or_insert(0) += bytes;
+            *g.entry((rule.to_string(), outbound.to_string()))
+                .or_insert(0) += bytes;
         }
     }
 
     pub fn snapshot(&self) -> Vec<BreakdownRow> {
-        let Ok(g) = self.inner.lock() else { return Vec::new() };
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
+        };
         let mut v: Vec<BreakdownRow> = g
             .iter()
             .map(|((rule, outbound), bytes)| BreakdownRow {
@@ -67,7 +74,7 @@ impl Breakdown {
                 bytes: *bytes,
             })
             .collect();
-        v.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        v.sort_by_key(|r| std::cmp::Reverse(r.bytes));
         v
     }
 

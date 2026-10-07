@@ -66,7 +66,11 @@ impl Target {
             .clone()
             .or_else(|| flow.dst_ip.map(|ip| ip.to_string()))
             .unwrap_or_default();
-        Self { host, port: flow.dst_port, is_tcp: flow.is_tcp }
+        Self {
+            host,
+            port: flow.dst_port,
+            is_tcp: flow.is_tcp,
+        }
     }
 
     pub fn key(&self) -> String {
@@ -197,7 +201,10 @@ impl RuleSet {
                 raw: rule.raw().to_string(),
             });
         }
-        Ok(Self { entries, final_decision: Decision::from_policy(final_policy) })
+        Ok(Self {
+            entries,
+            final_decision: Decision::from_policy(final_policy),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -234,10 +241,10 @@ impl RuleSet {
 
     /// Кэш решений по ключу `host:port`. Реальный трафик бьёт в одни и те же
     /// хосты постоянно, а разбор SNI и прогон по правилам — не бесплатный.
-    pub fn decide_cached<'a>(
+    pub fn decide_cached(
         &self,
         flow: &Flow,
-        cache: &'a mut std::collections::HashMap<String, (Decision, Option<usize>)>,
+        cache: &mut std::collections::HashMap<String, (Decision, Option<usize>)>,
     ) -> (Decision, Option<usize>) {
         if let Some(hit) = cache.get(&flow_key(flow)) {
             return hit.clone();
@@ -318,7 +325,9 @@ impl Entry {
 
             Compiled::Port { set, ranges, .. } => {
                 set.contains(&flow.dst_port)
-                    || ranges.iter().any(|(a, b)| (*a..=*b).contains(&flow.dst_port))
+                    || ranges
+                        .iter()
+                        .any(|(a, b)| (*a..=*b).contains(&flow.dst_port))
             }
 
             Compiled::Process { set, .. } => match &flow.process {
@@ -396,13 +405,22 @@ fn compile_one(
         }
 
         Geoip | Geosite => {
-            let kind = if parsed.kind == Geoip { GeoKind::Geoip } else { GeoKind::Geosite };
+            let kind = if parsed.kind == Geoip {
+                GeoKind::Geoip
+            } else {
+                GeoKind::Geosite
+            };
             let tag = parsed.arg(0).to_string();
             let handle = geo.get(kind, &tag);
             if handle.is_none() {
                 tracing::warn!(rule = raw, ?kind, %tag, "geo-набор не загружен, правило не сработает");
             }
-            Compiled::Geo { kind, tag, handle, policy }
+            Compiled::Geo {
+                kind,
+                tag,
+                handle,
+                policy,
+            }
         }
 
         DstPort | SrcPort => {
@@ -440,9 +458,15 @@ fn compile_one(
                 }
             }
             if set.is_empty() && ranges.is_empty() {
-                return Err(Error::ConfigInvalid(format!("правило {raw:?}: не указан ни один порт")));
+                return Err(Error::ConfigInvalid(format!(
+                    "правило {raw:?}: не указан ни один порт"
+                )));
             }
-            Compiled::Port { set, ranges, policy }
+            Compiled::Port {
+                set,
+                ranges,
+                policy,
+            }
         }
 
         ProcessName | ProcessPath => Compiled::Process {
@@ -504,7 +528,11 @@ mod tests {
     #[test]
     fn first_match_wins() {
         let rs = set(
-            &["DOMAIN,ads.com,REJECT", "DOMAIN-SUFFIX,example.com,Работа", "MATCH,DIRECT"],
+            &[
+                "DOMAIN,ads.com,REJECT",
+                "DOMAIN-SUFFIX,example.com,Работа",
+                "MATCH,DIRECT",
+            ],
             "DIRECT",
         );
         let d = rs.decide(&flow(Some("ads.com"), None, 80));
@@ -518,7 +546,10 @@ mod tests {
     #[test]
     fn order_is_preserved_across_types() {
         // IP-правило стоит раньше доменного — должно выиграть именно оно.
-        let rs = set(&["IP-CIDR,1.2.3.0/24,DIRECT", "DOMAIN,1.2.3.4,Работа"], "DIRECT");
+        let rs = set(
+            &["IP-CIDR,1.2.3.0/24,DIRECT", "DOMAIN,1.2.3.4,Работа"],
+            "DIRECT",
+        );
         let d = rs.decide(&flow(None, Some("1.2.3.4"), 80));
         assert_eq!(d.0, Decision::Direct);
     }
@@ -532,37 +563,94 @@ mod tests {
 
     #[test]
     fn domain_suffix_does_not_match_lookalike() {
-        let rs = set(&["DOMAIN-SUFFIX,example.com,REJECT", "MATCH,DIRECT"], "DIRECT");
-        assert_eq!(rs.decide(&flow(Some("example.com"), None, 80)).0, Decision::Reject);
-        assert_eq!(rs.decide(&flow(Some("a.example.com"), None, 80)).0, Decision::Reject);
-        assert_eq!(rs.decide(&flow(Some("notexample.com"), None, 80)).0, Decision::Direct);
-        assert_eq!(rs.decide(&flow(Some("example.com.evil.net"), None, 80)).0, Decision::Direct);
+        let rs = set(
+            &["DOMAIN-SUFFIX,example.com,REJECT", "MATCH,DIRECT"],
+            "DIRECT",
+        );
+        assert_eq!(
+            rs.decide(&flow(Some("example.com"), None, 80)).0,
+            Decision::Reject
+        );
+        assert_eq!(
+            rs.decide(&flow(Some("a.example.com"), None, 80)).0,
+            Decision::Reject
+        );
+        assert_eq!(
+            rs.decide(&flow(Some("notexample.com"), None, 80)).0,
+            Decision::Direct
+        );
+        assert_eq!(
+            rs.decide(&flow(Some("example.com.evil.net"), None, 80)).0,
+            Decision::Direct
+        );
     }
 
     #[test]
     fn ports_single_range_and_open_ended() {
         let rs = set(
-            &["DST-PORT,443,Работа", "DST-PORT,8000-9000,Работа2", "DST-PORT,1000+,Рабата3", "MATCH,DIRECT"],
+            &[
+                "DST-PORT,443,Работа",
+                "DST-PORT,8000-9000,Работа2",
+                "DST-PORT,1000+,Рабата3",
+                "MATCH,DIRECT",
+            ],
             "DIRECT",
         );
-        assert_eq!(rs.decide(&flow(None, Some("9.9.9.9"), 443)).0, Decision::Proxy("Работа".into()));
-        assert_eq!(rs.decide(&flow(None, Some("9.9.9.9"), 8080)).0, Decision::Proxy("Работа2".into()));
-        assert_eq!(rs.decide(&flow(None, Some("9.9.9.9"), 8000)).0, Decision::Proxy("Работа2".into()));
-        assert_eq!(rs.decide(&flow(None, Some("9.9.9.9"), 9000)).0, Decision::Proxy("Работа2".into()));
+        assert_eq!(
+            rs.decide(&flow(None, Some("9.9.9.9"), 443)).0,
+            Decision::Proxy("Работа".into())
+        );
+        assert_eq!(
+            rs.decide(&flow(None, Some("9.9.9.9"), 8080)).0,
+            Decision::Proxy("Работа2".into())
+        );
+        assert_eq!(
+            rs.decide(&flow(None, Some("9.9.9.9"), 8000)).0,
+            Decision::Proxy("Работа2".into())
+        );
+        assert_eq!(
+            rs.decide(&flow(None, Some("9.9.9.9"), 9000)).0,
+            Decision::Proxy("Работа2".into())
+        );
         // Портов ниже 1000, вне диапазона, — напрямую.
-        assert_eq!(rs.decide(&flow(None, Some("9.9.9.9"), 500)).0, Decision::Direct);
+        assert_eq!(
+            rs.decide(&flow(None, Some("9.9.9.9"), 500)).0,
+            Decision::Direct
+        );
         // Форма `1000+` ловит всё от 1000 и выше; 443 под неё не попадает,
         // потому что 443 ниже 1000.
-        assert_eq!(rs.decide(&flow(None, Some("9.9.9.9"), 1000)).0, Decision::Proxy("Рабата3".into()));
-        assert_eq!(rs.decide(&flow(None, Some("9.9.9.9"), 65535)).0, Decision::Proxy("Рабата3".into()));
+        assert_eq!(
+            rs.decide(&flow(None, Some("9.9.9.9"), 1000)).0,
+            Decision::Proxy("Рабата3".into())
+        );
+        assert_eq!(
+            rs.decide(&flow(None, Some("9.9.9.9"), 65535)).0,
+            Decision::Proxy("Рабата3".into())
+        );
     }
 
     #[test]
     fn cidr_matching_v4_and_v6() {
-        let rs = set(&["IP-CIDR,10.0.0.0/8,DIRECT", "IP-CIDR,2001:db8::/32,DIRECT", "MATCH,Работа"], "Работа");
-        assert_eq!(rs.decide(&flow(None, Some("10.1.2.3"), 1)).0, Decision::Direct);
-        assert_eq!(rs.decide(&flow(None, Some("2001:db8::1"), 1)).0, Decision::Direct);
-        assert_eq!(rs.decide(&flow(None, Some("11.0.0.1"), 1)).0, Decision::Proxy("Работа".into()));
+        let rs = set(
+            &[
+                "IP-CIDR,10.0.0.0/8,DIRECT",
+                "IP-CIDR,2001:db8::/32,DIRECT",
+                "MATCH,Работа",
+            ],
+            "Работа",
+        );
+        assert_eq!(
+            rs.decide(&flow(None, Some("10.1.2.3"), 1)).0,
+            Decision::Direct
+        );
+        assert_eq!(
+            rs.decide(&flow(None, Some("2001:db8::1"), 1)).0,
+            Decision::Direct
+        );
+        assert_eq!(
+            rs.decide(&flow(None, Some("11.0.0.1"), 1)).0,
+            Decision::Proxy("Работа".into())
+        );
     }
 
     #[test]
@@ -583,27 +671,52 @@ mod tests {
         let mut udp = flow(None, Some("1.1.1.1"), 53);
         udp.is_tcp = false;
         assert_eq!(rs.decide(&udp).0, Decision::Direct);
-        assert_eq!(rs.decide(&flow(None, Some("1.1.1.1"), 443)).0, Decision::Proxy("Работа".into()));
+        assert_eq!(
+            rs.decide(&flow(None, Some("1.1.1.1"), 443)).0,
+            Decision::Proxy("Работа".into())
+        );
     }
 
     #[test]
     fn regex_rule() {
-        let rs = set(&[r"DOMAIN-REGEX,^ads[0-9]*\.,REJECT", "MATCH,DIRECT"], "DIRECT");
-        assert_eq!(rs.decide(&flow(Some("ads12.example.com"), None, 80)).0, Decision::Reject);
-        assert_eq!(rs.decide(&flow(Some("myads.example.com"), None, 80)).0, Decision::Direct);
+        let rs = set(
+            &[r"DOMAIN-REGEX,^ads[0-9]*\.,REJECT", "MATCH,DIRECT"],
+            "DIRECT",
+        );
+        assert_eq!(
+            rs.decide(&flow(Some("ads12.example.com"), None, 80)).0,
+            Decision::Reject
+        );
+        assert_eq!(
+            rs.decide(&flow(Some("myads.example.com"), None, 80)).0,
+            Decision::Direct
+        );
     }
 
     #[test]
     fn missing_domain_never_matches_domain_rules() {
         let rs = set(&["DOMAIN,example.com,REJECT", "MATCH,DIRECT"], "DIRECT");
-        assert_eq!(rs.decide(&flow(None, Some("8.8.8.8"), 80)).0, Decision::Direct);
+        assert_eq!(
+            rs.decide(&flow(None, Some("8.8.8.8"), 80)).0,
+            Decision::Direct
+        );
     }
 
     #[test]
     fn geo_rules_without_data_do_not_crash() {
-        let rs = set(&["GEOSITE,category-ads-all,REJECT", "GEOIP,cn,DIRECT", "MATCH,Работа"], "Работа");
+        let rs = set(
+            &[
+                "GEOSITE,category-ads-all,REJECT",
+                "GEOIP,cn,DIRECT",
+                "MATCH,Работа",
+            ],
+            "Работа",
+        );
         assert_eq!(rs.missing_geo().len(), 2);
-        assert_eq!(rs.decide(&flow(Some("ads.example"), None, 80)).0, Decision::Proxy("Работа".into()));
+        assert_eq!(
+            rs.decide(&flow(Some("ads.example"), None, 80)).0,
+            Decision::Proxy("Работа".into())
+        );
     }
 
     #[test]

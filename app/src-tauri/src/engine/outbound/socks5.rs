@@ -33,7 +33,9 @@ const ATYP_IPV4: u8 = 0x01;
 /// передать сюда IP, а не домен.
 pub async fn resolve_target_addr(target: &Target) -> Result<SocketAddr> {
     use std::net::ToSocketAddrs;
-    let addrs: Vec<_> = (target.host.as_str(), target.port).to_socket_addrs()?.collect();
+    let addrs: Vec<_> = (target.host.as_str(), target.port)
+        .to_socket_addrs()?
+        .collect();
     addrs
         .first()
         .copied()
@@ -85,7 +87,10 @@ impl SocksProxy {
         let mut reply = [0u8; 2];
         tcp.read_exact(&mut reply).await?;
         if reply[0] != VER {
-            return Err(Error::protocol("socks", format!("плохая версия в ответе: {}", reply[0])));
+            return Err(Error::protocol(
+                "socks",
+                format!("плохая версия в ответе: {}", reply[0]),
+            ));
         }
         match reply[1] {
             0x00 => Ok(()),
@@ -140,7 +145,10 @@ impl SocksProxy {
         let mut head = [0u8; 4];
         tcp.read_exact(&mut head).await?;
         if head[0] != VER {
-            return Err(Error::protocol("socks", format!("плохая версия в ответе: {}", head[0])));
+            return Err(Error::protocol(
+                "socks",
+                format!("плохая версия в ответе: {}", head[0]),
+            ));
         }
         if head[1] != 0x00 {
             let reason = match head[1] {
@@ -152,9 +160,17 @@ impl SocksProxy {
                 0x06 => "TTL истёк",
                 0x07 => "команда не поддерживается",
                 0x08 => "тип адреса не поддерживается",
-                n => return Err(Error::protocol("socks", format!("неизвестный код ответа {n:#x}"))),
+                n => {
+                    return Err(Error::protocol(
+                        "socks",
+                        format!("неизвестный код ответа {n:#x}"),
+                    ))
+                }
             };
-            return Err(Error::protocol("socks", format!("прокси отклонил запрос: {reason}")));
+            return Err(Error::protocol(
+                "socks",
+                format!("прокси отклонил запрос: {reason}"),
+            ));
         }
 
         // Точная длина ответа зависит от типа адреса в нём.
@@ -180,7 +196,10 @@ impl SocksProxy {
                 rest.extend_from_slice(&b);
             }
             other => {
-                return Err(Error::protocol("socks", format!("неизвестный тип адреса {other:#x} в ответе")))
+                return Err(Error::protocol(
+                    "socks",
+                    format!("неизвестный тип адреса {other:#x} в ответе"),
+                ))
             }
         }
         parse_socks_addr(&rest)
@@ -214,12 +233,19 @@ impl Outbound for SocksProxy {
 
     async fn open_udp(&self) -> Result<Arc<dyn UdpSession>> {
         if !self.udp {
-            return Err(Error::protocol("socks", "UDP отключён в конфигурации outbound'а"));
+            return Err(Error::protocol(
+                "socks",
+                "UDP отключён в конфигурации outbound'а",
+            ));
         }
         let mut tcp = connect_proxy(self.server, Duration::from_secs(10)).await?;
         self.handshake(&mut tcp).await?;
         // UDP ASSOCIATE с адресом 0.0.0.0:0 — прокси сам выберет порт.
-        let any = Target { host: "0.0.0.0".into(), port: 0, is_tcp: false };
+        let any = Target {
+            host: "0.0.0.0".into(),
+            port: 0,
+            is_tcp: false,
+        };
         let (bind_host, bind_port) = self.request(&mut tcp, CMD_UDP_ASSOCIATE, &any).await?;
         tcp.flush().await?;
 
@@ -229,7 +255,11 @@ impl Outbound for SocksProxy {
         } else {
             bind_host
         };
-        let relay_port = if bind_port == 0 { self.server.port() } else { bind_port };
+        let relay_port = if bind_port == 0 {
+            self.server.port()
+        } else {
+            bind_port
+        };
 
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         sock.connect(format!("{relay_host}:{relay_port}")).await?;
@@ -239,7 +269,11 @@ impl Outbound for SocksProxy {
 
     async fn probe(&self, timeout: Duration) -> ProbeResult {
         let started = std::time::Instant::now();
-        let target = Target { host: "www.gstatic.com".into(), port: 443, is_tcp: true };
+        let target = Target {
+            host: "www.gstatic.com".into(),
+            port: 443,
+            is_tcp: true,
+        };
         let req = Request { target };
         let r = tokio::time::timeout(timeout, self.connect(&req)).await;
         let resolved_via = Some(if self.remote_dns { "remote" } else { "local" });
@@ -281,11 +315,9 @@ impl UdpSession for SocksUdp {
     async fn send_to(&self, data: &[u8], dst: &Target) -> Result<()> {
         let mut pkt = Vec::with_capacity(data.len() + 22);
         pkt.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV
-        let addr = if dst.host.parse::<std::net::IpAddr>().is_ok() {
-            socks_addr_bytes(&dst.host, dst.port)?
-        } else {
-            socks_addr_bytes(&dst.host, dst.port)?
-        };
+                                                    // `socks_addr_bytes` сам разбирает, IP это или домен, и ставит
+                                                    // нужный ATYP. Отдельная ветка для IP ничего не меняла.
+        let addr = socks_addr_bytes(&dst.host, dst.port)?;
         pkt.extend_from_slice(&addr);
         pkt.extend_from_slice(data);
         self.inner.send(&pkt).await?;
@@ -306,7 +338,12 @@ impl UdpSession for SocksUdp {
             0x01 => 4 + 2,
             0x04 => 16 + 2,
             0x03 => 1 + pkt[4] as usize + 2,
-            _ => return Err(Error::protocol("socks", "неизвестный тип адреса в UDP-ответе")),
+            _ => {
+                return Err(Error::protocol(
+                    "socks",
+                    "неизвестный тип адреса в UDP-ответе",
+                ))
+            }
         };
         let payload_at = 4 + addr_len;
         if n <= payload_at {
@@ -316,11 +353,20 @@ impl UdpSession for SocksUdp {
         let len = n - payload_at;
         let len = len.min(buf.len());
         buf[..len].copy_from_slice(&pkt[payload_at..payload_at + len]);
-        Ok((len, Target { host, port, is_tcp: false }))
+        Ok((
+            len,
+            Target {
+                host,
+                port,
+                is_tcp: false,
+            },
+        ))
     }
 
     fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+        self.inner
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
     }
 }
 
@@ -350,11 +396,8 @@ mod tests {
             };
             // Фаза 1: приветствие. Клиент шлёт его одним write, читаем одним read.
             let mut buf = vec![0u8; 4096];
-            let n = match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                s.read(&mut buf),
-            )
-            .await
+            let n = match tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut buf))
+                .await
             {
                 Ok(Ok(n)) => n,
                 _ => return,
@@ -364,11 +407,8 @@ mod tests {
             let _ = s.write_all(&[VER, 0x00]).await;
 
             // Фаза 2: запрос CONNECT. Он тоже приходит одним write.
-            let n = match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                s.read(&mut buf),
-            )
-            .await
+            let n = match tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut buf))
+                .await
             {
                 Ok(Ok(n)) => n,
                 _ => return,
@@ -409,13 +449,19 @@ mod tests {
         // Ищем последнее вхождение CMD: приветствие [05,01,00] содержит ту же
         // пару байт, что и начало запроса.
         let req = captured.lock().unwrap().clone();
-        assert!(req.len() > 16, "сервер должен был увидеть приветствие и запрос");
+        assert!(
+            req.len() > 16,
+            "сервер должен был увидеть приветствие и запрос"
+        );
         let atyp_pos = req
             .windows(2)
             .rposition(|w| w == [CMD_CONNECT, 0x00])
             .map(|i| i + 2)
             .expect("нет запроса CONNECT");
-        assert_eq!(req[atyp_pos], 0x03, "домен обязан передаваться прокси как домен");
+        assert_eq!(
+            req[atyp_pos], 0x03,
+            "домен обязан передаваться прокси как домен"
+        );
         let len = req[atyp_pos + 1] as usize;
         let host = String::from_utf8_lossy(&req[atyp_pos + 2..atyp_pos + 2 + len]);
         assert_eq!(host, "example.com");
@@ -434,7 +480,10 @@ mod tests {
             .rposition(|w| w == [CMD_CONNECT, 0x00])
             .map(|i| i + 2)
             .expect("нет запроса CONNECT");
-        assert_eq!(req[pos], 0x01, "при remote_dns=false уходит IPv4, а не домен");
+        assert_eq!(
+            req[pos], 0x01,
+            "при remote_dns=false уходит IPv4, а не домен"
+        );
         assert_eq!(&req[pos + 1..pos + 5], &[127, 0, 0, 1]);
     }
 
@@ -443,7 +492,11 @@ mod tests {
         // REP = 0x02 «правило запрещает».
         let (addr, _) = fake_socks(0x02).await;
         let p = SocksProxy::new(cfg(addr, true)).unwrap();
-        let err = p.connect(&Request::tcp("example.com", 80)).await.err().expect("ожидалась ошибка");
+        let err = p
+            .connect(&Request::tcp("example.com", 80))
+            .await
+            .err()
+            .expect("ожидалась ошибка");
         assert!(err.to_string().contains("запрещает"), "{err}");
     }
 
@@ -453,14 +506,21 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut s, _) = match listener.accept().await { Ok(v) => v, Err(_) => return };
+            let (mut s, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
             let mut buf = vec![0u8; 64];
             let _ = s.read(&mut buf).await;
             // Отвечаем: требуется username/password.
             let _ = s.write_all(&[VER, 0x02]).await;
         });
         let p = SocksProxy::new(cfg(addr, true)).unwrap();
-        let err = p.connect(&Request::tcp("example.com", 80)).await.err().expect("ожидалась ошибка");
+        let err = p
+            .connect(&Request::tcp("example.com", 80))
+            .await
+            .err()
+            .expect("ожидалась ошибка");
         assert!(err.to_string().contains("логин"), "{err}");
     }
 

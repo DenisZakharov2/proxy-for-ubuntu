@@ -40,11 +40,14 @@ impl Outbound for Direct {
     async fn connect(&self, req: &Request) -> Result<Box<dyn AsyncReadWrite>> {
         let target = &req.target;
         if target.is_tcp {
-            let stream = resolve_and_connect(&target.host, target.port, Duration::from_secs(15))
-                .await?;
+            let stream =
+                resolve_and_connect(&target.host, target.port, Duration::from_secs(15)).await?;
             Ok(Box::new(stream))
         } else {
-            Err(Error::protocol("direct", "UDP обрабатывается через open_udp"))
+            Err(Error::protocol(
+                "direct",
+                "UDP обрабатывается через open_udp",
+            ))
         }
     }
 
@@ -54,11 +57,7 @@ impl Outbound for Direct {
 }
 
 /// Резолвит хост (или использует готовый IP) и подключается.
-pub async fn resolve_and_connect(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<TcpStream> {
+pub async fn resolve_and_connect(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
     use std::net::ToSocketAddrs;
     let addrs: Vec<_> = (host, port).to_socket_addrs()?.collect();
     if addrs.is_empty() {
@@ -75,13 +74,18 @@ pub async fn resolve_and_connect(
             }
             Ok(Err(e)) => last = Some(e),
             Err(_) => {
-                return Err(Error::Timeout(format!("{host}:{port} не ответил за {timeout:?}")))
+                return Err(Error::Timeout(format!(
+                    "{host}:{port} не ответил за {timeout:?}"
+                )))
             }
         }
     }
     Err(Error::Protocol {
         proto: "direct",
-        message: format!("не удалось подключиться к {host}:{port}: {}", last.map(|e| e.to_string()).unwrap_or_default()),
+        message: format!(
+            "не удалось подключиться к {host}:{port}: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ),
     })
 }
 
@@ -92,7 +96,9 @@ struct DirectUdp {
 
 impl DirectUdp {
     async fn new() -> Result<Self> {
-        Ok(Self { sock: tokio::net::UdpSocket::bind("0.0.0.0:0").await? })
+        Ok(Self {
+            sock: tokio::net::UdpSocket::bind("0.0.0.0:0").await?,
+        })
     }
 }
 
@@ -113,11 +119,20 @@ impl UdpSession for DirectUdp {
             .await
             .map_err(|_| Error::Timeout("UDP: нет данных".into()))??;
         let (n, addr) = n;
-        Ok((n, crate::engine::rules::Target { host: addr.ip().to_string(), port: addr.port(), is_tcp: false }))
+        Ok((
+            n,
+            crate::engine::rules::Target {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                is_tcp: false,
+            },
+        ))
     }
 
     fn local_addr(&self) -> std::net::SocketAddr {
-        self.sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+        self.sock
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
     }
 }
 

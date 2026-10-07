@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 #[allow(unused_imports)]
 use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
@@ -54,18 +54,34 @@ impl Trojan {
             .first()
             .copied()
             .ok_or_else(|| Error::ConfigInvalid(format!("{} не разрешается", cfg.server)))?;
-        let host_header = if cfg.sni.is_empty() { cfg.server.clone() } else { cfg.sni.clone() };
+        let host_header = if cfg.sni.is_empty() {
+            cfg.server.clone()
+        } else {
+            cfg.sni.clone()
+        };
         let tls_connector = build_tls_config(&host_header, &cfg.alpn, cfg.skip_cert_verify)?;
         let hash = trojan_hash(&cfg.password);
         let mut password_hash = [0u8; 56];
         password_hash.copy_from_slice(hash.as_bytes());
-        Ok(Self { name: cfg.name, server, host_header, password_hash, tls_connector, udp: cfg.udp })
+        Ok(Self {
+            name: cfg.name,
+            server,
+            host_header,
+            password_hash,
+            tls_connector,
+            udp: cfg.udp,
+        })
     }
 
     async fn open_tls(&self) -> Result<TlsStream<TcpStream>> {
         let tcp = connect_proxy(self.server, Duration::from_secs(10)).await?;
-        let name = rustls::pki_types::ServerName::try_from(self.host_header.clone())
-            .map_err(|e| Error::Tls(format!("недопустимое имя сервера {:?}: {e}", self.host_header)))?;
+        let name =
+            rustls::pki_types::ServerName::try_from(self.host_header.clone()).map_err(|e| {
+                Error::Tls(format!(
+                    "недопустимое имя сервера {:?}: {e}",
+                    self.host_header
+                ))
+            })?;
         self.tls_connector
             .connect(name, tcp)
             .await
@@ -101,7 +117,13 @@ impl Outbound for Trojan {
         head.extend_from_slice(b"\r\n");
         tls.write_all(&head).await?;
         tls.flush().await?;
-        Ok(Box::new(TrojanStream { inner: tls, password_hash: self.password_hash, out: VecDeque::new(), sig: [0u8; SIG_LEN], sig_filled: 0 }))
+        Ok(Box::new(TrojanStream {
+            inner: tls,
+            password_hash: self.password_hash,
+            out: VecDeque::new(),
+            sig: [0u8; SIG_LEN],
+            sig_filled: 0,
+        }))
     }
 
     async fn open_udp(&self) -> Result<Arc<dyn UdpSession>> {
@@ -127,53 +149,52 @@ struct TrojanStream {
 }
 
 impl AsyncRead for TrojanStream {
-    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-        loop {
-            let me = self.as_mut().get_mut();
-            // 1. Снимаем подпись.
-            while me.sig_filled < SIG_LEN {
-                let n = match poll_read_into(&mut me.inner, cx, &mut me.sig[me.sig_filled..]) {
-                    std::task::Poll::Pending => return std::task::Poll::Pending,
-                    std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                    std::task::Poll::Ready(Ok(n)) => n,
-                };
-                if n == 0 {
-                    return std::task::Poll::Ready(if me.sig_filled == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "trojan: поток оборвался внутри подписи",
-                        ))
-                    });
-                }
-                me.sig_filled += n;
-            }
-            if me.sig[..56] != me.password_hash {
-                return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "trojan: сервер прислал неверную подпись пароля",
-                )));
-            }
-            me.sig_filled = 0;
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
 
-            // 2. Есть ли данные? Если poll_read сразу дал 0 — конец потока.
-            // Данные читаем прямо в буфер вызывающего: копировать в
-            // промежуточный буфер означало бы двойной memcpy на каждом пакете.
-            let filled = buf.remaining();
-            let spare = buf.initialize_unfilled();
-            match poll_read_into(&mut me.inner, cx, spare) {
+        // 1. Снимаем подпись: 56 hex-символов SHA224(пароль) + CRLF.
+        //    Накапливаем по частям — TCP не обязан прислать её целиком.
+        while me.sig_filled < SIG_LEN {
+            let n = match poll_read_into(&mut me.inner, cx, &mut me.sig[me.sig_filled..]) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
                 std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Ready(Ok(n)) => {
-                    buf.advance(n);
-                    if n == 0 || n < filled {
-                        return std::task::Poll::Ready(Ok(()));
-                    }
-                    return std::task::Poll::Ready(Ok(()));
-                }
+                std::task::Poll::Ready(Ok(n)) => n,
+            };
+            if n == 0 {
+                return std::task::Poll::Ready(if me.sig_filled == 0 {
+                    // Ровно на границе: поток закрылся штатно.
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "trojan: поток оборвался внутри подписи",
+                    ))
+                });
             }
+            me.sig_filled += n;
         }
+
+        if me.sig[..56] != me.password_hash {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trojan: сервер прислал неверную подпись пароля",
+            )));
+        }
+        me.sig_filled = 0;
+
+        // 2. Читаем полезную нагрузку прямо в буфер вызывающего: промежуточный
+        //    буфер означал бы лишний memcpy на каждом пакете.
+        let n = match poll_read_into(&mut me.inner, cx, buf.initialize_unfilled()) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Ready(Ok(n)) => n,
+        };
+        buf.advance(n);
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -270,7 +291,10 @@ mod tests {
         let t = Trojan::new(cfg()).unwrap();
         let err = t.open_udp().await.err().expect("ожидалась ошибка");
         let msg = err.to_string();
-        assert!(msg.contains("SOCKS5h"), "ошибка должна подсказывать решение: {msg}");
+        assert!(
+            msg.contains("SOCKS5h"),
+            "ошибка должна подсказывать решение: {msg}"
+        );
     }
 
     #[test]

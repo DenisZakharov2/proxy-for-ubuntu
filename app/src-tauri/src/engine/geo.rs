@@ -35,7 +35,9 @@ pub enum GeoEntry {
     Cidr(IpNet),
     Domain(String),
     /// Заглушка на случай битого файла — не роняет загрузку, попадает в счётчик.
-    Invalid { line: String },
+    Invalid {
+        line: String,
+    },
 }
 
 impl GeoEntry {
@@ -45,8 +47,13 @@ impl GeoEntry {
                 .parse::<IpNet>()
                 .map(GeoEntry::Cidr)
                 // Частая ошибка в чужих списках: `1.2.3.4/32` иногда пишут без маски.
-                .or_else(|_| line.parse::<IpAddr>().map(|ip| GeoEntry::Cidr(IpNet::from(ip))))
-                .unwrap_or_else(|_| GeoEntry::Invalid { line: line.to_string() }),
+                .or_else(|_| {
+                    line.parse::<IpAddr>()
+                        .map(|ip| GeoEntry::Cidr(IpNet::from(ip)))
+                })
+                .unwrap_or_else(|_| GeoEntry::Invalid {
+                    line: line.to_string(),
+                }),
             GeoKind::Geosite => GeoEntry::Domain(line.to_ascii_lowercase()),
         }
     }
@@ -80,7 +87,9 @@ pub struct GeoRegistry {
 
 impl std::fmt::Debug for GeoRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GeoRegistry").field("count", &self.sets.len()).finish()
+        f.debug_struct("GeoRegistry")
+            .field("count", &self.sets.len())
+            .finish()
     }
 }
 
@@ -98,7 +107,10 @@ impl std::fmt::Debug for GeoSetHandle {
 
 impl GeoSetHandle {
     pub fn entries(&self) -> Vec<GeoEntry> {
-        self.inner.read().map(|g| g.entries.clone()).unwrap_or_default()
+        self.inner
+            .read()
+            .map(|g| g.entries.clone())
+            .unwrap_or_default()
     }
 
     pub fn meta(&self) -> GeoMeta {
@@ -143,7 +155,10 @@ impl GeoSet {
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(|l| GeoEntry::parse(kind, l))
             .collect();
-        let invalid = entries.iter().filter(|e| matches!(e, GeoEntry::Invalid { .. })).count();
+        let invalid = entries
+            .iter()
+            .filter(|e| matches!(e, GeoEntry::Invalid { .. }))
+            .count();
         if invalid > 0 {
             tracing::warn!(set = tag, kind = ?kind, invalid, "часть строк набора не распознана");
         }
@@ -170,7 +185,9 @@ fn set_file(kind: GeoKind, tag: &str) -> PathBuf {
         GeoKind::Geoip => "geoip",
         GeoKind::Geosite => "geosite",
     };
-    paths::geo_dir().join(sub).join(format!("{}.txt", sanitize_tag(tag)))
+    paths::geo_dir()
+        .join(sub)
+        .join(format!("{}.txt", sanitize_tag(tag)))
 }
 
 /// Имя тега входит в имя файла — не пропускаем никакие символы, кроме
@@ -179,7 +196,13 @@ fn set_file(kind: GeoKind, tag: &str) -> PathBuf {
 fn sanitize_tag(tag: &str) -> String {
     let cleaned: String = tag
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "unnamed".into()
@@ -204,7 +227,9 @@ mod sanitize_tag {
 impl GeoRegistry {
     /// Пустой реестр — для тестов и для запуска без geo-данных.
     pub fn empty() -> Self {
-        Self { sets: HashMap::new() }
+        Self {
+            sets: HashMap::new(),
+        }
     }
 
     /// Загружает с диска все наборы, упомянутые в правилах, плюс все, что уже
@@ -217,18 +242,30 @@ impl GeoRegistry {
                 GeoKind::Geoip => "geoip",
                 GeoKind::Geosite => "geosite",
             });
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in rd.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("txt") {
                     continue;
                 }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
                 let key = (kind_dir, stem.to_string());
                 if !needed.is_empty() && !needed.contains(&key) {
                     continue;
                 }
-                if let Ok(handle) = Self::load_file(&path, kind_dir, stem, &std::fs::metadata(&path).ok().map(|m| m.len() as i64).unwrap_or(0)) {
+                if let Ok(handle) = Self::load_file(
+                    &path,
+                    kind_dir,
+                    stem,
+                    &std::fs::metadata(&path)
+                        .ok()
+                        .map(|m| m.len() as i64)
+                        .unwrap_or(0),
+                ) {
                     sets.insert(key, Arc::new(handle));
                 }
             }
@@ -240,7 +277,9 @@ impl GeoRegistry {
         let text = std::fs::read_to_string(path)?;
         let mut set = GeoSet::parse(kind, tag, &text, path.display().to_string().as_str());
         set.sha256 = sha256_hex(text.as_bytes());
-        Ok(GeoSetHandle { inner: RwLock::new(set) })
+        Ok(GeoSetHandle {
+            inner: RwLock::new(set),
+        })
     }
 
     /// Набор по тегу. `None` — если его скачать не удалось; правило с таким
@@ -251,7 +290,7 @@ impl GeoRegistry {
 
     pub fn list(&self) -> Vec<GeoMeta> {
         let mut v: Vec<GeoMeta> = self.sets.values().map(|h| h.meta()).collect();
-        v.sort_by(|a, b| (a.kind as u8, &a.tag).cmp(&(b.kind as u8, &b.tag)));
+        v.sort_by_key(|m| (m.kind as u8, m.tag.clone()));
         v
     }
 
@@ -308,7 +347,12 @@ mod tests {
 
     #[test]
     fn parses_geoip_cidr_with_and_without_mask() {
-        let s = GeoSet::parse(GeoKind::Geoip, "cn", "1.0.1.0/24\n8.8.8.8\n# c\n\nbad-line", "t");
+        let s = GeoSet::parse(
+            GeoKind::Geoip,
+            "cn",
+            "1.0.1.0/24\n8.8.8.8\n# c\n\nbad-line",
+            "t",
+        );
         assert_eq!(s.entries.len(), 3);
         assert!(s.entries[0].contains_ip("1.0.1.5".parse().unwrap()));
         assert!(s.entries[1].contains_ip("8.8.8.8".parse().unwrap()));

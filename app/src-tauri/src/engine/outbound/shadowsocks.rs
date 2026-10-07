@@ -78,7 +78,10 @@ impl Cipher {
     }
 
     fn seal(&self, nonce: &[u8; NONCE_LEN], plaintext: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
-        let p = Payload { msg: plaintext, aad: ad };
+        let p = Payload {
+            msg: plaintext,
+            aad: ad,
+        };
         let n = chacha20poly1305::Nonce::from_slice(nonce);
         match self {
             Cipher::ChaCha(c) => c
@@ -94,18 +97,30 @@ impl Cipher {
     }
 
     fn open(&self, nonce: &[u8; NONCE_LEN], ciphertext: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
-        let p = Payload { msg: ciphertext, aad: ad };
+        let p = Payload {
+            msg: ciphertext,
+            aad: ad,
+        };
         let n = chacha20poly1305::Nonce::from_slice(nonce);
         match self {
-            Cipher::ChaCha(c) => c
-                .decrypt(n, p)
-                .map_err(|_| Error::protocol("ss", "ошибка расшифровки: неверный ключ или данные повреждены")),
-            Cipher::Aes128(c) => c
-                .decrypt(AesNonce::from_slice(nonce), p)
-                .map_err(|_| Error::protocol("ss", "ошибка расшифровки: неверный ключ или данные повреждены")),
-            Cipher::Aes256(c) => c
-                .decrypt(AesNonce::from_slice(nonce), p)
-                .map_err(|_| Error::protocol("ss", "ошибка расшифровки: неверный ключ или данные повреждены")),
+            Cipher::ChaCha(c) => c.decrypt(n, p).map_err(|_| {
+                Error::protocol(
+                    "ss",
+                    "ошибка расшифровки: неверный ключ или данные повреждены",
+                )
+            }),
+            Cipher::Aes128(c) => c.decrypt(AesNonce::from_slice(nonce), p).map_err(|_| {
+                Error::protocol(
+                    "ss",
+                    "ошибка расшифровки: неверный ключ или данные повреждены",
+                )
+            }),
+            Cipher::Aes256(c) => c.decrypt(AesNonce::from_slice(nonce), p).map_err(|_| {
+                Error::protocol(
+                    "ss",
+                    "ошибка расшифровки: неверный ключ или данные повреждены",
+                )
+            }),
         }
     }
 }
@@ -177,7 +192,11 @@ struct Sealer {
 
 impl Sealer {
     fn new(cipher: Cipher) -> Self {
-        Self { cipher, nonce: [0u8; NONCE_LEN], queue: Vec::new() }
+        Self {
+            cipher,
+            nonce: [0u8; NONCE_LEN],
+            queue: Vec::new(),
+        }
     }
 
     /// Нарезает `plain` на чанты и кладёт их в очередь. Синхронно.
@@ -273,7 +292,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for OpenStream<S> {
                 }
                 // Это длина шифротекста, а не полезной нагрузки.
                 let ct_len = u16::from_be_bytes([me.hdr[0], me.hdr[1]]) as usize;
-                if ct_len < FRAME_LEN_SIZE + TAG_LEN || ct_len > MAX_CHUNK + FRAME_LEN_SIZE + TAG_LEN {
+                if !(FRAME_LEN_SIZE + TAG_LEN..=MAX_CHUNK + FRAME_LEN_SIZE + TAG_LEN)
+                    .contains(&ct_len)
+                {
                     return std::task::Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("нераспознанная длина кадра {ct_len}"),
@@ -302,24 +323,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for OpenStream<S> {
 
             let nonce = me.nonce;
             me.nonce = bump(nonce);
-            let plain = me
-                .cipher
-                .open(&nonce, &me.pay, &[])
-                .and_then(|v| {
-                    // Первые два байта открытого текста — длина полезной
-                    // нагрузки, дальше сами данные.
-                    if v.len() < FRAME_LEN_SIZE {
-                        return Err(Error::protocol("ss", "чант короче заголовка"));
-                    }
-                    let declared = u16::from_be_bytes([v[0], v[1]]) as usize;
-                    if v.len() != FRAME_LEN_SIZE + declared {
-                        return Err(Error::protocol(
-                            "ss",
-                            "длина внутри чанта не совпадает с его размером",
-                        ));
-                    }
-                    Ok(v[FRAME_LEN_SIZE..].to_vec())
-                });
+            let plain = me.cipher.open(&nonce, &me.pay, &[]).and_then(|v| {
+                // Первые два байта открытого текста — длина полезной
+                // нагрузки, дальше сами данные.
+                if v.len() < FRAME_LEN_SIZE {
+                    return Err(Error::protocol("ss", "чант короче заголовка"));
+                }
+                let declared = u16::from_be_bytes([v[0], v[1]]) as usize;
+                if v.len() != FRAME_LEN_SIZE + declared {
+                    return Err(Error::protocol(
+                        "ss",
+                        "длина внутри чанта не совпадает с его размером",
+                    ));
+                }
+                Ok(v[FRAME_LEN_SIZE..].to_vec())
+            });
             me.hdr_filled = 0;
             me.pay_filled = 0;
             me.state = RxState::Header;
@@ -386,9 +404,7 @@ impl AsyncWrite for ShadowsocksStream {
         }
         // Шифрование синхронное и быстрое: ошибки AEAD на записи невозможны,
         // в отличие от расшифровки, поэтому unwrap здесь безопасен.
-        me.sealer
-            .push(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        me.sealer.push(buf).map_err(std::io::Error::other)?;
         std::task::Poll::Ready(Ok(buf.len()))
     }
 
@@ -399,7 +415,12 @@ impl AsyncWrite for ShadowsocksStream {
         // Разбираем структуру на части: иначе нельзя одновременно держать
         // изменяемую ссылку на сокет и неизменяемую на очередь кадров.
         let me = self.get_mut();
-        let Self { write, sealer, sent, .. } = me;
+        let Self {
+            write,
+            sealer,
+            sent,
+            ..
+        } = me;
         while !sealer.queue.is_empty() {
             if *sent >= sealer.queue[0].len() {
                 sealer.queue.remove(0);
@@ -448,7 +469,13 @@ impl Shadowsocks {
             .copied()
             .ok_or_else(|| Error::ConfigInvalid(format!("{} не разрешается", cfg.server)))?;
         let master_key = derive_key(&cfg.method, &cfg.password);
-        Ok(Self { name: cfg.name, server, method: cfg.method, master_key, udp: cfg.udp })
+        Ok(Self {
+            name: cfg.name,
+            server,
+            method: cfg.method,
+            master_key,
+            udp: cfg.udp,
+        })
     }
 
     /// Открывает TCP-канал: генерирует соль, выводит подключевой ключ, шлёт
@@ -467,7 +494,7 @@ impl Shadowsocks {
             .sealer
             .cipher
             .seal(&stream.sealer.nonce, &payload, &[])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         stream.sealer.nonce = bump(stream.sealer.nonce);
 
         let mut framed = Vec::with_capacity(SALT_LEN + 2 + ct.len());
@@ -520,11 +547,20 @@ impl UdpSession for SsUdp {
         }
         let len = (plain.len() - at).min(buf.len());
         buf[..len].copy_from_slice(&plain[at..at + len]);
-        Ok((len, Target { host, port, is_tcp: false }))
+        Ok((
+            len,
+            Target {
+                host,
+                port,
+                is_tcp: false,
+            },
+        ))
     }
 
     fn local_addr(&self) -> SocketAddr {
-        self.sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+        self.sock
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
     }
 }
 
@@ -598,7 +634,11 @@ mod tests {
     #[test]
     fn nonce_increments_little_endian_with_carry() {
         // Обычный случай: младший байт растёт.
-        assert_eq!(bump([0u8; 12]), { let mut e = [0u8; 12]; e[0] = 1; e });
+        assert_eq!(bump([0u8; 12]), {
+            let mut e = [0u8; 12];
+            e[0] = 1;
+            e
+        });
         // Перенос: переполнившийся младший байт обнуляется, единица уходит
         // в следующий — счётчик little-endian.
         assert_eq!(bump([0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), {
@@ -613,7 +653,7 @@ mod tests {
     #[test]
     fn cipher_roundtrip_for_every_supported_method() {
         for m in ["chacha20-ietf-poly1305", "aes-128-gcm", "aes-256-gcm"] {
-            let key = vec![42u8; 32];
+            let key = [42u8; 32];
             let c = Cipher::new(m, &key[..if m == "aes-128-gcm" { 16 } else { 32 }]).unwrap();
             let nonce = [3u8; 12];
             let ct = c.seal(&nonce, b"hello shadowsocks", b"").unwrap();
@@ -622,7 +662,10 @@ mod tests {
             // Подмена байта должна давать ошибку аутентификации, а не мусор.
             let mut bad = ct.clone();
             bad[0] ^= 1;
-            assert!(c.open(&nonce, &bad, b"").is_err(), "{m} принял подделанный пакет");
+            assert!(
+                c.open(&nonce, &bad, b"").is_err(),
+                "{m} принял подделанный пакет"
+            );
         }
     }
 
@@ -684,13 +727,13 @@ mod tests {
 
         let mut r = OpenStream::new(client, c);
         let mut out = Vec::new();
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            r.read_to_end(&mut out),
-        )
-        .await
-        .expect("чтение не должно зависать на повреждённых данных");
-        assert!(res.is_err(), "повреждённый чант должен давать ошибку, а не данные");
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_to_end(&mut out))
+            .await
+            .expect("чтение не должно зависать на повреждённых данных");
+        assert!(
+            res.is_err(),
+            "повреждённый чант должен давать ошибку, а не данные"
+        );
     }
 
     #[test]
@@ -708,13 +751,20 @@ mod tests {
         })
         .unwrap();
         let c = Cipher::new(&s.method, &subkey(&s.master_key, &[0u8; 32])).unwrap();
-        let t = Target { host: "example.com".into(), port: 443, is_tcp: true };
+        let t = Target {
+            host: "example.com".into(),
+            port: 443,
+            is_tcp: true,
+        };
         let addr = socks_addr_bytes(&t.host, t.port).unwrap();
         let mut payload = Vec::new();
         payload.extend_from_slice(&(addr.len() as u16).to_be_bytes());
         payload.extend_from_slice(&addr);
         let ct = c.seal(&[0u8; 12], &payload, &[]).unwrap();
-        assert_eq!(u16::from_be_bytes([0u8, 0u8][..].try_into().unwrap()) as usize, 0);
+        assert_eq!(
+            u16::from_be_bytes([0u8, 0u8][..].try_into().unwrap()) as usize,
+            0
+        );
         assert_eq!(ct.len() - TAG_LEN, payload.len(), "полезная нагрузка чанта");
     }
 }

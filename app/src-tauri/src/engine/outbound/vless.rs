@@ -23,7 +23,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 use crate::config::OutboundVless;
-use crate::engine::outbound::{connect_proxy, poll_read_into, AsyncReadWrite, Outbound, Request, UdpSession};
+use crate::engine::outbound::{
+    connect_proxy, poll_read_into, AsyncReadWrite, Outbound, Request, UdpSession,
+};
 use crate::engine::rules::Target;
 use crate::engine::tls::build_tls_config;
 use crate::error::{Error, Result};
@@ -61,7 +63,11 @@ impl Vless {
             .copied()
             .ok_or_else(|| Error::ConfigInvalid(format!("{} не разрешается", cfg.server)))?;
 
-        let sni = if cfg.sni.is_empty() { cfg.server.clone() } else { cfg.sni.clone() };
+        let sni = if cfg.sni.is_empty() {
+            cfg.server.clone()
+        } else {
+            cfg.sni.clone()
+        };
         let use_ws = cfg.network.as_deref() == Some("ws");
         // Без TLS WebSocket тоже возможен (ws://), но сервер без TLS почти
         // всегда означает «забыли включить», поэтому требуем TLS для ws.
@@ -78,8 +84,16 @@ impl Vless {
             uuid: u,
             use_tls,
             use_ws,
-            path: if cfg.path.is_empty() { "/".into() } else { cfg.path.clone() },
-            host_header: if cfg.host.is_empty() { sni } else { cfg.host.clone() },
+            path: if cfg.path.is_empty() {
+                "/".into()
+            } else {
+                cfg.path.clone()
+            },
+            host_header: if cfg.host.is_empty() {
+                sni
+            } else {
+                cfg.host.clone()
+            },
             tls_connector,
             udp: cfg.udp,
         })
@@ -89,7 +103,7 @@ impl Vless {
     pub fn build_request_header(target: &Target, is_udp: bool) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(24 + target.host.len());
         out.push(0x00); // версия
-        // uuid добавит вызывающий: держим функцию чистой для тестирования.
+                        // uuid добавит вызывающий: держим функцию чистой для тестирования.
         out.push(0x00); // addonsLen
         out.push(if is_udp { CMD_UDP } else { CMD_TCP });
         out.extend_from_slice(&target.port.to_be_bytes());
@@ -137,7 +151,7 @@ impl Vless {
         let mut s = stream;
         let key = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
-            &rand::random::<[u8; 16]>(),
+            rand::random::<[u8; 16]>(),
         );
         let req = format!(
             "GET {} HTTP/1.1\r\n\
@@ -155,11 +169,17 @@ impl Vless {
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
             if s.read_exact(&mut byte).await.is_err() {
-                return Err(Error::protocol("vless", "сервер закрыл соединение на WS-рукопожатии"));
+                return Err(Error::protocol(
+                    "vless",
+                    "сервер закрыл соединение на WS-рукопожатии",
+                ));
             }
             head.push(byte[0]);
             if head.len() > 4096 {
-                return Err(Error::protocol("vless", "неразумный размер ответа на WS-рукопожатии"));
+                return Err(Error::protocol(
+                    "vless",
+                    "неразумный размер ответа на WS-рукопожатии",
+                ));
             }
         }
         let text = String::from_utf8_lossy(&head);
@@ -169,7 +189,10 @@ impl Vless {
                 .next()
                 .and_then(|l| l.split_whitespace().nth(1))
                 .unwrap_or("?");
-            return Err(Error::protocol("vless", format!("WS Upgrade отклонён, код {code}")));
+            return Err(Error::protocol(
+                "vless",
+                format!("WS Upgrade отклонён, код {code}"),
+            ));
         }
         Ok(WebSocket::<S>::new(s))
     }
@@ -190,7 +213,10 @@ pub fn encode_addr(host: &str) -> Result<Vec<u8>> {
         }
         Err(_) => {
             if host.len() > 255 {
-                return Err(Error::protocol("vless", format!("домен {host:?} длиннее 255 байт")));
+                return Err(Error::protocol(
+                    "vless",
+                    format!("домен {host:?} длиннее 255 байт"),
+                ));
             }
             out.push(ATYP_DOMAIN);
             out.push(host.len() as u8);
@@ -212,7 +238,12 @@ pub struct WebSocket<S> {
 
 impl<S> WebSocket<S> {
     pub fn new(inner: S) -> Self {
-        Self { inner, pending: Vec::new(), pending_pos: 0, closed: false }
+        Self {
+            inner,
+            pending: Vec::new(),
+            pending_pos: 0,
+            closed: false,
+        }
     }
 
     /// Кадр с маской (клиент обязан маскировать) и payload <= 125 байт.
@@ -344,7 +375,7 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WebSocket<S> {
                 }
                 0x9 => continue, // ping — отвечаем ниже в write, пока игнорируем
                 0xA => continue, // pong
-                0x1 | 0x2 | 0x0 => {
+                0x0..=0x2 => {
                     me.pending = payload;
                     me.pending_pos = 0;
                 }
@@ -428,7 +459,10 @@ impl Outbound for Vless {
     }
 
     async fn open_udp(&self) -> Result<Arc<dyn UdpSession>> {
-        Err(Error::protocol("vless", "UDP для VLESS не реализован; используйте SOCKS5h для QUIC"))
+        Err(Error::protocol(
+            "vless",
+            "UDP для VLESS не реализован; используйте SOCKS5h для QUIC",
+        ))
     }
 }
 
@@ -450,7 +484,11 @@ mod tests {
 
     #[test]
     fn header_layout() {
-        let t = Target { host: "example.com".into(), port: 443, is_tcp: true };
+        let t = Target {
+            host: "example.com".into(),
+            port: 443,
+            is_tcp: true,
+        };
         let h = Vless::build_request_header(&t, false).unwrap();
         assert_eq!(h[0], 0x00, "версия");
         assert_eq!(h[1], 0x00, "длина addons");
@@ -461,7 +499,11 @@ mod tests {
 
     #[test]
     fn udp_command_is_2() {
-        let t = Target { host: "1.1.1.1".into(), port: 53, is_tcp: false };
+        let t = Target {
+            host: "1.1.1.1".into(),
+            port: 53,
+            is_tcp: false,
+        };
         let h = Vless::build_request_header(&t, true).unwrap();
         assert_eq!(h[2], CMD_UDP);
     }

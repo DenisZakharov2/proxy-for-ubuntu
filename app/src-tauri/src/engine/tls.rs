@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 
 use crate::error::Result as PfuResult;
 
@@ -130,7 +130,11 @@ mod tests {
     fn alpn_is_accepted() {
         // Значения проверяем на этапе конфигурации: сам коннектор хранит
         // ALPN внутри rustls и не отдаёт его наружу.
-        let c = build_tls_config("example.com", &["h2".to_string(), "http/1.1".to_string()], false);
+        let c = build_tls_config(
+            "example.com",
+            &["h2".to_string(), "http/1.1".to_string()],
+            false,
+        );
         assert!(c.is_ok());
         assert!(build_tls_config("example.com", &["h2".to_string()], true).is_ok());
     }

@@ -89,7 +89,13 @@ impl Resolver {
         st.next = st.next.wrapping_add(1);
         let ip = IpAddr::V4(Ipv4Addr::from(u32::from(FAKE_IPV4) + (n % FAKE_IPV4_END)));
         st.reverse.insert(domain.to_ascii_lowercase(), ip);
-        st.forward.insert(ip, FakeEntry { domain: domain.to_ascii_lowercase(), expires: Instant::now() + Duration::from_secs(3600) });
+        st.forward.insert(
+            ip,
+            FakeEntry {
+                domain: domain.to_ascii_lowercase(),
+                expires: Instant::now() + Duration::from_secs(3600),
+            },
+        );
         Some(ip)
     }
 
@@ -102,7 +108,10 @@ impl Resolver {
     /// Резолвит домен в адреса с кэшем и TTL.
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         {
-            let cache = self.cache.lock().map_err(|_| Error::Internal("кэш DNS заблокирован".into()))?;
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| Error::Internal("кэш DNS заблокирован".into()))?;
             if let Some(e) = cache.get(domain) {
                 if e.expires > Instant::now() {
                     return Ok(e.addrs.clone());
@@ -116,7 +125,10 @@ impl Resolver {
             }
             cache.insert(
                 domain.to_string(),
-                CacheEntry { addrs: addrs.clone(), expires: Instant::now() + Duration::from_secs(self.cfg.cache_ttl) },
+                CacheEntry {
+                    addrs: addrs.clone(),
+                    expires: Instant::now() + Duration::from_secs(self.cfg.cache_ttl),
+                },
             );
         }
         Ok(addrs)
@@ -282,7 +294,10 @@ pub async fn read_tcp_dns(sock: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
     sock.read_exact(&mut len).await?;
     let n = u16::from_be_bytes(len) as usize;
     if n == 0 || n > 4096 {
-        return Err(Error::protocol("dns", format!("нераспознанная длина DNS {n}")));
+        return Err(Error::protocol(
+            "dns",
+            format!("нераспознанная длина DNS {n}"),
+        ));
     }
     let mut body = vec![0u8; n];
     sock.read_exact(&mut body).await?;
@@ -329,9 +344,12 @@ mod tests {
     fn parses_dns_question() {
         // a.example.com A ?
         let mut q = vec![0u8; 12];
-        q.push(1); q.extend_from_slice(b"a");
-        q.push(7); q.extend_from_slice(b"example");
-        q.push(3); q.extend_from_slice(b"com");
+        q.push(1);
+        q.extend_from_slice(b"a");
+        q.push(7);
+        q.extend_from_slice(b"example");
+        q.push(3);
+        q.extend_from_slice(b"com");
         q.push(0);
         q.extend_from_slice(&1u16.to_be_bytes());
         q.extend_from_slice(&1u16.to_be_bytes());
@@ -343,8 +361,11 @@ mod tests {
     #[test]
     fn dns_response_has_answers() {
         let mut q = vec![0u8; 12];
-        q[0] = 0xAB; q[1] = 0xCD; // id
-        q.push(3); q.extend_from_slice(b"com"); q.push(0);
+        q[0] = 0xAB;
+        q[1] = 0xCD; // id
+        q.push(3);
+        q.extend_from_slice(b"com");
+        q.push(0);
         q.extend_from_slice(&1u16.to_be_bytes());
         q.extend_from_slice(&1u16.to_be_bytes());
         let addrs = vec!["1.2.3.4".parse().unwrap()];

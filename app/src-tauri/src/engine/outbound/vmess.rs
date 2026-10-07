@@ -21,19 +21,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
-use aes::cipher::generic_array::GenericArray;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 use crate::config::OutboundVmess;
-use crate::engine::outbound::{connect_proxy, poll_read_into, AsyncReadWrite, Outbound, Request, UdpSession};
+use crate::engine::outbound::vless::WebSocket;
+use crate::engine::outbound::{
+    connect_proxy, poll_read_into, AsyncReadWrite, Outbound, Request, UdpSession,
+};
 use crate::engine::rules::Target;
 use crate::engine::tls::build_tls_config;
-use crate::engine::outbound::vless::WebSocket;
 use crate::error::{Error, Result};
 
 /// Заголовок ответа AEAD: 2 + 2 + 8 + 1 + 4 + 1 байт.
@@ -79,17 +81,17 @@ impl Security {
 /// AES-128-ECB с PKCS7, как требует vmess-aead для построения authID и
 /// буферов длины. Возвращает ровно один блок — 16 байт.
 pub fn aes_ecb_block(key: &[u8; 16], plaintext: &[u8]) -> [u8; 16] {
-    debug_assert!(plaintext.len() < 16, "PKCS7 требует хотя бы один байт заполнения");
+    debug_assert!(
+        plaintext.len() < 16,
+        "PKCS7 требует хотя бы один байт заполнения"
+    );
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut block = [0u8; 16];
     block[..plaintext.len()].copy_from_slice(plaintext);
+    // PKCS7: каждый байт заполнения равен их количеству. Именно это
+    // отличает PKCS7 от «добить нулями»: сервер должен уметь снять
+    // дополнение, а не угадывать его.
     let pad = 16 - (plaintext.len() % 16);
-    for (i, b) in block.iter_mut().enumerate().skip(plaintext.len()) {
-        *b = pad as u8;
-        let _ = i;
-        break;
-    }
-    // Заполняем весь хвост, а не только первый байт.
     for b in block.iter_mut().skip(plaintext.len()) {
         *b = pad as u8;
     }
@@ -126,11 +128,18 @@ impl Vmess {
             .first()
             .copied()
             .ok_or_else(|| Error::ConfigInvalid(format!("{} не разрешается", cfg.server)))?;
-        let sni = if cfg.sni.is_empty() { cfg.server.clone() } else { cfg.sni.clone() };
+        let sni = if cfg.sni.is_empty() {
+            cfg.server.clone()
+        } else {
+            cfg.sni.clone()
+        };
         let use_ws = cfg.network.as_deref() == Some("ws");
         let use_tls = cfg.tls || use_ws;
-        let tls_connector =
-            build_tls_config(&sni, &["h2".to_string(), "http/1.1".to_string()], cfg.skip_cert_verify)?;
+        let tls_connector = build_tls_config(
+            &sni,
+            &["h2".to_string(), "http/1.1".to_string()],
+            cfg.skip_cert_verify,
+        )?;
 
         Ok(Self {
             name: cfg.name,
@@ -139,8 +148,16 @@ impl Vmess {
             security,
             use_tls,
             use_ws,
-            path: if cfg.path.is_empty() { "/".into() } else { cfg.path.clone() },
-            host_header: if cfg.host.is_empty() { sni } else { cfg.host.clone() },
+            path: if cfg.path.is_empty() {
+                "/".into()
+            } else {
+                cfg.path.clone()
+            },
+            host_header: if cfg.host.is_empty() {
+                sni
+            } else {
+                cfg.host.clone()
+            },
             tls_connector,
             udp: cfg.udp,
         })
@@ -164,7 +181,7 @@ impl Vmess {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| Error::Internal(format!("часы идут назад: {e}")))?
-            .as_secs() as u64;
+            .as_secs();
         self.build_request_at(target, data, is_udp, ts)
     }
 
@@ -221,7 +238,7 @@ impl Vmess {
             if self.use_ws {
                 let key = base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
-                    &rand::random::<[u8; 16]>(),
+                    rand::random::<[u8; 16]>(),
                 );
                 let req = format!(
                     "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\n\
@@ -256,7 +273,10 @@ fn encode_addr_v(host: &str) -> Result<Vec<u8>> {
         }
         Err(_) => {
             if host.len() > 255 {
-                return Err(Error::protocol("vmess", format!("домен {host:?} длиннее 255 байт")));
+                return Err(Error::protocol(
+                    "vmess",
+                    format!("домен {host:?} длиннее 255 байт"),
+                ));
             }
             out.push(0x02);
             out.push(host.len() as u8);
@@ -293,14 +313,26 @@ pub fn aead_seal(
         Security::Aes128Gcm => {
             let c = aes_gcm::Aes128Gcm::new_from_slice(&full)
                 .map_err(|e| Error::protocol("vmess", e.to_string()))?;
-            c.encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
-                .map_err(|_| Error::protocol("vmess", "AES-128-GCM: ошибка шифрования"))
+            c.encrypt(
+                aes_gcm::Nonce::from_slice(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| Error::protocol("vmess", "AES-128-GCM: ошибка шифрования"))
         }
         Security::ChaCha20Poly1305 => {
             let c = chacha20poly1305::ChaCha20Poly1305::new_from_slice(&full)
                 .map_err(|e| Error::protocol("vmess", e.to_string()))?;
-            c.encrypt(chacha20poly1305::Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
-                .map_err(|_| Error::protocol("vmess", "ChaCha20-Poly1305: ошибка шифрования"))
+            c.encrypt(
+                chacha20poly1305::Nonce::from_slice(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| Error::protocol("vmess", "ChaCha20-Poly1305: ошибка шифрования"))
         }
     }
 }
@@ -318,14 +350,33 @@ pub fn aead_open(
         Security::Aes128Gcm => {
             let c = aes_gcm::Aes128Gcm::new_from_slice(&full)
                 .map_err(|e| Error::protocol("vmess", e.to_string()))?;
-            c.decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
-                .map_err(|_| Error::protocol("vmess", "AES-128-GCM: неверный ключ или данные повреждены"))
+            c.decrypt(
+                aes_gcm::Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| {
+                Error::protocol("vmess", "AES-128-GCM: неверный ключ или данные повреждены")
+            })
         }
         Security::ChaCha20Poly1305 => {
             let c = chacha20poly1305::ChaCha20Poly1305::new_from_slice(&full)
                 .map_err(|e| Error::protocol("vmess", e.to_string()))?;
-            c.decrypt(chacha20poly1305::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
-                .map_err(|_| Error::protocol("vmess", "ChaCha20-Poly1305: неверный ключ или данные повреждены"))
+            c.decrypt(
+                chacha20poly1305::Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| {
+                Error::protocol(
+                    "vmess",
+                    "ChaCha20-Poly1305: неверный ключ или данные повреждены",
+                )
+            })
         }
     }
 }
@@ -447,7 +498,10 @@ impl Outbound for Vmess {
     }
 
     async fn open_udp(&self) -> Result<Arc<dyn UdpSession>> {
-        Err(Error::protocol("vmess", "UDP для VMess не реализован; используйте SOCKS5h для QUIC"))
+        Err(Error::protocol(
+            "vmess",
+            "UDP для VMess не реализован; используйте SOCKS5h для QUIC",
+        ))
     }
 }
 
@@ -488,7 +542,11 @@ mod tests {
     #[test]
     fn request_header_layout_matches_spec() {
         let v = inst("auto");
-        let t = Target { host: "example.com".into(), port: 443, is_tcp: true };
+        let t = Target {
+            host: "example.com".into(),
+            port: 443,
+            is_tcp: true,
+        };
         let h = v.build_request_at(&t, b"hello", false, 1700000000).unwrap();
         assert_eq!(h[16..18].len(), 2, "authID(16) + lenBuf(2)");
         // Всё после заголовка должно дешифроваться тем же authID.
@@ -500,7 +558,11 @@ mod tests {
         // lenPlain — длина всего блока VMess (команда + адрес + данные),
         // а не только данных: 1 + 2 + atyp + 11 + 5 = 21 байт.
         let expected = Vmess::build_payload(&t, b"hello", false);
-        assert_eq!(&plain[..2], &(expected.len() as u16).to_be_bytes(), "lenPlain = длина payload");
+        assert_eq!(
+            &plain[..2],
+            &(expected.len() as u16).to_be_bytes(),
+            "lenPlain = длина payload"
+        );
         assert_eq!(&plain[2..2 + expected.len()], &expected[..]);
         // Открытый текст: lenPlain(2) || payload || crc32(4), поэтому данные
         // заканчиваются за 4 байта до конца блока, а не в самом конце.
@@ -508,29 +570,49 @@ mod tests {
         assert_eq!(&plain[at..at + 5], b"hello");
         // CRC32 занимает последние 4 байта всего открытого текста.
         let crc = crc32fast::hash(&[nonce, &plain[..plain.len() - 4]].concat());
-        assert_eq!(&plain[plain.len() - 4..], &crc.to_be_bytes(), "CRC32 не сошёлся");
+        assert_eq!(
+            &plain[plain.len() - 4..],
+            &crc.to_be_bytes(),
+            "CRC32 не сошёлся"
+        );
     }
 
     #[test]
     fn auth_id_depends_on_uuid_and_timestamp() {
         let a = inst("auto").build_request_at(
-            &Target { host: "a.com".into(), port: 1, is_tcp: true },
+            &Target {
+                host: "a.com".into(),
+                port: 1,
+                is_tcp: true,
+            },
             &[],
             false,
             1,
         );
         let b = inst("auto").build_request_at(
-            &Target { host: "a.com".into(), port: 1, is_tcp: true },
+            &Target {
+                host: "a.com".into(),
+                port: 1,
+                is_tcp: true,
+            },
             &[],
             false,
             2,
         );
-        assert_ne!(a.unwrap()[..16], b.unwrap()[..16], "authID обязан зависеть от времени");
+        assert_ne!(
+            a.unwrap()[..16],
+            b.unwrap()[..16],
+            "authID обязан зависеть от времени"
+        );
     }
 
     #[test]
     fn payload_encodes_command_port_and_address() {
-        let t = Target { host: "1.2.3.4".into(), port: 8080, is_tcp: true };
+        let t = Target {
+            host: "1.2.3.4".into(),
+            port: 8080,
+            is_tcp: true,
+        };
         let p = Vmess::build_payload(&t, b"data", false);
         assert_eq!(p[0], 0x01);
         assert_eq!(&p[1..3], &[0x1F, 0x90]);
@@ -554,7 +636,10 @@ mod tests {
             );
             let mut bad = ct.clone();
             bad[0] ^= 1;
-            assert!(aead_open(s, &key, &nonce, &bad, b"aad").is_err(), "{s}: подмена данных");
+            assert!(
+                aead_open(s, &key, &nonce, &bad, b"aad").is_err(),
+                "{s}: подмена данных"
+            );
         }
     }
 

@@ -103,9 +103,9 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
     r.push_str("    }\n");
     r.push_str("}\n");
 
-    let mut ip_pre = vec![
-        format!("ip rule add fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"),
-    ];
+    let mut ip_pre = vec![format!(
+        "ip rule add fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"
+    )];
     let mut ip_post = Vec::new();
     for cmd in &ip_pre {
         let _ = cmd;
@@ -161,7 +161,9 @@ pub async fn teardown() -> Result<()> {
 
 pub fn base_rollback() -> Vec<String> {
     vec![
-        format!("ip rule del fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"),
+        format!(
+            "ip rule del fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"
+        ),
         format!("ip route flush table {ROUTE_TABLE} 2>/dev/null || true"),
         "nft delete table inet pfu 2>/dev/null || true".to_string(),
     ]
@@ -177,7 +179,9 @@ async fn apply_ruleset(ruleset: &str) -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
-            Error::Internal(format!("не удалось запустить nft: {e}. Установлен ли пакет nftables?"))
+            Error::Internal(format!(
+                "не удалось запустить nft: {e}. Установлен ли пакет nftables?"
+            ))
         })?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(ruleset.as_bytes()).await?;
@@ -217,8 +221,14 @@ async fn run_sh(cmd: &str) -> Result<()> {
 
 /// Проверка окружения для `system.diagnose`.
 pub async fn check_available() -> (bool, String) {
-    match tokio::process::Command::new("nft").arg("--version").output().await {
-        Ok(o) if o.status.success() => (true, String::from_utf8_lossy(&o.stdout).trim().to_string()),
+    match tokio::process::Command::new("nft")
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            (true, String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
         Ok(_) => (false, "nft есть, но не запускается".into()),
         Err(e) => (false, format!("не найден: {e}")),
     }
@@ -231,7 +241,11 @@ mod tests {
     fn base_cfg() -> Config {
         let mut c = Config::default();
         c.outbounds.push(crate::config::Outbound::Direct(
-            crate::config::OutboundDirect { name: "X".into(), test_url: None, test_timeout_ms: None },
+            crate::config::OutboundDirect {
+                name: "X".into(),
+                test_url: None,
+                test_timeout_ms: None,
+            },
         ));
         c
     }

@@ -12,9 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::config::OutboundHttp;
-use crate::engine::outbound::{
-    connect_proxy, AsyncReadWrite, Outbound, Request, UdpSession,
-};
+use crate::engine::outbound::{connect_proxy, AsyncReadWrite, Outbound, Request, UdpSession};
 use crate::error::{Error, Result};
 
 pub struct HttpProxy {
@@ -51,7 +49,11 @@ impl HttpProxy {
             .copied()
             .ok_or_else(|| Error::ConfigInvalid(format!("{} не разрешается", cfg.server)))?;
 
-        Ok(Self { name: cfg.name, server, auth_header })
+        Ok(Self {
+            name: cfg.name,
+            server,
+            auth_header,
+        })
     }
 
     /// CONNECT-запрос. Домен уходит как есть — резолвит прокси.
@@ -60,8 +62,14 @@ impl HttpProxy {
 
         // Заголовок домена не может содержать пробелов и непечатных символов —
         // иначе можно было бы инъецировать в запрос.
-        if host.is_empty() || !host.bytes().all(|b| (0x21..=0x7E).contains(&b)) || host.contains(':') && host.parse::<std::net::IpAddr>().is_err() {
-            return Err(Error::protocol("http", format!("недопустимый домен {host:?}")));
+        if host.is_empty()
+            || !host.bytes().all(|b| (0x21..=0x7E).contains(&b))
+            || host.contains(':') && host.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(Error::protocol(
+                "http",
+                format!("недопустимый домен {host:?}"),
+            ));
         }
 
         let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
@@ -117,13 +125,22 @@ impl HttpProxy {
                 let _ = s.set_nodelay(true);
                 Ok(s)
             }
-            407 => Err(Error::protocol("http", "прокси требует логин и пароль (407)")),
-            403 => Err(Error::protocol("http", "прокси запретил доступ к этому хосту (403)")),
-            502 | 503 | 504 => Err(Error::protocol(
+            407 => Err(Error::protocol(
+                "http",
+                "прокси требует логин и пароль (407)",
+            )),
+            403 => Err(Error::protocol(
+                "http",
+                "прокси запретил доступ к этому хосту (403)",
+            )),
+            502..=504 => Err(Error::protocol(
                 "http",
                 format!("прокси не смог связаться с {host}:{port} ({code})"),
             )),
-            other => Err(Error::protocol("http", format!("неожиданный код ответа {other}"))),
+            other => Err(Error::protocol(
+                "http",
+                format!("неожиданный код ответа {other}"),
+            )),
         }
     }
 }
@@ -147,7 +164,9 @@ impl Outbound for HttpProxy {
     }
 
     async fn connect(&self, req: &Request) -> Result<Box<dyn AsyncReadWrite>> {
-        let s = self.connect_tunnel(&req.target.host, req.target.port).await?;
+        let s = self
+            .connect_tunnel(&req.target.host, req.target.port)
+            .await?;
         Ok(Box::new(s))
     }
 
@@ -199,7 +218,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_connect_returns_stream() {
-        let (addr, _) = fake_connect_proxy("HTTP/1.1 200 Connection established\r\n\r\n", false).await;
+        let (addr, _) =
+            fake_connect_proxy("HTTP/1.1 200 Connection established\r\n\r\n", false).await;
         let p = HttpProxy::new(OutboundHttp {
             name: "H".into(),
             server: addr.ip().to_string(),
@@ -218,7 +238,8 @@ mod tests {
 
     #[tokio::test]
     async fn maps_407_to_readable_error() {
-        let (addr, _) = fake_connect_proxy("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", false).await;
+        let (addr, _) =
+            fake_connect_proxy("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", false).await;
         let p = HttpProxy::new(OutboundHttp {
             name: "H".into(),
             server: addr.ip().to_string(),
@@ -230,7 +251,11 @@ mod tests {
             test_timeout_ms: None,
         })
         .unwrap();
-        let err = p.connect(&Request::tcp("example.com", 443)).await.err().expect("ожидалась ошибка");
+        let err = p
+            .connect(&Request::tcp("example.com", 443))
+            .await
+            .err()
+            .expect("ожидалась ошибка");
         assert!(err.to_string().contains("407"), "{err}");
     }
 
@@ -276,7 +301,8 @@ mod tests {
         let err = p
             .connect(&Request::tcp("evil.com HTTP/1.1\r\nX: y", 443))
             .await
-            .err().expect("ожидалась ошибка");
+            .err()
+            .expect("ожидалась ошибка");
         assert!(err.to_string().contains("недопустимый"), "{err}");
     }
 }

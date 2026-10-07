@@ -77,7 +77,12 @@ impl Engine {
         }
         let group = self.config.find_group(name)?;
         // Явный выбор пользователя важнее автоматики.
-        if let Some(chosen) = self.group_choice.read().ok().and_then(|g| g.get(name).cloned()) {
+        if let Some(chosen) = self
+            .group_choice
+            .read()
+            .ok()
+            .and_then(|g| g.get(name).cloned())
+        {
             if let Some(ob) = self.resolve_outbound(&chosen) {
                 return Some(ob);
             }
@@ -109,7 +114,11 @@ impl Engine {
 
     /// Открывает соединение по решению правил. `REJECT` и отсутствие
     /// outbound'а — разные ошибки, и это видно в логе.
-    pub async fn open(&self, target: &Target, flow: &Flow) -> Result<(Arc<dyn Outbound>, Box<dyn outbound::AsyncReadWrite>)> {
+    pub async fn open(
+        &self,
+        target: &Target,
+        flow: &Flow,
+    ) -> Result<(Arc<dyn Outbound>, Box<dyn outbound::AsyncReadWrite>)> {
         let (decision, label) = self.route(flow);
         match decision {
             Decision::Reject | Decision::RejectDrop => {
@@ -120,7 +129,9 @@ impl Engine {
                 )));
             }
             Decision::HijackDns => {
-                return Err(Error::Internal("HIJACK-DNS обрабатывается DNS-модулем".into()));
+                return Err(Error::Internal(
+                    "HIJACK-DNS обрабатывается DNS-модулем".into(),
+                ));
             }
             Decision::Direct | Decision::Proxy(_) => {}
         }
@@ -141,7 +152,11 @@ impl Engine {
         // UDP у DIRECT и у прокси без UDP идёт вниз по TCP-протоколу клиента
         // (например, QUIC сам переподключится по TCP). Лучше один
         // переподключившийся запрос, чем молчаливая потеря пакетов.
-        let stream = ob.connect(&Request { target: target.clone() }).await?;
+        let stream = ob
+            .connect(&Request {
+                target: target.clone(),
+            })
+            .await?;
         self.stats.conn_opened();
         Ok((ob, stream))
     }
@@ -221,7 +236,12 @@ rules:
     #[tokio::test]
     async fn routes_by_domain() {
         let e = engine(BASE);
-        let f = Flow { domain: Some("proxy.example".into()), dst_port: 80, is_tcp: true, ..Default::default() };
+        let f = Flow {
+            domain: Some("proxy.example".into()),
+            dst_port: 80,
+            is_tcp: true,
+            ..Default::default()
+        };
         let (d, label) = e.route(&f);
         assert!(matches!(d, Decision::Proxy(_)));
         assert_eq!(label.as_deref(), Some("Локальный"));
@@ -230,8 +250,17 @@ rules:
     #[tokio::test]
     async fn reject_short_circuits_before_connect() {
         let e = engine(BASE);
-        let f = Flow { domain: Some("blocked.com".into()), dst_port: 80, is_tcp: true, ..Default::default() };
-        let t = Target { host: "blocked.com".into(), port: 80, is_tcp: true };
+        let f = Flow {
+            domain: Some("blocked.com".into()),
+            dst_port: 80,
+            is_tcp: true,
+            ..Default::default()
+        };
+        let t = Target {
+            host: "blocked.com".into(),
+            port: 80,
+            is_tcp: true,
+        };
         let err = e.open(&t, &f).await.err().expect("ожидалась ошибка");
         assert!(Engine::is_reject(&err), "ожидался REJECT, получен {err}");
     }
@@ -239,7 +268,12 @@ rules:
     #[tokio::test]
     async fn direct_fallback_works() {
         let e = engine(BASE);
-        let f = Flow { domain: Some("unknown.net".into()), dst_port: 80, is_tcp: true, ..Default::default() };
+        let f = Flow {
+            domain: Some("unknown.net".into()),
+            dst_port: 80,
+            is_tcp: true,
+            ..Default::default()
+        };
         let (d, label) = e.route(&f);
         assert_eq!(d, Decision::Direct);
         assert_eq!(label.as_deref(), Some("DIRECT"));
@@ -253,7 +287,11 @@ rules:
         );
         let e = engine(&yaml);
         let ob = e.resolve_outbound("Авто").unwrap();
-        assert_eq!(ob.name(), "Локальный", "первый участник группы по умолчанию");
+        assert_eq!(
+            ob.name(),
+            "Локальный",
+            "первый участник группы по умолчанию"
+        );
     }
 
     #[tokio::test]
@@ -263,14 +301,22 @@ rules:
             BASE.trim_end()
         );
         let e = engine(&yaml);
-        e.group_choice.write().unwrap().insert("Авто".into(), "DIRECT".into());
+        e.group_choice
+            .write()
+            .unwrap()
+            .insert("Авто".into(), "DIRECT".into());
         assert_eq!(e.resolve_outbound("Авто").unwrap().name(), "DIRECT");
     }
 
     #[tokio::test]
     async fn decision_cache_does_not_change_outcome() {
         let e = engine(BASE);
-        let f = Flow { domain: Some("proxy.example".into()), dst_port: 80, is_tcp: true, ..Default::default() };
+        let f = Flow {
+            domain: Some("proxy.example".into()),
+            dst_port: 80,
+            is_tcp: true,
+            ..Default::default()
+        };
         let first = e.route(&f);
         for _ in 0..100 {
             assert_eq!(e.route(&f), first);
@@ -290,7 +336,10 @@ rules:
         let peer = tokio::spawn(async move {
             let mut buf = [0u8; 5];
             proxy_side.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf, b"hello", "relay должен передавать байты без изменений");
+            assert_eq!(
+                &buf, b"hello",
+                "relay должен передавать байты без изменений"
+            );
             proxy_side.write_all(b"world!").await.unwrap();
             proxy_side.flush().await.ok();
             // Держим сокет открытым, пока relay не завершит подсчёт.

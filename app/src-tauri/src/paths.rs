@@ -119,9 +119,9 @@ pub fn ensure_secure_dir(path: &Path) -> Result<()> {
 /// Так читатель никогда не увидит половину файла.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Internal(format!("нет родительского каталога для {}", path.display())))?;
+    let parent = path.parent().ok_or_else(|| {
+        Error::Internal(format!("нет родительского каталога для {}", path.display()))
+    })?;
     ensure_dir(parent)?;
 
     let tmp = parent.join(format!(
@@ -161,7 +161,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "остались временные файлы: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "остались временные файлы: {leftovers:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

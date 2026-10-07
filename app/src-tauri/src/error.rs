@@ -44,7 +44,10 @@ pub enum Error {
     Tls(String),
 
     #[error("протокол {proto}: {message}")]
-    Protocol { proto: &'static str, message: String },
+    Protocol {
+        proto: &'static str,
+        message: String,
+    },
 
     #[error("таймаут: {0}")]
     Timeout(String),
@@ -80,18 +83,18 @@ impl Error {
     /// под текстом ошибки, а не в логе.
     pub fn hint(&self) -> Option<String> {
         match self {
-            Error::NoDaemon(_) => Some(
-                "Запустите демон: sudo systemctl start proxy-for-ubuntud".into(),
-            ),
+            Error::NoDaemon(_) => {
+                Some("Запустите демон: sudo systemctl start proxy-for-ubuntud".into())
+            }
             Error::Permission(_) => Some("Нужны права root. Проверьте, что демон запущен.".into()),
             Error::Tls(_) => Some(
                 "Проверьте SNI и сертификат сервера. Временно можно включить \
                  skip_cert_verify, но это отключает проверку и небезопасно."
                     .into(),
             ),
-            Error::Protocol { proto, .. } => {
-                Some(format!("Проверьте параметры протокола {proto} и версию сервера."))
-            }
+            Error::Protocol { proto, .. } => Some(format!(
+                "Проверьте параметры протокола {proto} и версию сервера."
+            )),
             _ => None,
         }
     }
@@ -107,7 +110,10 @@ impl Error {
     }
 
     pub fn protocol(proto: &'static str, message: impl Into<String>) -> Self {
-        Error::Protocol { proto, message: message.into() }
+        Error::Protocol {
+            proto,
+            message: message.into(),
+        }
     }
 }
 
