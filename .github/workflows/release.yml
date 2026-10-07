@@ -35,9 +35,12 @@ jobs:
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: webkit2gtk-4.1,libayatana-appindicator3-dev,librsvg2-dev,patchelf
+      - name: Установить системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config patchelf libssl-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -50,15 +53,29 @@ jobs:
 
       - name: Проверить пакет
         run: |
+          set -euo pipefail
           DEB=$(ls dist/*.deb | head -1)
           echo "Проверяем $DEB"
           dpkg-deb --info "$DEB"
-          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/proxy-for-ubuntud'
-          dpkg-deb --contents "$DEB" | grep -q 'lib/systemd/system/proxy-for-ubuntud.service'
-          # Бинарники должны быть исполняемыми и без динамических зависимостей
-          # на локальные библиотеки — иначе пакет не запустится на чистой машине.
-          ldd dist/*.deb 2>/dev/null || true
-          echo "OK"
+          # Ключевые файлы должны быть на месте: без systemd-юнита демон не
+          # запустится, без polkit — GUI не сможет запрашивать права.
+          for f in \
+            usr/bin/proxy-for-ubuntu \
+            usr/bin/proxy-for-ubuntud \
+            usr/bin/pfu-cli \
+            lib/systemd/system/proxy-for-ubuntud.service \
+            lib/polkit-1/actions/com.deniszakharov.proxyforubuntu.policy \
+            usr/share/applications/proxy-for-ubuntu.desktop \
+            usr/share/proxy-for-ubuntu/profiles/default.yaml ; do
+            dpkg-deb --contents "$DEB" | grep -q "$f" || { echo "НЕТ $f в пакете"; exit 1; }
+            echo "  ок: $f"
+          done
+          # Бинарник должен стартовать и печатить версию. GTK в headless
+          # не откроется, поэтому проверяем именно демон и CLI.
+          mkdir -p _unpack && dpkg-deb -x "$DEB" _unpack
+          ./_unpack/usr/bin/pfu-cli version
+          ./_unpack/usr/bin/proxy-for-ubuntud --version
+          echo "пакет в порядке"
 
       - uses: softprops/action-gh-release@v2
         with:
