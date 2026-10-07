@@ -71,8 +71,11 @@ jobs:
 
       - name: Проверка структуры пакета
         run: |
+          set -euo pipefail
           DEB=$(ls dist/*.deb | head -1)
-          dpkg-deb --info "$DEB" > /dev/null
+          # Список файлов берём один раз: `dpkg-deb --contents | grep -q`
+          # при pipefail даёт ложный провал из-за SIGPIPE в tar.
+          CONTENTS="$(dpkg-deb --contents "$DEB")"
           for f in \
             usr/bin/proxy-for-ubuntu \
             usr/bin/proxy-for-ubuntud \
@@ -80,7 +83,10 @@ jobs:
             lib/systemd/system/proxy-for-ubuntud.service \
             usr/share/applications/proxy-for-ubuntu.desktop \
             usr/share/proxy-for-ubuntu/profiles/default.yaml ; do
-            dpkg-deb --contents "$DEB" | grep -q "$f" || { echo "нет $f в пакете"; exit 1; }
+            if ! grep -q -- "$f" <<<"$CONTENTS"; then
+              echo "нет $f в пакете"
+              exit 1
+            fi
           done
           echo "структура пакета в порядке"
 

@@ -57,8 +57,14 @@ jobs:
           DEB=$(ls dist/*.deb | head -1)
           echo "Проверяем $DEB"
           dpkg-deb --info "$DEB"
-          # Ключевые файлы должны быть на месте: без systemd-юнита демон не
-          # запустится, без polkit — GUI не сможет запрашивать права.
+
+          # ВНИМАНИЕ: список файлов извлекаем ОДИН раз в переменную.
+          # `dpkg-deb --contents "$DEB" | grep -q ...` при `set -o pipefail`
+          # всегда даёт ложный провал: grep завершается на первом совпадении,
+          # tar ловит SIGPIPE и возвращает ненулевой код, а pipefail
+          # превращает это в ошибку всего шага.
+          CONTENTS="$(dpkg-deb --contents "$DEB")"
+
           for f in \
             usr/bin/proxy-for-ubuntu \
             usr/bin/proxy-for-ubuntud \
@@ -67,12 +73,17 @@ jobs:
             lib/polkit-1/actions/com.deniszakharov.proxyforubuntu.policy \
             usr/share/applications/proxy-for-ubuntu.desktop \
             usr/share/proxy-for-ubuntu/profiles/default.yaml ; do
-            dpkg-deb --contents "$DEB" | grep -q "$f" || { echo "НЕТ $f в пакете"; exit 1; }
+            if ! grep -q -- "$f" <<<"$CONTENTS"; then
+              echo "НЕТ $f в пакете"
+              exit 1
+            fi
             echo "  ок: $f"
           done
-          # Бинарник должен стартовать и печатить версию. GTK в headless
-          # не откроется, поэтому проверяем именно демон и CLI.
-          mkdir -p _unpack && dpkg-deb -x "$DEB" _unpack
+
+          # Бинарники должны стартовать и печатить версию. GTK в headless
+          # не откроется, поэтому проверяем демон и CLI, а не GUI.
+          rm -rf _unpack && mkdir -p _unpack
+          dpkg-deb -x "$DEB" _unpack
           ./_unpack/usr/bin/pfu-cli version
           ./_unpack/usr/bin/proxy-for-ubuntud --version
           echo "пакет в порядке"
