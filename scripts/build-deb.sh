@@ -71,9 +71,12 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
         (cd "$ROOT/app/src-tauri" && cargo test --lib --quiet) || die "тесты не прошли — сборка прервана"
     fi
 
-    echo "==> frontend build"
-    (cd "$ROOT/app" && npm ci --no-audit --no-fund && npm run build) \
-        || die "сборка фронтенда не удалась"
+    # Фронтенд не требует сборки: это самодостаточные HTML/CSS/JS, которые
+    # Tauri грузит как есть. Благодаря этому пакет ставится без Node.js и его
+    # зависимостей. Проверяем только, что файлы на месте.
+    for f in index.html style.css app.js; do
+        [[ -f "$ROOT/app/ui/$f" ]] || die "нет файла интерфейса app/ui/$f"
+    done
 
     echo "==> cargo build --release"
     (cd "$ROOT/app/src-tauri" && cargo build --release --bins) || die "сборка Rust не удалась"
