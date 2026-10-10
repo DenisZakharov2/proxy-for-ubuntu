@@ -199,6 +199,9 @@ sudo pfu-cli apply < my.yaml
 | "nftables rejected the ruleset" | Missing privileges or conflicting rules: `sudo nft list ruleset` |
 | QUIC/games bypass the proxy | Needs `intercept.udp: tproxy` and an outbound with `udp: true` |
 | Internet gone after Apply | Daemon did not roll back: `sudo systemctl stop proxy-for-ubuntud && sudo nft delete table inet pfu; sudo ip rule del fwmark 0x1 lookup 100; sudo ip route flush table 100` |
+| `Permission denied` на `/run/proxy-for-ubuntu/ctl.sock` | Пользователь не в группе `proxy-for-ubuntu`. При установке через `sudo apt` группа добавляется автоматически; если ставили из графического менеджера — `sudo usermod -aG proxy-for-ubuntu $USER` и повторный вход в систему |
+| Окно приложения открывается пустым | WebKitGTK не рисует интерфейс на LXQt/Xfce с Openbox. `proxy-for-ubuntu` сам выставляет `WEBKIT_DISABLE_DMABUF_RENDERER=1`; если не помогло — `LIBGL_ALWAYS_SOFTWARE=1 proxy-for-ubuntu`. Диагностика: `proxy-for-ubuntu --diagnose` |
+| `proxy-for-ubuntu --version` ничего не выводит | Устаревшая сборка: команда добавлена в 0.1.1. Переустановите пакет |
 | `ssh` stopped working | SSH is excluded from interception by default (`exclude_ports: ["22"]`). Check you did not override it |
 | Docker ignores the proxy | Container traffic goes through `FORWARD`, not `OUTPUT`. See [docs/TESTING.md](docs/TESTING.md) |
 | Some rules never match | Geo sets not downloaded: Geo sets tab → Update |

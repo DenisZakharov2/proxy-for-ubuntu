@@ -9,6 +9,46 @@ set -e
 PFU_USER="proxy-for-ubuntu"
 PFU_GROUP="proxy-for-ubuntu"
 
+# Определяет пользователя, за которым сидит графическая сессия.
+#
+# Без этого GUI не может подключиться к сокету демона: сокет принадлежит
+# группе proxy-for-ubuntu, а обычного пользователя в неё никто не добавляет,
+# и приложение падает с Permission denied. Источники перебираем от надёжного
+# к хитрому, потому что пакет ставят по-разному:
+#   1. SUDO_USER — установка через `sudo apt install`;
+#   2. сеанс logind на seat0 — установка из графического менеджера обновлений,
+#      где SUDO_USER не выставлен.
+desktop_user() {
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        echo "$SUDO_USER"
+        return 0
+    fi
+    # Вывод loginctl list-sessions: SESSION UID USER SEAT TTY, то есть
+    # именно SEAT — четвёртое поле, а не третье. На третьем лежит USER.
+    if command -v loginctl >/dev/null 2>&1; then
+        u="$(loginctl list-sessions --no-legend 2>/dev/null \
+             | awk '$4 ~ /^seat/ && $2 >= 1000 {print $1}' | head -1)"
+        if [ -n "$u" ]; then
+            name="$(loginctl show-session "$u" -p Name --value 2>/dev/null)"
+            if [ -n "$name" ] && [ "$name" != "root" ]; then
+                echo "$name"
+                return 0
+            fi
+        fi
+    fi
+
+    # Последний запасной вариант: кто вошёл в систему через терминал или
+    # графическую сессию. Работает там, где loginctl недоступен.
+    if command -v who >/dev/null 2>&1; then
+        name="$(who 2>/dev/null | awk '$1 != "root" && $1 != "" {print $1}' | head -1)"
+        if [ -n "$name" ]; then
+            echo "$name"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 case "$1" in
     configure)
         # ── системный пользователь ────────────────────────────────────────
@@ -21,6 +61,27 @@ case "$1" in
                     "$PFU_USER"
         fi
 
+        # ── доступ к сокету демона для пользователя рабочего стола ────────
+        # Сокет /run/proxy-for-ubuntu/ctl.sock принадлежит группе
+        # proxy-for-ubuntu. Без членства GUI получает Permission denied.
+        DETECTED_USER="$(desktop_user || true)"
+        ADDED_TO_GROUP=0
+        if [ -n "$DETECTED_USER" ] && getent passwd "$DETECTED_USER" >/dev/null; then
+            if id -nG "$DETECTED_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$PFU_GROUP"; then
+                ADDED_TO_GROUP=1
+            elif usermod --append --groups "$PFU_GROUP" "$DETECTED_USER" 2>/dev/null \
+                || adduser "$DETECTED_USER" "$PFU_GROUP" >/dev/null 2>&1; then
+                ADDED_TO_GROUP=1
+            else
+                echo "proxy-for-ubuntu: не удалось добавить $DETECTED_USER в группу $PFU_GROUP" >&2
+            fi
+        elif [ -n "$DETECTED_USER" ]; then
+            # Имя нашлось, но пользователя в системе нет — установка шла из
+            # удалённого окружения. Молчать об этом нельзя: тогда GUI
+            # упрётся в Permission denied без всякой подсказки.
+            echo "proxy-for-ubuntu: пользователь $DETECTED_USER не найден в /etc/passwd" >&2
+        fi
+
         # ── каталоги ──────────────────────────────────────────────────────
         install -d -m 0750 -o root -g "$PFU_GROUP" /etc/proxy-for-ubuntu
         install -d -m 0750 -o root -g "$PFU_GROUP" /etc/proxy-for-ubuntu/profiles
@@ -30,7 +91,9 @@ case "$1" in
         install -d -m 0750 -o root -g root      /var/lib/proxy-for-ubuntu/geo/geosite
         install -d -m 0750 -o root -g root      /var/lib/proxy-for-ubuntu/rollback
         install -d -m 0750 -o root -g adm       /var/log/proxy-for-ubuntu
-        install -d -m 0755 -o root -g root      /run/proxy-for-ubuntu
+        # Каталог с сокетом принадлежит группе демона: иначе обычный
+        # пользователь не может даже войти в /run/proxy-for-ubuntu.
+        install -d -m 0750 -o root -g "$PFU_GROUP" /run/proxy-for-ubuntu
 
         # ── конфиг по умолчанию ───────────────────────────────────────────
         if [ ! -f /etc/proxy-for-ubuntu/config.yaml ]; then
@@ -95,17 +158,27 @@ ENVEOF
             fi
         fi
 
-        cat <<'MSG'
-proxy-for-ubuntu установлен.
-
-Что делать дальше:
-  1. Запустить демон:        sudo systemctl start proxy-for-ubuntud
-  2. Открыть приложение:     proxy-for-ubuntu
-  3. Добавить прокси и нажать «Применить».
-
-Демон включён в автозапуск, но перехват трафика не активируется сам —
-это делается тумблером в приложении.
-MSG
+        echo "proxy-for-ubuntu установлен."
+        echo
+        echo "Что делать дальше:"
+        echo "  1. Запустить демон:        sudo systemctl start proxy-for-ubuntud"
+        echo "  2. Открыть приложение:     proxy-for-ubuntu"
+        echo "  3. Добавить прокси и нажать «Применить»."
+        echo
+        echo "Демон включён в автозапуск, но перехват трафика не активируется сам —"
+        echo "это делается тумблером в приложении."
+        if [ "$ADDED_TO_GROUP" -eq 1 ]; then
+            echo
+            echo "Пользователь $DETECTED_USER добавлен в группу $PFU_GROUP."
+            echo "Группа вступит в силу при следующем входе в систему. Чтобы"
+            echo "применить её прямо сейчас, выполните:  newgrp $PFU_GROUP"
+        else
+            echo
+            echo "Не удалось определить пользователя рабочего стола. Чтобы GUI мог"
+            echo "подключиться к демону, добавьте себя в группу $PFU_GROUP:"
+            echo "  sudo usermod -aG $PFU_GROUP \$USER"
+            echo "  newgrp $PFU_GROUP"
+        fi
         ;;
 
     abort-upgrade|abort-remove|abort-deconfigure)

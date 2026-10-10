@@ -175,12 +175,20 @@ profile.export ← { "name": "Работа", "redact_secrets": true }
 ### `log.tail` / `log.search` / `log.export`
 
 ```json
-log.tail   ← { "lines": 500, "level": "info"|"warn"|"error"|null }
-          → { "entries": [ { "ts": 1728261234, "level": "info",
-                              "target": "engine::nft", "message": "…" } ] }
-log.export ← { "level": null, "since": null }
-          → { "ok": true, "path": "/home/u/Desktop/pfu-log.txt" }
+log.tail    ← { "lines": 500, "level": "info"|"warn"|"error"|null }
+           → { "entries": [ { "ts": 1728261234, "level": "info",
+                               "target": "engine::nft", "message": "…" } ] }
+
+log.search  ← { "query": "nft", "level": null, "limit": 200 }
+           → { "entries": [ … ], "total": 3 }
+
+log.export  ← { "level": null }
+           → { "ok": true, "path": "/home/u/.cache/proxy-for-ubuntu/engine-log.txt" }
 ```
+
+`log.search` ищет подстроку без учёта регистра в поле `message` и в `target`.
+Пустой `query` возвращает все записи. `limit` по умолчанию 200, максимум 5000;
+возвращаются последние совпадения.
 
 ### `metrics.live`
 

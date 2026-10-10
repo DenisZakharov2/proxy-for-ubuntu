@@ -39,7 +39,9 @@ const I18N = {
     'geo.title': 'Geo-наборы', 'geo.update': 'Обновить', 'geo.count': 'Записей',
     'geo.updated': 'Обновлён', 'geo.preview': 'Показать',
     'geo.hint': 'Текстовые списки доменов и CIDR. Хранятся в /var/lib/proxy-for-ubuntu/geo.',
-    'logs.title': 'Журнал', 'logs.refresh': 'Обновить', 'logs.export': 'Экспорт', 'logs.rollback': 'Откатить конфиг',
+    'logs.title': 'Журнал', 'logs.refresh': 'Обновить',
+    'logs.search': 'Поиск по журналу', 'logs.empty': 'Журнал пуст.',
+    'logs.notFound': 'Ничего не найдено.', 'logs.export': 'Экспорт', 'logs.rollback': 'Откатить конфиг',
     'logs.rollback.confirm': 'Вернуть предыдущую рабочую конфигурацию? Текущие системные правила будут сняты и применены снова.',
     'set.diagnose': 'Проверка окружения', 'set.run': 'Запустить', 'set.interface': 'Интерфейс',
     'set.lang': 'Язык', 'set.theme': 'Тема', 'set.advanced': 'Параметры перехвата',
@@ -52,6 +54,7 @@ const I18N = {
     'err.rollbackFailed': 'Откат не удался: проверьте правила вручную (sudo nft list table inet pfu).', 'err.noProxies': 'Прокси ещё не настроены',
     'err.noProxies.hint': 'Добавьте хотя бы один прокси — иначе весь трафик пойдёт напрямую.',
     'empty.rules': 'Правил нет', 'empty.rules.hint': 'Весь трафик идёт по правилу final',
+    'rules.finalRow': 'Всё, что не попало ни под одно правило выше',
     'empty.profiles': 'Профилей нет',
     'experimental': 'Не проверен на живом сервере',
     'udp.dnsLeak': 'DNS разрешается локально — есть риск утечки',
@@ -88,7 +91,9 @@ const I18N = {
     'geo.title': 'Geo sets', 'geo.update': 'Update', 'geo.count': 'Entries',
     'geo.updated': 'Updated', 'geo.preview': 'Show',
     'geo.hint': 'Plain-text domain and CIDR lists, stored in /var/lib/proxy-for-ubuntu/geo.',
-    'logs.title': 'Logs', 'logs.refresh': 'Refresh', 'logs.export': 'Export', 'logs.rollback': 'Roll back config',
+    'logs.title': 'Logs', 'logs.refresh': 'Refresh',
+    'logs.search': 'Search log', 'logs.empty': 'The log is empty.',
+    'logs.notFound': 'Nothing found.', 'logs.export': 'Export', 'logs.rollback': 'Roll back config',
     'logs.rollback.confirm': 'Restore the previous working configuration? Current system rules will be removed and re-applied.',
     'set.diagnose': 'Environment check', 'set.run': 'Run', 'set.interface': 'Interface',
     'set.lang': 'Language', 'set.theme': 'Theme', 'set.advanced': 'Interception settings',
@@ -101,6 +106,7 @@ const I18N = {
     'err.rollbackFailed': 'Rollback failed: check the rules manually (sudo nft list table inet pfu).', 'err.noProxies': 'No proxies configured yet',
     'err.noProxies.hint': 'Add at least one proxy, otherwise all traffic goes out directly.',
     'empty.rules': 'No rules', 'empty.rules.hint': 'All traffic follows the final rule',
+    'rules.finalRow': 'Everything that matched no rule above',
     'empty.profiles': 'No profiles',
     'experimental': 'Not verified against a live server',
     'udp.dnsLeak': 'DNS is resolved locally — possible leak',
@@ -124,6 +130,11 @@ const t = (key) => (I18N[state.lang] && I18N[state.lang][key]) || I18N.ru[key] |
 
 // ─────────────────────────────── backend ───────────────────────────────────
 
+// Отсутствие глобального API Tauri означает, что приложение запущено вне
+// оболочки (обычно в браузере при разработке). В поставочной сборке так
+// быть НЕ должно: без withGlobalTauri в tauri.conf.json интерфейс молча
+// работал бы на подставных данных, и пользователь решил бы, что всё
+// настроено правильно. Поэтому в таком режиме показываем заметную плашку.
 const isMock = typeof window.__TAURI__ === 'undefined';
 
 async function ipc(method, params = {}) {
@@ -189,7 +200,7 @@ function mock(method, params) {
       { name: 'default', builtin: true, updated_at: 1728200000 },
       { name: 'Работа', builtin: false, updated_at: 1728261234 },
     ] };
-    case 'log.tail': return { entries: [
+    case 'log.tail': case 'log.search': return { entries: [
       { ts: Date.now() / 1000 | 0, level: 'info', target: 'engine::nft', message: 'правила применены' },
       { ts: Date.now() / 1000 | 0, level: 'warn', target: 'engine::geo', message: 'geo-набор cn не скачан' },
     ] };
@@ -205,6 +216,12 @@ function mock(method, params) {
 }
 
 // ─────────────────────────────── утилиты ───────────────────────────────────
+
+/** Откладывает вызов: не перерисовываем журнал на каждый ввод. */
+function debounce(fn, ms) {
+  let t;
+  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -530,7 +547,7 @@ async function renderRules() {
           <button class="btn-ghost sm" data-rm="${i}">${esc(t('action.delete'))}</button>
         </td></tr>`;
     }).join('') +
-    `<tr><td></td><td class="muted">${esc(t('empty.rules.hint').replace('^.*final.*$', ''))}</td>
+    `<tr><td></td><td class="muted">${esc(t('rules.finalRow'))}</td>
       <td><span class="badge direct">${esc((state.config && state.config.final) || 'DIRECT')}</span></td><td></td></tr></tbody>`;
 
   $$('[data-up]', tbl).forEach(b => b.onclick = () => move(+b.dataset.up, -1));
@@ -664,11 +681,16 @@ async function renderGeo() {
 
 async function renderLogs() {
   const lvl = $('#logLevel').value;
-  const r = await ipc('log.tail', { lines: 500, level: lvl || null }).catch(() => ({ entries: [] }));
+  const q = $('#logQuery').value.trim();
+  // Поиск выполняет демон: в журнале может быть десятки тысяч строк,
+  // и тащить их все в браузер ради подстроки незачем.
+  const r = q
+    ? await ipc('log.search', { query: q, level: lvl || null, limit: 500 }).catch(() => ({ entries: [] }))
+    : await ipc('log.tail', { lines: 500, level: lvl || null }).catch(() => ({ entries: [] }));
   const rows = r.entries || [];
   $('#logView').textContent = rows.length
     ? rows.map(e => `[${when(e.ts)}] ${e.level.toUpperCase().padEnd(5)} ${e.target}: ${e.message}`).join('\n')
-    : 'Журнал пуст.';
+    : q ? t('logs.notFound') : t('logs.empty');
 }
 
 // ─────────────────────────────── Настройки ─────────────────────────────────
@@ -768,6 +790,7 @@ function applyTheme() {
 function applyLang() {
   document.documentElement.lang = state.lang;
   $$('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+  $$('[data-i18n-placeholder]').forEach(el => { el.placeholder = t(el.dataset.i18nPlaceholder); });
   localStorage.setItem('pfu.lang', state.lang);
   $('#pageTitle').textContent = t(ROUTES[state.route].title);
 }
@@ -786,9 +809,23 @@ async function loadConfig() {
   }
 }
 
+/** Предупреждение о режиме подставных данных. */
+function markMockMode() {
+  if (!isMock) return;
+  const box = document.createElement('div');
+  box.className = 'toast warn';
+  box.style.cssText = 'left:20px;right:auto;max-width:520px;';
+  box.innerHTML = '<b>Демонстрационный режим</b>' +
+    '<div class="hint">Интерфейс запущен вне оболочки приложения и показывает ' +
+    'подставные данные. Настоящие настройки не загружены, изменения ни на что ' +
+    'не влияют. Это ожидаемо только при разработке в браузере.</div>';
+  document.querySelector('.content').prepend(box);
+}
+
 async function boot() {
   applyTheme();
   applyLang();
+  markMockMode();
   await loadConfig();
 
   $('#nav').onclick = e => {
@@ -813,6 +850,7 @@ async function boot() {
   $('#runDoctor').onclick = runDoctor;
   $('#refreshLogs').onclick = renderLogs;
   $('#logLevel').onchange = renderLogs;
+  $('#logQuery').oninput = debounce(renderLogs, 250);
   $('#testAll').onclick = async () => {
     for (const o of outbounds()) if (o.name !== 'DIRECT') await testOne(o.name);
   };

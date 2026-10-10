@@ -196,6 +196,9 @@ sudo pfu-cli apply < my.yaml
 | «nftables отклонил набор правил» | Нет прав или правила заняты: `sudo nft list ruleset` |
 | QUIC/игры не идут через прокси | Нужен `intercept.udp: tproxy` и outbound с `udp: true` |
 | Интернет пропал после Apply | Демон не откатил изменения: `sudo systemctl stop proxy-for-ubuntud && sudo nft delete table inet pfu; sudo ip rule del fwmark 0x1 lookup 100; sudo ip route flush table 100` |
+| `Permission denied` на `/run/proxy-for-ubuntu/ctl.sock` | Пользователь не в группе `proxy-for-ubuntu`. При установке через `sudo apt` группа добавляется автоматически; если ставили из графического менеджера — `sudo usermod -aG proxy-for-ubuntu $USER` и повторный вход в систему |
+| Окно приложения открывается пустым | WebKitGTK не рисует интерфейс на LXQt/Xfce с Openbox. `proxy-for-ubuntu` сам выставляет `WEBKIT_DISABLE_DMABUF_RENDERER=1`; если не помогло — `LIBGL_ALWAYS_SOFTWARE=1 proxy-for-ubuntu`. Диагностика: `proxy-for-ubuntu --diagnose` |
+| `proxy-for-ubuntu --version` ничего не выводит | Устаревшая сборка: команда добавлена в 0.1.1. Переустановите пакет |
 | `ssh` перестал работать | Он по умолчанию исключён из перехвата (`exclude_ports: ["22"]`). Проверьте, не переписали ли это |
 | Docker не использует прокси | Трафик контейнеров идёт через `FORWARD`, а не `OUTPUT`. Смотрите [docs/TESTING.md](docs/TESTING.md) |
 | Часть правил не срабатывает | Не скачаны geo-наборы: вкладка «Geo-наборы» → «Обновить» |

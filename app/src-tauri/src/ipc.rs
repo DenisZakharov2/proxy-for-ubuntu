@@ -209,6 +209,7 @@ impl Server {
             "profile.export" => self.profile_export(&params),
             "subscription.update" => self.subscription_update(&params).await,
             "log.tail" => self.log_tail(&params).await,
+            "log.search" => self.log_search(&params).await,
             "log.export" => self.log_export(&params).await,
             "metrics.live" => self.metrics_live().await,
             other => Err(Error::NotFound(format!("неизвестный метод {other:?}"))),
@@ -741,6 +742,41 @@ impl Server {
         Ok(json!({ "entries": v }))
     }
 
+    /// Поиск по журналу. Без него пользователю с 500 строками приходится
+    /// читать всё подряд, чтобы найти одно сообщение об ошибке.
+    async fn log_search(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let query = params
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            // Именно to_lowercase, а не to_ascii_lowercase: журнал и
+            // интерфейс русские, а ascii-вариант кириллицу не трогает,
+            // и поиск «ПРАВИЛА» не нашёл бы «правила».
+            .to_lowercase();
+        let level = params.get("level").and_then(Value::as_str);
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(200)
+            .min(5000) as usize;
+
+        let g = self.log_ring.lock().await;
+        let mut matched: Vec<&LogEntry> = g
+            .iter()
+            .filter(|e| level.map(|l| e.level == l).unwrap_or(true))
+            .filter(|e| {
+                query.is_empty()
+                    || e.message.to_lowercase().contains(&query)
+                    || e.target.to_lowercase().contains(&query)
+            })
+            .collect();
+        // Свежие записи в конце — их и показываем первыми.
+        if matched.len() > limit {
+            matched = matched.split_off(matched.len() - limit);
+        }
+        Ok(json!({ "entries": matched, "total": matched.len() }))
+    }
+
     async fn log_export(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let g = self.log_ring.lock().await;
         let level = params.get("level").and_then(Value::as_str);
@@ -758,7 +794,15 @@ impl Server {
                 ));
             }
         }
-        paths::ensure_dir(path.parent().unwrap())?;
+        // Путь приходит от GUI, поэтому родитель может отсутствовать
+        // (`"log.txt"`), а не быть `Some("")`. Раньше здесь стоял
+        // `unwrap()` и попытка выгрузить лог без каталога давала ошибку
+        // вместо записи в текущий.
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                paths::ensure_dir(dir)?;
+            }
+        }
         paths::atomic_write(&path, out.as_bytes())?;
         Ok(json!({ "ok": true, "path": path.display().to_string() }))
     }
@@ -915,6 +959,59 @@ mod tests {
             "логин не секрет, его можно оставить"
         );
         assert!(r.contains("server: a"));
+    }
+
+    #[tokio::test]
+    async fn log_search_filters_by_level_and_substring() {
+        use std::sync::Arc;
+        let s = Arc::new(Server::new());
+        {
+            let mut g = s.log_ring.lock().await;
+            g.push(LogEntry {
+                ts: 1,
+                level: "info".into(),
+                target: "engine::nft".into(),
+                message: "правила применены".into(),
+            });
+            g.push(LogEntry {
+                ts: 2,
+                level: "error".into(),
+                target: "engine::outbound".into(),
+                message: "соединение отклонено".into(),
+            });
+            g.push(LogEntry {
+                ts: 3,
+                level: "warn".into(),
+                target: "engine::nft".into(),
+                message: "geo-набор не скачан".into(),
+            });
+        }
+
+        // По подстроке в тексте сообщения.
+        let r = s.log_search(&json!({ "query": "nft" })).await.unwrap();
+        let n = r["entries"].as_array().unwrap().len();
+        // Совпадение идёт и по полю target, поэтому берём оба.
+        assert!(n >= 1, "поиск по 'nft' ничего не нашёл");
+
+        // По уровню.
+        let r = s.log_search(&json!({ "level": "error" })).await.unwrap();
+        let e = r["entries"].as_array().unwrap();
+        assert_eq!(e.len(), 1, "уровень error должен дать ровно одну запись");
+        assert_eq!(e[0]["level"], "error");
+
+        // Несуществующая подстрока — пусто, а не ошибка.
+        let r = s
+            .log_search(&json!({ "query": "такого-текста-нет" }))
+            .await
+            .unwrap();
+        assert!(r["entries"].as_array().unwrap().is_empty());
+
+        // Поиск регистронезависим.
+        let r = s.log_search(&json!({ "query": "ПРАВИЛА" })).await.unwrap();
+        assert!(
+            !r["entries"].as_array().unwrap().is_empty(),
+            "поиск должен быть без учёта регистра"
+        );
     }
 
     #[test]
