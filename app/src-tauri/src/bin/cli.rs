@@ -194,15 +194,21 @@ fn profile_export(args: &[String]) -> Result<ExitCode> {
     while i < args.len() {
         match args[i].as_str() {
             "--name" => {
-                name = Some(args.get(i + 1).ok_or_else(|| {
-                    Error::ConfigInvalid("--name требует значение".into())
-                })?.clone());
+                name = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| Error::ConfigInvalid("--name требует значение".into()))?
+                        .clone(),
+                );
                 i += 2;
             }
             "--age-passphrase" => {
-                age_passphrase = Some(args.get(i + 1).ok_or_else(|| {
-                    Error::ConfigInvalid("--age-passphrase требует значение".into())
-                })?.clone());
+                age_passphrase = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| {
+                            Error::ConfigInvalid("--age-passphrase требует значение".into())
+                        })?
+                        .clone(),
+                );
                 i += 2;
             }
             "--age" => {
@@ -218,7 +224,8 @@ fn profile_export(args: &[String]) -> Result<ExitCode> {
             _ => i += 1,
         }
     }
-    let name = name.ok_or_else(|| Error::ConfigInvalid("укажите имя профиля: pfu-cli profile-export <имя>"))?;
+    let name = name
+        .ok_or_else(|| Error::ConfigInvalid("укажите имя профиля: pfu-cli profile-export <имя>"))?;
     let mut params = serde_json::json!({ "name": name, "redact_secrets": true });
     if let Some(pass) = age_passphrase {
         params["age_passphrase"] = serde_json::Value::String(pass);
@@ -235,7 +242,10 @@ fn profile_export(args: &[String]) -> Result<ExitCode> {
         }
         Ok(ExitCode::SUCCESS)
     } else {
-        let msg = out.get("message").and_then(|v| v.as_str()).unwrap_or("ошибка экспорта");
+        let msg = out
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ошибка экспорта");
         eprintln!("{msg}");
         Ok(ExitCode::FAILURE)
     }

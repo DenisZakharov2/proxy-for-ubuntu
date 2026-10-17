@@ -22,8 +22,8 @@ use crate::paths;
 use crate::supervisor::{ApplyReport, Supervisor};
 
 // age-шифрование для защищённого экспорта профилей.
-use age::{Encryptor, Recipient};
 use age::secrecy::SecretString;
+use age::{Encryptor, Recipient};
 use std::io::Write;
 
 #[derive(Debug, Deserialize)]
@@ -661,9 +661,7 @@ impl Server {
             .get("redact_secrets")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let age_passphrase = params
-            .get("age_passphrase")
-            .and_then(Value::as_str);
+        let age_passphrase = params.get("age_passphrase").and_then(Value::as_str);
         let (path, _) = resolve_profile_path(name)?;
         let mut text =
             std::fs::read_to_string(&path).map_err(|e| Error::NotFound(format!("{name}: {e}")))?;
@@ -672,8 +670,7 @@ impl Server {
         }
         if let Some(passphrase) = age_passphrase {
             let passphrase = SecretString::from(passphrase);
-            let encryptor =
-                Encryptor::new_recipients([Recipient::Passphrase(passphrase)]);
+            let encryptor = Encryptor::new_recipients([Recipient::Passphrase(passphrase)]);
             let mut buf = Vec::new();
             {
                 let mut writer = encryptor.encrypt_writer(&mut buf)?;
