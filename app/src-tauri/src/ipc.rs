@@ -674,7 +674,7 @@ impl Server {
             let mut buf = Vec::new();
             use base64::Engine as _;
             {
-                let mut writer = encryptor.encrypt_writer(&mut buf)?;
+                let mut writer = encryptor.wrap_output(&mut buf)?;
                 writer.write_all(text.as_bytes())?;
                 writer.finish()?;
             }
