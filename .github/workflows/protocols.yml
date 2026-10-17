@@ -38,7 +38,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev nftables iproute2 curl \
-            gettext-base docker.io jq
+            gettext-base jq
+          # Docker запускать не нужно ставить: на ubuntu-22.04 раннерах GitHub
+          # Actions он уже предустановлен (пакет containerd). `docker.io`
+          # конфликтует с ним (containerd.io vs containerd) и ломает шаг.
 
       - uses: dtolnay/rust-toolchain@stable
 
