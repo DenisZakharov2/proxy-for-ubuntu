@@ -228,8 +228,8 @@ fn profile_export(args: &[String]) -> Result<ExitCode> {
         Error::ConfigInvalid("укажите имя профиля: pfu-cli profile-export <имя>".to_string())
     })?;
     let mut params = serde_json::json!({ "name": name, "redact_secrets": true });
-    if let Some(pass) = age_passphrase {
-        params["age_passphrase"] = serde_json::Value::String(pass);
+    if let Some(ref pass) = age_passphrase {
+        params["age_passphrase"] = serde_json::Value::String(pass.clone());
     }
     let out = call("profile.export", params)?;
     let ok = out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
