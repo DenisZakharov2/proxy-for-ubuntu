@@ -47,15 +47,27 @@ rules:
 ## Быстрый старт
 
 ```bash
-# 1. Скачать .deb со страницы релизов и поставить однострочником:
+# 1. Скачать .deb и его sha256 со страницы релизов:
 #    https://github.com/DenisZakharov2/proxy-for-ubuntu/releases
+# 2. Проверить целостность перед установкой:
+sha256sum -c proxy-for-ubuntu_0.1.1_amd64.deb.sha256
+# 3. Поставить однострочником:
 sudo apt install ./proxy-for-ubuntu_0.1.1_amd64.deb
 
-# 2. Запустить демон
+# 4. Запустить демон
 sudo systemctl start proxy-for-ubuntud
 
-# 3. Открыть приложение
+# 5. Открыть приложение
 proxy-for-ubuntu
+```
+
+При обновлении скачайте новый `.deb` и `.sha256`, проверьте хэш, установите
+пакет и перезагрузите конфигу démonа без обрыва связи:
+
+```bash
+sha256sum -c proxy-for-ubuntu_<версия>_amd64.deb.sha256
+sudo apt install ./proxy-for-ubuntu_<версия>_amd64.deb
+sudo systemctl reload proxy-for-ubuntud
 ```
 
 В приложении: **Прокси → Добавить** (впишите адрес своего сервера) →
