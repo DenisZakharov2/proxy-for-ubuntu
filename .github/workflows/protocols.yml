@@ -111,7 +111,7 @@ jobs:
           sudo docker run -d --name pfu-xray \
             -p 1443:443 -p 1444:444 \
             -v "${PFU_WORK}/xray.config.json:/etc/xray/config.json:ro" \
-            "${XRAY_IMAGE}" run -config /etc/xray/config.json || true
+            "${XRAY_IMAGE}" || true
 
           # Ждём, пока Xray поднимет порты.
           for i in $(seq 1 30); do
@@ -157,7 +157,7 @@ jobs:
       # `nginx -t`. `apply` требует root, nftables и запущенный демон, в
       # Actions его не прогоняем.
       - name: Валидация конфига pfu-cli
-        run: ./target/debug/pfu-cli validate < "${PFU_WORK}/config.yaml"
+        run: ./app/src-tauri/target/debug/pfu-cli validate < "${PFU_WORK}/config.yaml"
 
       # ── Проверяем vless: реальный обмен байтами с Xray ────────────────
       - name: Проверить vless — обмен байтами с живым Xray
