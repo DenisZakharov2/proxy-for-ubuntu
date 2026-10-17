@@ -196,10 +196,7 @@ jobs:
           echo "| vless | ${XRAY_IMAGE} | ✅ соединение установлено | TCP до inbound 1443 проходит, байты уходят |" >> "$GITHUB_STEP_SUMMARY"
           echo "| vmess | ${XRAY_IMAGE} | ✅ соединение установлено | TCP до inbound 1444 проходит, байты уходят |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Ограничение: pfu-cli apply требует root и nftables, поэтому полный "
-          "цикл «применить → соединиться → получить ответ» невозможен в "
-          "GitHub Actions без привилегированного контейнера. Для сквозной "
-          "проверки см. [docs/TESTING.md](docs/TESTING.md)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Ограничение: pfu-cli apply требует root и nftables, поэтому полный цикл «применить → соединиться → получить ответ» невозможен в GitHub Actions без привилегированного контейнера. Для сквозной проверки см. [docs/TESTING.md](docs/TESTING.md)." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Остановить Xray-контейнер
         if: always()
