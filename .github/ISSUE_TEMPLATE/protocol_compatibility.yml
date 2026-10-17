@@ -1,0 +1,93 @@
+name: Совместимость протоколов
+description: Сообщить, работает ли протокол (vless/vmess/trojan/...) с конкретным сервером. Заполняйте все поля — без них баг невозможно разбирать.
+title: "[proto] <протокол> + <сервер>: <краткое описание>"
+labels: ["protocol", "needs-testing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Перед созданием убедитесь, что проблема не описана в таблице совместимости README.
+
+  - type: input
+    id: client-version
+    attributes:
+      label: Версия клиента proxy-for-ubuntu
+      description: Например 0.1.1 или коммит main
+      placeholder: 0.1.1
+    validations:
+      required: true
+
+  - type: input
+    id: server-type
+    attributes:
+      label: Тип сервера
+      description: Xray, v2ray, sing-box, الروя и т.д.
+      placeholder: Xray
+    validations:
+      required: true
+
+  - type: input
+    id: server-version
+    attributes:
+      label: Версия сервера
+      description: Например 1.8.10
+      placeholder: 1.8.10
+    validations:
+      required: true
+
+  - type: input
+    id: protocol
+    attributes:
+      label: Протокол
+      description: vless, vmess, trojan, shadowsocks
+      placeholder: vless
+    validations:
+      required: true
+
+  - type: input
+    id: os-kernel
+    attributes:
+      label: Версия ядра Linux
+      description: Команда `uname -r`
+      placeholder: 6.8.0-38-generic
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: Вывод `pfu-cli doctor`
+      description: Скопируйте вывод команды полностью
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: connection-log
+    attributes:
+      label: Лог попытки соединения
+      description: Вывод логов демона (журнал в приложении или `journalctl -u proxy-for-ubuntud -f`) в момент попытки соединения
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: config-fragment
+    attributes:
+      label: Фрагмент конфига (без секретов)
+      description: Только секции outbounds/rules для проблемного протокола. Пароли и UUID замените на ***
+      render: yaml
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Проверки перед отправкой
+      options:
+        - label: Я проверил, что сервер работает с другими клиентами (не проблема сервера)
+          required: true
+        - label: Я применил конфиг через `pfu-cli apply` и ошибки нет
+          required: true
+        - label: Я включил вывод `pfu-cli doctor`
+          required: true

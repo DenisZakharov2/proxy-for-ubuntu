@@ -101,6 +101,17 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("        meta mark set 0x1\n");
     }
     r.push_str("    }\n");
+    // ── forward: трафик Docker-контейнеров (FORWARD-хук) ───────────────
+    // Приоритет -10 срабатывает раньше цепочки DOCKER-USER (priority 0).
+    // Вердикт не разрывающий: пакет помечается меткой и уходит дальше без
+    // изменений; маршрутизацию забирает ip rule (таблица 100).
+    if cfg.intercept.docker {
+        r.push_str("    chain forward {\n");
+        r.push_str("        type filter hook forward priority -10; policy accept;\n");
+        r.push_str("        meta mark set 0x1\n");
+        r.push_str("    }\n");
+    }
+
     r.push_str("}\n");
 
     let mut ip_pre = vec![format!(

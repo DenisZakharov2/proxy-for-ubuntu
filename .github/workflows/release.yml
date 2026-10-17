@@ -34,6 +34,15 @@ jobs:
             VERSION="${GITHUB_REF#refs/tags/v}"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # RC-теги (например v0.2.0-rc.1) выпускаются как prerelease:
+          # не является «latest», висит минимум неделю до стабильного релиза.
+          if echo "$VERSION" | grep -q -- '-rc'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Установить системные зависимости
         run: |
@@ -94,6 +103,8 @@ jobs:
             dist/*.deb
             dist/*.deb.sha256
           fail_on_unmatched_files: true
+          prerelease: ${{ steps.ver.outputs.prerelease }}
+          make_latest: ${{ steps.ver.outputs.latest }}
           generate_release_notes: true
           body: |
             ## proxy-for-ubuntu ${{ steps.ver.outputs.version }}

@@ -47,8 +47,9 @@ rules:
 ## Быстрый старт
 
 ```bash
-# 1. Скачать .deb из релизов и поставить
-sudo apt install ./proxy-for-ubuntu_0.1.0_amd64.deb
+# 1. Скачать .deb со страницы релизов и поставить однострочником:
+#    https://github.com/DenisZakharov2/proxy-for-ubuntu/releases
+sudo apt install ./proxy-for-ubuntu_0.1.1_amd64.deb
 
 # 2. Запустить демон
 sudo systemctl start proxy-for-ubuntud
@@ -100,8 +101,17 @@ proxy-for-ubuntu
 | `shadowsocks` | ✅ рабочий | AEAD: ChaCha20-Poly1305, AES-128/256-GCM |
 | `trojan` | ✅ рабочий | проверка пароля на каждом пакете |
 | `ssh` | ✅ рабочий | делегирован системному OpenSSH (`ssh -D`) |
-| `vless` | ⚠ не проверен | написан по спецификации, не сверялся с живым Xray-сервером |
-| `vmess` | ⚠ не проверен | то же; только AEAD-режим с `alterId: 0` |
+| `vless` | ⚠ не проверен | написан по спецификации, не сверялся с живым Xray-сервером. См. матрицу ниже. |
+| `vmess` | ⚠ не проверен | то же; только AEAD-режим с `alterId: 0`. См. матрицу ниже. |
+
+## Матрица совместимости протоколов
+
+| Протокол | Сервер | Версия сервера | Статус | Дата проверки |
+|---|---|---|---|---|
+| `vless` | Xray | — | ⚠ не проверен | — |
+| `vmess` | Xray | — | ⚠ не проверен | — |
+
+Матрица заполняется автоматически workflow `.github/workflows/protocols.yml`: каждый прогон записывает, с какой версией Xray соединился. Если вы проверили протокол со своим сервером, создайтеissue по шаблону `.github/ISSUE_TEMPLATE/protocol_compatibility.yml` — так автор обновит таблицу вручную.
 
 Честно про последние два: код компилируется и проходит тесты на собственных
 серверах, но **ни разу не подключался к настоящему xray-серверу**. Проверив
@@ -178,6 +188,7 @@ final: DIRECT
 sudo pfu-cli connect          # включить перехват
 pfu-cli status                # состояние демона
 pfu-cli doctor                # проверить окружение
+pfu-cli doctor --strict       # то же, но с кодом возврата 1 при проблемах (для systemd ExecStartPre)
 pfu-cli rules                 # правила маршрутизации
 pfu-cli proxies               # список прокси
 pfu-cli metrics               # текущий трафик
@@ -186,6 +197,9 @@ pfu-cli metrics               # текущий трафик
 pfu-cli config > my.yaml
 $EDITOR my.yaml
 sudo pfu-cli apply < my.yaml
+
+# валидация конфига без применения (код возврата 0 — ок, 1 — ошибки)
+pfu-cli config validate --dry-run < my.yaml
 ```
 
 ## Решение проблем

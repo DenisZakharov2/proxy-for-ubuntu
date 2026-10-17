@@ -55,6 +55,8 @@ fn run(args: &[String]) -> Result<ExitCode> {
         "metrics" => simple("metrics.live", serde_json::json!({})),
         "geo" => simple("geo.list", serde_json::json!({})),
         "logs" => simple("log.tail", serde_json::json!({ "lines": 200 })),
+        "validate" => config_validate(),
+        "profile-export" => profile_export(&args[1..]),
         "apply" => {
             // Конфиг читается из stdin: `pfu-cli apply < config.yaml`
             let mut input = String::new();
@@ -180,6 +182,92 @@ fn apply(yaml: &str) -> Result<ExitCode> {
         eprintln!("  sudo ip route flush table 100");
     }
     Ok(ExitCode::FAILURE)
+}
+
+/// Экспорт профиля на печать stdout.
+/// `pfu-cli profile-export <имя> [--age-passphrase <пароль>]`
+/// При `--age-passphrase` выход шифруется age-паролем — можно класть в git.
+fn profile_export(args: &[String]) -> Result<ExitCode> {
+    let mut name = None;
+    let mut age_passphrase = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                name = Some(args.get(i + 1).ok_or_else(|| {
+                    Error::ConfigInvalid("--name требует значение".into())
+                })?.clone());
+                i += 2;
+            }
+            "--age-passphrase" => {
+                age_passphrase = Some(args.get(i + 1).ok_or_else(|| {
+                    Error::ConfigInvalid("--age-passphrase требует значение".into())
+                })?.clone());
+                i += 2;
+            }
+            "--age" => {
+                // Возвращаем ошибку с подсказкой: пароль передаётся явно.
+                return Err(Error::ConfigInvalid(
+                    "--age требует значения: используйте --age-passphrase <пароль>".into(),
+                ));
+            }
+            _ if name.is_none() => {
+                name = Some(args[i].clone());
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let name = name.ok_or_else(|| Error::ConfigInvalid("укажите имя профиля: pfu-cli profile-export <имя>"))?;
+    let mut params = serde_json::json!({ "name": name, "redact_secrets": true });
+    if let Some(pass) = age_passphrase {
+        params["age_passphrase"] = serde_json::Value::String(pass);
+    }
+    let out = call("profile.export", params)?;
+    let ok = out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if ok {
+        if age_passphrase.is_some() {
+            let encrypted = out.get("encrypted").and_then(|v| v.as_str()).unwrap_or("");
+            println!("{encrypted}");
+        } else {
+            let yaml = out.get("yaml").and_then(|v| v.as_str()).unwrap_or("");
+            println!("{yaml}");
+        }
+        Ok(ExitCode::SUCCESS)
+    } else {
+        let msg = out.get("message").and_then(|v| v.as_str()).unwrap_or("ошибка экспорта");
+        eprintln!("{msg}");
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// Валидация конфига без обращения к демону (как `nginx -t`).
+/// Читает YAML из stdin, парсит и валидирует локально.
+/// Код возврата 0 — конфиг валиден, 1 — есть ошибки.
+fn config_validate() -> Result<ExitCode> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    if input.trim().is_empty() {
+        return Err(Error::ConfigInvalid("на stdin пусто".into()));
+    }
+    let env = pfu::config::read_env_file(&paths::env_file());
+    match pfu::config::Config::parse(&input, &env) {
+        Ok(cfg) => {
+            println!(
+                "конфиг валиден: {} outbound'ов, {} правил",
+                cfg.outbounds.len(),
+                cfg.rules.len()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("конфиг не валиден: {e}");
+            if let Some(h) = e.hint() {
+                eprintln!("подсказка: {h}");
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 fn print_rules() -> Result<ExitCode> {

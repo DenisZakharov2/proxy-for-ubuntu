@@ -21,6 +21,11 @@ use crate::error::{Error, Result};
 use crate::paths;
 use crate::supervisor::{ApplyReport, Supervisor};
 
+// age-шифрование для защищённого экспорта профилей.
+use age::{Encryptor, Recipient};
+use age::secrecy::SecretString;
+use std::io::Write;
+
 #[derive(Debug, Deserialize)]
 struct Request {
     id: Option<Value>,
@@ -656,11 +661,27 @@ impl Server {
             .get("redact_secrets")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let age_passphrase = params
+            .get("age_passphrase")
+            .and_then(Value::as_str);
         let (path, _) = resolve_profile_path(name)?;
         let mut text =
             std::fs::read_to_string(&path).map_err(|e| Error::NotFound(format!("{name}: {e}")))?;
         if redact {
             text = redact_secrets(&text);
+        }
+        if let Some(passphrase) = age_passphrase {
+            let passphrase = SecretString::from(passphrase);
+            let encryptor =
+                Encryptor::new_recipients([Recipient::Passphrase(passphrase)]);
+            let mut buf = Vec::new();
+            {
+                let mut writer = encryptor.encrypt_writer(&mut buf)?;
+                writer.write_all(text.as_bytes())?;
+                writer.finish()?;
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+            return Ok(json!({ "ok": true, "encrypted": encoded }));
         }
         Ok(json!({ "ok": true, "yaml": text }))
     }

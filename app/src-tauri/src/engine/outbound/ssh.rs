@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
-use crate::config::OutboundSsh;
+use crate::config::{HostKeyCheck, OutboundSsh};
 use crate::engine::outbound::socks5::SocksProxy;
 use crate::engine::outbound::{AsyncReadWrite, Outbound, Request, UdpSession};
 use crate::error::{Error, Result};
@@ -72,11 +72,34 @@ impl SshTunnel {
             "ServerAliveInterval=30".into(),
             "-o".into(),
             "ServerAliveCountMax=3".into(),
-            // Не спрашивать ничего интерактивно: неоткрытый ключ должен
-            // падать сразу, а не висеть с вводом пароля.
-            "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
         ];
+
+        // Режим проверки ключа хоста.
+        match cfg.host_key_check {
+            HostKeyCheck::Strict => {
+                args.push("-o".into());
+                args.push("StrictHostKeyChecking=yes".into());
+            }
+            HostKeyCheck::TrustOnFirstUse => {
+                args.push("-o".into());
+                args.push("StrictHostKeyChecking=accept-new".into());
+                tracing::warn!(
+                    server = %cfg.server,
+                    "SSH: TOFU — новый ключ хоста будет принят без предупреждения о подмене"
+                );
+            }
+            HostKeyCheck::AcceptNew => {
+                args.push("-o".into());
+                args.push("StrictHostKeyChecking=accept-new".into());
+            }
+        }
+
+        // Собственный файл known_hosts (для strict и tofu).
+        if let Some(path) = &cfg.known_hosts_file {
+            args.push("-o".into());
+            args.push(format!("UserKnownHostsFile={path}"));
+        }
+
         if !cfg.host_key_algorithms.is_empty() {
             args.push("-o".into());
             args.push(format!(

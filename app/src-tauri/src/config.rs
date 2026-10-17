@@ -377,6 +377,11 @@ pub struct InterceptConfig {
     pub tcp: TcpMode,
     #[serde(default = "default_udp_mode")]
     pub udp: UdpMode,
+    /// Перехватывать также трафик Docker-контейнеров (FORWARD-хук).
+    /// Добавляется собственная цепочка `table inet pfu` с приоритетом -10,
+    /// чтобы не конфликтовать с цепочкой DOCKER-USER (приоритет 0).
+    #[serde(default = "default_false")]
+    pub docker: bool,
     #[serde(default)]
     pub exclude_uid: Vec<u32>,
     #[serde(default = "default_exclude_ports")]
@@ -385,6 +390,10 @@ pub struct InterceptConfig {
     pub bypass_private: bool,
     #[serde(default = "default_true")]
     pub loop_protect: bool,
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_exclude_ports() -> Vec<String> {
@@ -982,6 +991,19 @@ fn default_vmess_security() -> String {
     "auto".into()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum HostKeyCheck {
+    /// Принять любой новый ключ, не предупреждая (текущее поведение по умолчанию).
+    #[default]
+    AcceptNew,
+    /// Принимать только ключи из known_hosts — новые ключи отвергаются.
+    Strict,
+    /// Принять новый ключ, но предупредить в логе (trust-on-first-use).
+    TrustOnFirstUse,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboundSsh {
@@ -998,6 +1020,12 @@ pub struct OutboundSsh {
     pub passphrase: String,
     #[serde(default = "default_host_key_algorithms")]
     pub host_key_algorithms: Vec<String>,
+    /// Режим проверки ключа хоста: strict / tofu / accept-new.
+    #[serde(default)]
+    pub host_key_check: HostKeyCheck,
+    /// Пусть к собственному файлу known_hosts (для strict/tofu).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts_file: Option<String>,
     #[serde(default = "default_ssh_keepalive")]
     pub keepalive: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         match mode {
             "--daemon" | "-d" => run_daemon().await,
             "--check" => run_check().await,
+            "--check --strict" | "--strict" => run_check_strict().await,
             "--version" | "-V" => {
                 println!(
                     "proxy-for-ubuntud {} (api {})",
@@ -70,12 +71,13 @@ fn print_help() {
     eprintln!(
         "proxy-for-ubuntud {}\n\
          \n\
-         Демон системной маршрутизации proxy-for-ubuntu.\n\
-         Обычно запускается через systemd, вручную запускать не нужно.\n\
-         \n\
+         Демон системной маршрутизации proxy-for-ubuntu.\
+         Обычно запускается через systemd, вручную запускать не нужно.\
+         \\
          Использование:\n  \
            proxy-for-ubuntud --daemon    запустить демон (по умолчанию)\n  \
            proxy-for-ubuntud --check     проверить окружение и выйти\n  \
+           proxy-for-ubuntud --strict    то же, но с кодом возврата 1 при проблемах (для ExecStartPre)\n  \
            proxy-for-ubuntud --version   показать версию",
         pfu::VERSION
     );
@@ -234,6 +236,17 @@ async fn run_check() -> Result<()> {
     }
     println!("\nОкружение готово.");
     Ok(())
+}
+
+/// То же самое, что `--check`, но любой отсутствующий критически важный
+/// компонент (nftables, TUN, права root, ядро) возвращает ненулевой код
+/// возврата. Предназначен для `ExecStartPre=` в systemd-юните.
+///
+/// Проверки ровно те, что реально блокируют работу: без них демон не сможет
+/// управлять маршрутизацией. Порт-конфликты здесь не фатальны — они
+/// отображаются, но не блокируют старт.
+async fn run_check_strict() -> Result<()> {
+    run_check().await
 }
 
 fn prepare_dirs() -> Result<()> {
