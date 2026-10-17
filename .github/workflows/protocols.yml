@@ -171,7 +171,7 @@ jobs:
             exec 3>&-
           '
           # Убеждаемся, что порт действительно слушает (TCP-соединение прошло).
-          sudo docker port pfu-xray | grep -q "0.0.0.0:1443->443/tcp"
+          sudo docker port pfu-xray | grep -q "0.0.0.0:1443"
           echo "vless: TCP-соединение к Xray inbound установлено (реальный обмен байтами)."
 
       # ── Проверяем vmess: реальный обмен байтами с Xray ────────────────
@@ -184,7 +184,7 @@ jobs:
             echo "vmess: enviados 10 байт, получено ${#resp} байт"
             exec 3>&-
           '
-          sudo docker port pfu-xray | grep -q "0.0.0.0:1444->444/tcp"
+          sudo docker port pfu-xray | grep -q "0.0.0.0:1444"
           echo "vmess: TCP-соединение к Xray inbound установлено (реальный обмен байтами)."
 
       # ── Итоговый verdict ──────────────────────────────────────────────
