@@ -148,14 +148,12 @@ jobs:
           final: DIRECT
           EOF
 
-      # ── Валидируем конфиг через pfu-cli (без root — только парсинг) ───
-      # apply требует root и nftables; здесь проверяем, что конфиг парсится и
-      # проходит валидацию. Живой Xray проверяется на следующем шаге напрямую.
+      # ── Валидируем конфиг через pfu-cli (без root и без демона) ───
+      # `pfu-cli validate` читает YAML из stdin и возвращает код 0/1 — как
+      # `nginx -t`. `apply` требует root, nftables и запущенный демон, в
+      # Actions его не прогоняем.
       - name: Валидация конфига pfu-cli
-        run: |
-          ./app/src-tauri/target/debug/pfu-cli apply < "${PFU_WORK}/config.yaml" || true
-          echo "примечание: apply требует root и запущенного демона; "
-          "конфиг считается валидным, если pfu-cli не упал на разборе"
+        run: ./target/debug/pfu-cli validate < "${PFU_WORK}/config.yaml"
 
       # ── Проверяем vless: реальный обмен байтами с Xray ────────────────
       - name: Проверить vless — обмен байтами с живым Xray
