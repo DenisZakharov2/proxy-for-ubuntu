@@ -157,7 +157,8 @@ jobs:
       # `nginx -t`. `apply` требует root, nftables и запущенный демон, в
       # Actions его не прогоняем.
       - name: Валидация конфига pfu-cli
-        run: ./app/src-tauri/target/debug/pfu-cli validate < "${PFU_WORK}/config.yaml"
+        working-directory: app/src-tauri
+        run: cargo run --bin pfu-cli -- validate < "${PFU_WORK}/config.yaml"
 
       # ── Проверяем vless: реальный обмен байтами с Xray ────────────────
       - name: Проверить vless — обмен байтами с живым Xray
