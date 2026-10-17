@@ -345,6 +345,29 @@ impl Server {
         serde_json::to_value(report).map_err(Error::from)
     }
 
+    /// Перечитать конфиг с диска и применить транзакционно (как
+    /// `config.apply`), но по сигналу — вызвается по SIGHUP
+    /// (`systemctl reload`). Состояние демона (TUN, nftables, текущие
+    /// соединения) сохраняется: меняется только активная конфигурация.
+    pub async fn reload_config(&self) -> Result<ApplyReport> {
+        let (cfg, _) = self.load_config()?;
+        let report = self.supervisor.apply(cfg, "reload").await;
+        if report.ok {
+            // Перечитываем конфиг и пересобираем движок в памяти — так же,
+            // как в `config.apply`, чтобы новые настройки вступили сразу.
+            if let Ok((loaded, _)) = self.load_config() {
+                let geo = GeoRegistry::load(&[]);
+                if let Ok(engine) = Engine::build(loaded, &geo) {
+                    engine
+                        .enabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    *self.engine.write().await = Some(engine);
+                }
+            }
+        }
+        Ok(report)
+    }
+
     async fn config_rollback(self: &Arc<Self>) -> Result<Value> {
         match self.supervisor.rollback_to_latest().await {
             Ok(path) => {

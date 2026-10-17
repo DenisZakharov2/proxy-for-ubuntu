@@ -182,6 +182,30 @@ async fn run_daemon() -> Result<()> {
     }
 
     let server = std::sync::Arc::new(Server::new());
+
+    // systemctl reload отправляет SIGHUP — перечитать конфиг и применить
+    // транзакционно без остановки демона (сохранение TUN, nftables,
+    // текущих соединений).
+    let server_reload = server.clone();
+    tokio::spawn(async move {
+        if let Ok(mut stream) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            while stream.recv().await.is_some() {
+                tracing::warn!("получен SIGHUP — перезагрузка конфигурации");
+                match server_reload.reload_config().await {
+                    Ok(report) if report.ok => {
+                        tracing::info!("конфигурация перезагружена после SIGHUP")
+                    }
+                    Ok(_) => tracing::warn!(
+                        "перезагрузка конфигурации после SIGHUP не удалась: откат выполнен"
+                    ),
+                    Err(e) => tracing::error!("ошибка перезагрузки конфигурации после SIGHUP: {e}"),
+                }
+            }
+        }
+    });
+
     let socket = paths::ctl_socket();
     let outcome = server.serve(socket).await;
 
