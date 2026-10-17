@@ -405,6 +405,7 @@ impl Default for InterceptConfig {
         Self {
             tcp: default_tcp_mode(),
             udp: default_udp_mode(),
+            docker: default_false(),
             exclude_uid: Vec::new(),
             exclude_ports: default_exclude_ports(),
             bypass_private: true,

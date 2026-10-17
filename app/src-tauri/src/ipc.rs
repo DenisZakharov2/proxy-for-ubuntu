@@ -23,7 +23,7 @@ use crate::supervisor::{ApplyReport, Supervisor};
 
 // age-шифрование для защищённого экспорта профилей.
 use age::secrecy::SecretString;
-use age::{Encryptor, Recipient};
+use age::Encryptor;
 use std::io::Write;
 
 #[derive(Debug, Deserialize)]
@@ -669,9 +669,10 @@ impl Server {
             text = redact_secrets(&text);
         }
         if let Some(passphrase) = age_passphrase {
-            let passphrase = SecretString::from(passphrase);
-            let encryptor = Encryptor::new_recipients([Recipient::Passphrase(passphrase)]);
+            let passphrase = SecretString::new(passphrase.to_string());
+            let encryptor = Encryptor::with_user_passphrase(passphrase);
             let mut buf = Vec::new();
+            use base64::Engine as _;
             {
                 let mut writer = encryptor.encrypt_writer(&mut buf)?;
                 writer.write_all(text.as_bytes())?;
