@@ -11,11 +11,12 @@
 //! соединения), происходит до того, как пользователь увидит «подключено».
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::config::Config;
 use crate::engine::outbound::{self, Outbound, Request, UdpSession};
@@ -37,6 +38,10 @@ pub struct Engine {
     pub breakdown: Breakdown,
     pub cache: RwLock<HashMap<String, (Decision, Option<usize>)>>,
     pub enabled: AtomicBool,
+
+    /// Лимиты скорости и числа соединений на каждый outbound, собранные из
+    /// раздела `limits` конфига при сборке движка.
+    pub outbound_limits: HashMap<String, Arc<OutboundLimit>>,
 }
 
 impl Engine {
@@ -46,6 +51,29 @@ impl Engine {
         let mut outbounds = HashMap::new();
         for ob in &config.outbounds {
             outbounds.insert(ob.name().to_string(), outbound::build(ob)?);
+        }
+
+        // Лимиты из раздела `limits`: глобальные `rate_limit` /
+        // `max_connections`, с переопределением через
+        // `limits.outbound.<имя>`. У каждого outbound'а своё ведро — глобальная
+        // цифра не делится поровну между всеми прокси автоматически.
+        let global_rate = config.limits.rate_limit;
+        let global_max = config.limits.max_connections;
+        let mut outbound_limits = HashMap::new();
+        for ob in &config.outbounds {
+            let per = config.limits.outbound.get(ob.name());
+            let rate = per.and_then(|l| l.rate_limit).or(global_rate);
+            let max = per.and_then(|l| l.max_connections).or(global_max);
+            let mut lim = OutboundLimit {
+                rate: None,
+                max_connections: max,
+                active: AtomicU64::new(0),
+            };
+            if let Some(rate) = rate.filter(|&r| r > 0) {
+                // Разрешаем скачок на одну секунду во всю скорость.
+                lim.rate = Some(Arc::new(RateLimiter::new(rate, rate)));
+            }
+            outbound_limits.insert(ob.name().to_string(), Arc::new(lim));
         }
 
         let missing = rules.missing_geo();
@@ -66,6 +94,7 @@ impl Engine {
             breakdown: Breakdown::default(),
             cache: RwLock::new(HashMap::new()),
             enabled: AtomicBool::new(false),
+            outbound_limits,
         }))
     }
 
@@ -112,6 +141,68 @@ impl Engine {
         (decision, Some(label))
     }
 
+/// Токен-ведро: ограничивает скорость передачи в байт/сек.
+/// `rate == 0` означает «нет лимита» — `acquire` возвращается сразу.
+pub struct RateLimiter {
+    rate: u64,    // долгосрочная скорость, байт/сек
+    burst: u64,   // допустимый скачок, байт
+    state: std::sync::Mutex<BucketState>,
+}
+
+struct BucketState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(rate: u64, burst: u64) -> Self {
+        Self {
+            rate,
+            burst,
+            state: std::sync::Mutex::new(BucketState {
+                tokens: burst as f64,
+                last: Instant::now(),
+            }),
+        }
+    }
+
+    /// Ждёт, пока в ведре наберется хотя бы `n` токенов, и забирает их.
+    /// Мьютекс не удерживается через `.await`: блокируется только на момент
+    /// проверки и списания токенов.
+    pub async fn acquire(&self, n: u64) {
+        if self.rate == 0 || n == 0 {
+            return;
+        }
+        let n = n as f64;
+        loop {
+            let wait = {
+                let mut g =
+                    self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                g.tokens = (g.tokens
+                    + now.duration_since(g.last).as_secs_f64() * self.rate as f64)
+                    .min(self.burst as f64);
+                g.last = now;
+                if g.tokens >= n {
+                    g.tokens -= n;
+                    return;
+                }
+                (n - g.tokens) / self.rate as f64
+            };
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+        }
+    }
+}
+
+/// Настоящие лимиты одного outbound'а, собранные из раздела `limits`
+/// конфига при сборке движка (`Engine::build`).
+pub struct OutboundLimit {
+    pub rate: Option<Arc<RateLimiter>>,
+    pub max_connections: Option<u64>,
+    /// Сколько соединений к этому outbound'у открыто прямо сейчас.
+    pub active: AtomicU64,
+}
+
     /// Открывает соединение по решению правил. `REJECT` и отсутствие
     /// outbound'а — разные ошибки, и это видно в логе.
     pub async fn open(
@@ -136,18 +227,32 @@ impl Engine {
             Decision::Direct | Decision::Proxy(_) => {}
         }
 
-        let ob = match self.resolve_outbound(&label.clone().unwrap_or_else(|| "DIRECT".into())) {
+        let label = label.clone().unwrap_or_else(|| "DIRECT".to_string());
+        let ob = match self.resolve_outbound(&label) {
             Some(o) => o,
-            None if label.as_deref() == Some("DIRECT") => {
-                return Err(Error::NoOutbound);
-            }
+            None if label == "DIRECT" => return Err(Error::NoOutbound),
             None => {
                 return Err(Error::ConfigInvalid(format!(
                     "правило ссылается на {:?}, но такого outbound'а нет",
-                    label.unwrap_or_default()
+                    label
                 )))
             }
         };
+
+        // Лимит числа соединений: резервируем место перед попыткой соединения
+        // и освобождаем при неудаче connect() или когда поток закрывается
+        // (MeteredStream::drop).
+        if let Some(lim) = self.outbound_limits.get(&label) {
+            if let Some(max) = lim.max_connections {
+                let taken = lim.active.fetch_add(1, Ordering::Relaxed);
+                if taken >= max {
+                    lim.active.fetch_sub(1, Ordering::Relaxed);
+                    return Err(Error::Limit(format!(
+                        "достигнут лимит {max} соединений для outbound {label}"
+                    )));
+                }
+            }
+        }
 
         // UDP у DIRECT и у прокси без UDP идёт вниз по TCP-протоколу клиента
         // (например, QUIC сам переподключится по TCP). Лучше один
@@ -156,7 +261,19 @@ impl Engine {
             .connect(&Request {
                 target: target.clone(),
             })
-            .await?;
+            .await;
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(lim) = self.outbound_limits.get(&label) {
+                    lim.active.fetch_sub(1, Ordering::Relaxed);
+                }
+                return Err(e);
+            }
+        };
+        if let Some(lim) = self.outbound_limits.get(&label) {
+            stream = Box::new(MeteredStream::new(stream, Arc::clone(&lim.active)));
+        }
         self.stats.conn_opened();
         Ok((ob, stream))
     }
@@ -179,23 +296,23 @@ impl Engine {
     }
 }
 
-/// Прогоняет байты между клиентским и проксированным сокетами.
-///
-/// Возвращает `(вверх, вниз)` — сколько байтов ушло в интернет и сколько
-/// пришло обратно.
+/// Прогоняет байты между клиентским и проксированным сокетами с учётом
+/// токен-ведра (если задан). Возвращает `(вверх, вниз)` — сколько байтов
+/// ушло в интернет и сколько пришло обратно.
 pub async fn relay<A, B>(
     client: A,
     proxy: B,
     on_bytes: impl Fn(u64, u64) + Copy,
+    limiter: Option<&RateLimiter>,
 ) -> std::io::Result<(u64, u64)>
 where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut pr, mut pw) = tokio::io::split(proxy);
-    let up = tokio::io::copy(&mut cr, &mut pw);
-    let down = tokio::io::copy(&mut pr, &mut cw);
+    let up = pump(cr, pw, limiter);
+    let down = pump(pr, cw, limiter);
     let (u, d) = tokio::join!(up, down);
     // Одна из сторон всегда завершится ошибкой: это нормальный способ
     // закончить relay, когда удалённый узел закрыл соединение.
@@ -209,6 +326,85 @@ where
     Ok((up_bytes, down_bytes))
 }
 
+/// Перекладывает байты из `reader` в `writer`, дозируя скорость токен-ведром.
+/// Возвращает число переложенных байт.
+async fn pump<R, W>(
+    mut reader: R,
+    mut writer: W,
+    limiter: Option<&RateLimiter>,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(total);
+        }
+        if let Some(lim) = limiter {
+            lim.acquire(n as u64).await;
+        }
+        writer.write_all(&buf[..n]).await?;
+        total += n as u64;
+    }
+}
+
+/// Поток, который при удалении уменьшает счётчик активных соединений
+/// outbound'а, чтобы `max_connections` не терял занятые слоты.
+struct MeteredStream<S> {
+    inner: S,
+    active: Arc<AtomicU64>,
+}
+
+impl<S> MeteredStream<S> {
+    fn new(inner: S, active: Arc<AtomicU64>) -> Self {
+        Self { inner, active }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MeteredStream<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MeteredStream<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> Drop for MeteredStream<S> {
+    fn drop(&mut self) {
+        let _ = self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Короткий таймаут на установление соединения к прокси. Без него Apply
 /// «зависнет» на мёртвом сервере вместо того, чтобы откатиться.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -216,7 +412,7 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::*;
+    use crate::{config::*, Error};
 
     fn engine(yaml: &str) -> Arc<Engine> {
         let cfg = Config::parse(yaml, &HashMap::new()).unwrap();
@@ -357,10 +553,93 @@ rules:
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
 
-        let (u, d) = relay(relay_client, relay_proxy, |_, _| {}).await.unwrap();
+        let (u, d) = relay(relay_client, relay_proxy, |_, _| {}, None).await.unwrap();
         peer.abort();
         app.abort();
         assert!(u >= 5, "5 байт ушло в прокси, получили {u}");
         assert!(d >= 6, "6 байт пришло обратно, получили {d}");
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_passes_burst_immediately() {
+        let lim = Arc::new(RateLimiter::new(10_000, 10_000));
+        let start = Instant::now();
+        lim.acquire(10_000).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "в пределах bursts задержки быть не должно: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_waits_after_exhausting_burst() {
+        let lim = Arc::new(RateLimiter::new(10_000, 10_000));
+        lim.acquire(10_000).await; // опустошаем ведро
+        let start = Instant::now();
+        lim.acquire(10_000).await; // ещё 10 КБ при 10 КБ/сек — около 1 секунды
+        assert!(
+            start.elapsed() >= Duration::from_millis(700),
+            "слишком быстро: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "слишком долго: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_zero_rate_is_unlimited() {
+        let lim = Arc::new(RateLimiter::new(0, 0));
+        let start = Instant::now();
+        lim.acquire(u64::MAX).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "без лимита задержки не должно быть"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_connections_blocks_and_releases() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Две принятые но не закрытые соединения — второй open() не должен
+        // дойти до connect(), а упереться в лимит.
+        let holder = tokio::spawn(async move {
+            let (s1, _) = listener.accept().await.unwrap();
+            let (s2, _) = listener.accept().await.unwrap();
+            drop((s1, s2));
+        });
+
+        let yaml = format!("{}\nlimits:\n  max_connections: 1\n", BASE.trim_end());
+        let e = engine(&yaml);
+        let target = Target {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            is_tcp: true,
+        };
+        let flow = Flow {
+            dst_port: addr.port(),
+            is_tcp: true,
+            ..Default::default()
+        };
+
+        let (_, stream) = e.open(&target, &flow).await.expect("первое соединение");
+        let err = e
+            .open(&target, &flow)
+            .await
+            .err()
+            .expect("второе — ошибка лимита");
+        assert!(
+            matches!(err, Error::Limit(_)),
+            "ожидалась Error::Limit, получена {err}"
+        );
+        // Освобождаем слот — следующее открытие снова доходит до connect().
+        drop(stream);
+        let (_, stream) = e.open(&target, &flow).await.expect("снова открыто");
+        drop(stream);
+        holder.abort();
     }
 }

@@ -57,6 +57,10 @@ pub enum Error {
     #[error("отклонено правилом: {0}")]
     Reject(String),
 
+    /// Лимит скорости или числа соединений превышен (раздел `limits` конфига).
+    #[error("лимит превышен: {0}")]
+    Limit(String),
+
     #[error("внутренняя ошибка: {0}")]
     Internal(String),
 }
@@ -76,6 +80,7 @@ impl Error {
             Error::Io(_) | Error::Yaml(_) | Error::Json(_) | Error::Internal(_) => "E_INTERNAL",
             Error::Tls(_) | Error::Protocol { .. } | Error::Timeout(_) => "E_PROBE_FAILED",
             Error::Reject(_) => "E_REJECT",
+            Error::Limit(_) => "E_LIMIT",
         }
     }
 

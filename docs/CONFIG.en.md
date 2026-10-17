@@ -283,3 +283,32 @@ password: "${SS_PASSWORD}"
 
 Values are taken from `/etc/proxy-for-ubuntu/env` (mode `0600`, owner root) and
 from the daemon's environment. This allows not storing secrets in YAML.
+
+## Traffic limits
+
+The `limits` section restricts proxied traffic: rate (token bucket) and the
+number of simultaneous connections.
+
+```yaml
+limits:
+  # Long-term rate of all proxied traffic, bytes/sec.
+  # 0 or missing — no limit.
+  rate_limit: 1048576
+  # Maximum number of concurrently open connections.
+  max_connections: 100
+  # Per-outbound override — key is the outbound name.
+  outbound:
+    Work:
+      rate_limit: 524288
+      max_connections: 10
+```
+
+The token bucket is a long-term rate plus one full-speed second burst, so
+short requests aren't dribbled. Each outbound gets its own bucket: the global
+`rate_limit` without `outbound.<name>` applies to every proxy separately,
+it's not split between them.
+
+When `max_connections` is exceeded, the connection is not established and
+`E_LIMIT` is returned; the slot is released when the stream is closed. Limits
+are applied without restarting the daemon on `systemctl reload` or
+`config.apply`.

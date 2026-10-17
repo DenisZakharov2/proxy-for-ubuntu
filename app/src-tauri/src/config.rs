@@ -55,6 +55,10 @@ pub struct Config {
     /// `final_policy`, а пользователю — в YAML и в JSON — видно как `final`.
     #[serde(rename = "final", default = "default_final")]
     pub final_policy: Policy,
+
+    /// Ограничения скорости и числа соединений.
+    #[serde(default)]
+    pub limits: LimitsConfig,
 }
 
 fn default_api() -> u32 {
@@ -83,6 +87,7 @@ impl Default for Config {
             })],
             rules: Vec::new(),
             final_policy: Policy::Direct,
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -537,6 +542,46 @@ impl GroupConfig {
         }
         Ok(())
     }
+}
+
+/// Ограничения скорости и числа соединений.
+///
+/// Есть глобальные значения (действуют на весь проксируемый трафик) и
+/// переопределения для отдельных outbound'ов по имени.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Долгосрочная скорость всего проксируемого трафика, байт/сек.
+    /// `None` (или 0) — не ограничено. Токен-ведро позволяет один скачок
+    /// на одну секунду во всю лимитирующую скорость.
+    #[serde(default)]
+    pub rate_limit: Option<u64>,
+    /// Максимум одновременно открытых соединений.
+    #[serde(default)]
+    pub max_connections: Option<u64>,
+    /// Переопределения для конкретных outbound'ов — ключ — имя outbound'а.
+    #[serde(default)]
+    pub outbound: HashMap<String, OutboundLimit>,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit: None,
+            max_connections: None,
+            outbound: HashMap::new(),
+        }
+    }
+}
+
+/// Лимиты одного outbound'а. Переопределяют глобальные из `limits`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundLimit {
+    #[serde(default)]
+    pub rate_limit: Option<u64>,
+    #[serde(default)]
+    pub max_connections: Option<u64>,
 }
 
 // ──────────────────────────────── outbound'ы ────────────────────────────────
@@ -1559,5 +1604,44 @@ outbounds:
         assert_eq!(m.get("B").map(String::as_str), Some("two"));
         assert_eq!(m.len(), 2);
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn parses_traffic_limits() {
+        let yaml = r#"
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: Работа, type: socks5, server: 1.2.3.4, port: 1080}
+limits:
+  rate_limit: 1048576
+  max_connections: 50
+  outbound:
+    Работа:
+      rate_limit: 524288
+      max_connections: 10
+"#;
+        let cfg = Config::parse(yaml, &HashMap::new()).unwrap();
+        assert_eq!(cfg.limits.rate_limit, Some(1_048_576));
+        assert_eq!(cfg.limits.max_connections, Some(50));
+        let w = cfg
+            .limits
+            .outbound
+            .get("Работа")
+            .expect("лимит для outbound 'Работа'");
+        assert_eq!(w.rate_limit, Some(524_288));
+        assert_eq!(w.max_connections, Some(10));
+        assert!(cfg.limits.outbound.get("DIRECT").is_none());
+    }
+
+    #[test]
+    fn unknown_limit_field_is_rejected() {
+        let yaml = r#"
+outbounds:
+  - {name: DIRECT, type: direct}
+limits:
+  rate_limit: 1
+  nope: 2
+"#;
+        assert!(Config::parse(yaml, &HashMap::new()).is_err());
     }
 }
