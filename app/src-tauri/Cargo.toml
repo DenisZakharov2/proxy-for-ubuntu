@@ -25,6 +25,10 @@ path = "src/bin/daemon.rs"
 name = "pfu-cli"
 path = "src/bin/cli.rs"
 
+[[bin]]
+name = "pfu-web"
+path = "src/bin/web.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -94,6 +98,7 @@ rustls-pemfile = "2"
 libc = "0.2"
 nix = { version = "0.29", features = ["net", "fs", "process", "signal", "user"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip"] }
+axum = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

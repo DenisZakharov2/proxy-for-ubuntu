@@ -1,0 +1,21 @@
+[Unit]
+Description=proxy-for-ubuntu Web UI
+Documentation=man:pfu-web(8)
+After=graphical-session.target proxy-for-ubuntud.service
+Wants=proxy-for-ubuntud.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pfu-web
+Restart=on-failure
+RestartSec=2
+
+# Непривилегированный процесс: без root, HTTP только на 127.0.0.1.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/proxy-for-ubuntu
+
+[Install]
+WantedBy=graphical-session.target
