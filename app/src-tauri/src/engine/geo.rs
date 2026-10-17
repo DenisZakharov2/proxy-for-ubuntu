@@ -81,6 +81,7 @@ impl GeoEntry {
 }
 
 /// Реестр всех наборов. Отдаётся наружу как `&` и не меняется после загрузки.
+#[derive(Clone)]
 pub struct GeoRegistry {
     sets: HashMap<(GeoKind, String), Arc<GeoSetHandle>>,
 }
@@ -97,6 +98,7 @@ impl std::fmt::Debug for GeoRegistry {
 /// наборы без пересборки движка (обновление geo на лету).
 pub struct GeoSetHandle {
     inner: RwLock<GeoSet>,
+    path: PathBuf,
 }
 
 impl std::fmt::Debug for GeoSetHandle {
@@ -132,6 +134,30 @@ impl GeoSetHandle {
                 source: String::new(),
                 sha256: String::new(),
             })
+    }
+
+    /// Перечитать файл с диска и заменить содержимое handle. Правила, которые
+    /// уже держат этот `Arc<GeoSetHandle>`, подхватят новые записи при
+    /// следующем пакете — без рекомпиляции `RuleSet` и без остановки демона.
+    pub fn reload(&self) -> Result<()> {
+        let text = std::fs::read_to_string(&self.path)?;
+        let current = self
+            .inner
+            .read()
+            .map_err(|_| Error::Internal("geo handle is poisoned".into()))?;
+        let set = GeoSet::parse(
+            current.kind,
+            &current.tag,
+            &text,
+            self.path.to_str().unwrap_or(""),
+        );
+        drop(current);
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| Error::Internal("geo handle is poisoned".into()))?;
+        *guard = set;
+        Ok(())
     }
 }
 
@@ -279,6 +305,7 @@ impl GeoRegistry {
         set.sha256 = sha256_hex(text.as_bytes());
         Ok(GeoSetHandle {
             inner: RwLock::new(set),
+            path: path.to_path_buf(),
         })
     }
 
@@ -292,6 +319,13 @@ impl GeoRegistry {
         let mut v: Vec<GeoMeta> = self.sets.values().map(|h| h.meta()).collect();
         v.sort_by_key(|m| (m.kind as u8, m.tag.clone()));
         v
+    }
+
+    /// Перезагрузить все наборы с диска — используется автообновлением по
+    /// расписанию, чтобы работающий движок подхватил новые записи без
+    /// остановки.
+    pub fn refresh(&self) -> Vec<Result<()>> {
+        self.sets.values().map(|h| h.reload()).collect()
     }
 
     /// Скачивает набор и кладёт на диск. Возвращает количество записей.
@@ -396,5 +430,22 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn geo_handle_reload_from_file() {
+        let path = std::env::temp_dir().join("pfu_geo_reload_test.txt");
+        std::fs::write(&path, "1.0.0.0/8\n").unwrap();
+        let set = GeoSet::parse(GeoKind::Geoip, "t", "1.0.0.0/8", "test");
+        let handle = GeoSetHandle {
+            inner: RwLock::new(set),
+            path: path.clone(),
+        };
+        assert!(handle.entries()[0].contains_ip("1.0.0.5".parse().unwrap()));
+        std::fs::write(&path, "10.0.0.0/8\n").unwrap();
+        handle.reload().unwrap();
+        assert!(handle.entries()[0].contains_ip("10.0.0.5".parse().unwrap()));
+        assert!(!handle.entries()[0].contains_ip("1.0.0.5".parse().unwrap()));
+        let _ = std::fs::remove_file(&path);
     }
 }

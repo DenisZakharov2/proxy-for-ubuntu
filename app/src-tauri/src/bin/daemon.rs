@@ -165,6 +165,22 @@ async fn run_daemon() -> Result<()> {
     let geo = GeoRegistry::load(&[]);
     tracing::info!(geo_sets = geo.list().len(), "geo-наборы загружены");
 
+    // Фоновое автообновление geo-наборов по расписанию (пункт бэклога).
+    if let Ok(cfg) = pfu::config::Config::load(
+        &paths::config_path(),
+        &pfu::config::read_env_file(&paths::env_file()),
+    ) {
+        if cfg.geo.auto_update && !cfg.geo.sources.is_empty() {
+            let geo_task = geo.clone();
+            let sources = cfg.geo.sources;
+            let interval =
+                std::time::Duration::from_secs(cfg.geo.update_interval_hours.max(1) * 3600);
+            tokio::spawn(async move {
+                geo_auto_update(geo_task, interval, sources).await;
+            });
+        }
+    }
+
     let server = std::sync::Arc::new(Server::new());
     let socket = paths::ctl_socket();
     let outcome = server.serve(socket).await;
@@ -302,4 +318,43 @@ pub fn spawn_gc_task(
 /// Только для тестов и диагностики: собираем резолвер один раз.
 pub fn build_resolver(cfg: pfu::config::Config) -> Result<std::sync::Arc<dns::Resolver>> {
     dns::Resolver::new(cfg.dns)
+}
+
+/// Фоновое автообновление geo-наборов по расписанию.
+///
+/// Каждые `interval` скачивает все источники из конфига (`GeoRegistry::update`
+/// — HTTP + проверка sha256 + атоматическая запись на диск), затем перечитывает
+/// наборы в памяти (`GeoRegistry::refresh`). Работающий движок держит
+/// `Arc<GeoSetHandle>` и читает записи из `RwLock` на каждый пакет, поэтому
+/// новые наборы подхватываются без пересборки `RuleSet` и без остановки демона.
+async fn geo_auto_update(
+    geo: GeoRegistry,
+    interval: std::time::Duration,
+    sources: Vec<crate::config::GeoSource>,
+) {
+    let mut tick = tokio::time::interval(interval);
+    loop {
+        tick.tick().await;
+        for src in &sources {
+            match GeoRegistry::update(src).await {
+                Ok(count) => tracing::info!(
+                    kind = ?src.kind,
+                    tag = %src.tag,
+                    count,
+                    "geo-набор обновлён по расписанию",
+                ),
+                Err(e) => tracing::warn!(
+                    kind = ?src.kind,
+                    tag = %src.tag,
+                    error = %e,
+                    "не удалось обновить geo-набор по расписанию",
+                ),
+            }
+        }
+        for r in geo.refresh() {
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "не удалось перезагрузить geo-набор в памяти");
+            }
+        }
+    }
 }
