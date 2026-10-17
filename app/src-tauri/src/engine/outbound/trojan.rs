@@ -5,9 +5,10 @@
 //! Проверка на каждом пакете — защита от подмены данных внутри TLS (в отличие
 //! от SOCKS5, где пароль проверяется один раз на рукопожатии).
 //!
-//! Реализация UDP намеренно не сделана: протокол требует отдельного
-//! согласования UDP-сессии, а недоделанный QUIC-туннель хуже, чем честный
-//! отказ с внятной ошибкой, по которой движок уведёт поток в DIRECT.
+//! UDP: каждая датаграмма — самостоятельная Trojan-сессия. Клиент шлёт
+//! `ADDR, payload, SHA224(pass), CRLF` на UDP-порт сервера и получает
+//! ответ в том же формате. Постоянного TCP/TLS-крыла не держим — это
+//! упрощённая модель, достаточная для DNS и QUIC через Trojan.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -18,13 +19,14 @@ use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::client::TlsStream;
 
 use crate::config::OutboundTrojan;
 use crate::engine::outbound::{
     connect_proxy, poll_read_into, socks_addr_bytes, AsyncReadWrite, Outbound, Request, UdpSession,
 };
+use crate::engine::rules::Target;
 use crate::engine::tls::build_tls_config;
 use crate::error::{Error, Result};
 
@@ -127,13 +129,18 @@ impl Outbound for Trojan {
     }
 
     async fn open_udp(&self) -> Result<Arc<dyn UdpSession>> {
-        let _ = self.udp;
-        Err(Error::protocol(
-            "trojan",
-            "UDP через Trojan в этой версии не реализован. \
-             Для QUIC и DNS добавьте outbound SOCKS5h с udp: true и направьте \
-             на него правило NETWORK,udp",
-        ))
+        if !self.udp {
+            return Err(Error::protocol(
+                "trojan",
+                "UDP отключён в конфигурации outbound'а",
+            ));
+        }
+        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        sock.connect(self.server).await?;
+        Ok(Arc::new(TrojanUdp {
+            sock,
+            password_hash: self.password_hash,
+        }))
     }
 }
 
@@ -251,6 +258,106 @@ impl AsyncWrite for TrojanStream {
     }
 }
 
+/// Длина адресного блока в начале UDP-датаграммы Trojan (ATYP + адрес + порт).
+fn udp_addr_len(pkt: &[u8]) -> Result<usize> {
+    if pkt.is_empty() {
+        return Err(Error::protocol("trojan", "пустая UDP-датаграмма"));
+    }
+    Ok(match pkt[0] {
+        0x01 => 1 + 4 + 2,  // ATYP + IPv4 + порт
+        0x04 => 1 + 16 + 2, // ATYP + IPv6 + порт
+        0x03 => {
+            if pkt.len() < 2 {
+                return Err(Error::protocol("trojan", "обрезанная длина домена"));
+            }
+            1 + 1 + pkt[1] as usize + 2 // ATYP + длина + домен + порт
+        }
+        other => {
+            return Err(Error::protocol(
+                "trojan",
+                format!("неизвестный тип адреса {other:#x}"),
+            ))
+        }
+    })
+}
+
+/// Собирает исходящую UDP-датаграмму: `[ADDR][DATA][SHA224(pass)][CRLF]`.
+fn build_udp_datagram(addr: &[u8], data: &[u8], hash: &[u8; 56]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(addr.len() + data.len() + SIG_LEN);
+    pkt.extend_from_slice(addr);
+    pkt.extend_from_slice(data);
+    pkt.extend_from_slice(hash);
+    pkt.extend_from_slice(b"\r\n");
+    pkt
+}
+
+/// Разбирает входящую UDP-датаграмму и проверяет подпись. Возвращает смещение
+/// и длину полезной нагрузки плюс цель.
+fn parse_udp_datagram(pkt: &[u8], hash: &[u8; 56]) -> Result<(usize, usize, Target)> {
+    let addr_len = udp_addr_len(pkt)?;
+    if pkt.len() < addr_len + SIG_LEN {
+        return Err(Error::protocol("trojan", "слишком короткая UDP-датаграмма"));
+    }
+    let trailer = &pkt[pkt.len() - SIG_LEN..];
+    if &trailer[..56] != hash || &trailer[56..] != b"\r\n" {
+        return Err(Error::protocol(
+            "trojan",
+            "неверная подпись пароля в UDP-ответе",
+        ));
+    }
+    let (host, port) = parse_socks_addr(&pkt[..addr_len])?;
+    let data_start = addr_len;
+    let data_len = pkt.len() - addr_len - SIG_LEN;
+    Ok((
+        data_start,
+        data_len,
+        Target {
+            host,
+            port,
+            is_tcp: false,
+        },
+    ))
+}
+
+/// UDP-сессия Trojan без постоянного TCP: каждая датаграмма подписывается
+/// хешем пароля и содержит адрес назначения.
+///
+/// shortcut: нет предварительного TCP-рукопожатия UDP ASSOCIATE, как у SOCKS5;
+/// сервер, который требует установления сессии через connect() с CMD=0x03,
+/// будет отбрасывать такие датаграммы — тогда в open_udp() добавить prologue.
+struct TrojanUdp {
+    sock: UdpSocket,
+    password_hash: [u8; 56],
+}
+
+#[async_trait]
+impl UdpSession for TrojanUdp {
+    async fn send_to(&self, data: &[u8], dst: &Target) -> Result<()> {
+        let addr = socks_addr_bytes(&dst.host, dst.port)?;
+        let pkt = build_udp_datagram(&addr, data, &self.password_hash);
+        self.sock.send(&pkt).await?;
+        Ok(())
+    }
+
+    async fn recv_from(&self, buf: &mut [u8], timeout: Duration) -> Result<(usize, Target)> {
+        let mut pkt = vec![0u8; 65535];
+        let n = tokio::time::timeout(timeout, self.sock.recv(&mut pkt))
+            .await
+            .map_err(|_| Error::Timeout("trojan UDP: нет данных от сервера".into()))??;
+        let (start, len, target) = parse_udp_datagram(&pkt[..n], &self.password_hash)?;
+        let data = &pkt[start..start + len];
+        let copied = data.len().min(buf.len());
+        buf[..copied].copy_from_slice(data);
+        Ok((copied, target))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.sock
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,15 +393,45 @@ mod tests {
         assert_eq!(t.password_hash.len(), 56);
     }
 
+    #[test]
+    fn udp_datagram_roundtrip_with_signature() {
+        let addr = socks_addr_bytes("example.com", 443).unwrap();
+        let data = b"hello udp";
+        let hash = [42u8; 56];
+        let pkt = build_udp_datagram(&addr, data, &hash);
+        let (start, len, target) = parse_udp_datagram(&pkt, &hash).unwrap();
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 443);
+        assert!(!target.is_tcp);
+        assert_eq!(&pkt[start..start + len], data);
+        // Подпись неверна — ошибка.
+        let mut bad = hash;
+        bad[0] ^= 1;
+        assert!(parse_udp_datagram(&pkt, &bad).is_err());
+    }
+
+    #[test]
+    fn udp_rejects_short_packet_and_bad_trailer() {
+        let hash = [1u8; 56];
+        assert!(parse_udp_datagram(&[], &hash).is_err());
+        assert!(parse_udp_datagram(&[0x03, 5, b'e'], &hash).is_err());
+        // IPv4 без хвостовой подписи.
+        let addr = socks_addr_bytes("1.2.3.4", 80).unwrap();
+        assert!(parse_udp_datagram(&addr, &hash).is_err());
+    }
+
     #[tokio::test]
-    async fn udp_returns_actionable_error_not_panic() {
-        let t = Trojan::new(cfg()).unwrap();
+    async fn open_udp_succeeds_when_enabled_and_fails_when_disabled() {
+        let mut enabled = cfg();
+        enabled.udp = true;
+        let t = Trojan::new(enabled).unwrap();
+        let _s = t.open_udp().await.expect("UDP-сессия должна открываться");
+
+        let mut disabled = cfg();
+        disabled.udp = false;
+        let t = Trojan::new(disabled).unwrap();
         let err = t.open_udp().await.err().expect("ожидалась ошибка");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("SOCKS5h"),
-            "ошибка должна подсказывать решение: {msg}"
-        );
+        assert!(err.to_string().contains("отключён"), "{err}");
     }
 
     #[test]
