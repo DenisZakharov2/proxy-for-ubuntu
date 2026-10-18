@@ -63,7 +63,7 @@ echo "==> proxy-for-ubuntu $VERSION ($ARCH)"
 
 # ── сборка фронтенда и бинарников ───────────────────────────────────────────
 TARGET_DIR="$ROOT/app/src-tauri/target/release"
-BINARIES=(proxy-for-ubuntu proxy-for-ubuntud pfu-cli)
+BINARIES=(proxy-for-ubuntu proxy-for-ubuntud pfu-cli pfu-web)
 
 if [[ $SKIP_BUILD -eq 0 ]]; then
     if [[ $SKIP_TESTS -eq 0 ]]; then
@@ -111,6 +111,7 @@ install -m 0644 "$ROOT/packaging/systemd/proxy-for-ubuntud.service" \
     "$STAGE/usr/lib/systemd/system/proxy-for-ubuntud.service"
 install -m 0644 "$ROOT/packaging/systemd/proxy-for-ubuntu-gui.service" \
     "$STAGE/usr/lib/systemd/system/proxy-for-ubuntu-gui.service"
+install -m 0644 "$ROOT/packaging/systemd/pfu-web.service" "$STAGE/usr/lib/systemd/system/pfu-web.service"
 
 # polkit
 install -m 0644 "$ROOT/packaging/polkit/com.deniszakharov.proxyforubuntu.policy" \

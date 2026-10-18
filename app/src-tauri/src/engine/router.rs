@@ -24,6 +24,66 @@ use crate::engine::rules::{Decision, Flow, RuleSet, Target};
 use crate::engine::stats::{Breakdown, Counters};
 use crate::error::{Error, Result};
 
+/// Токен-ведро: ограничивает скорость передачи в байт/сек.
+/// `rate == 0` означает «нет лимита» — `acquire` возвращается сразу.
+pub struct RateLimiter {
+    rate: u64,  // долгосрочная скорость, байт/сек
+    burst: u64, // допустимый скачок, байт
+    state: std::sync::Mutex<BucketState>,
+}
+
+struct BucketState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(rate: u64, burst: u64) -> Self {
+        Self {
+            rate,
+            burst,
+            state: std::sync::Mutex::new(BucketState {
+                tokens: burst as f64,
+                last: Instant::now(),
+            }),
+        }
+    }
+
+    /// Ждёт, пока в ведре наберется хотя бы `n` токенов, и забирает их.
+    /// Мьютекс не удерживается через `.await`: блокируется только на момент
+    /// проверки и списания токенов.
+    pub async fn acquire(&self, n: u64) {
+        if self.rate == 0 || n == 0 {
+            return;
+        }
+        let n = n as f64;
+        loop {
+            let wait = {
+                let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                g.tokens = (g.tokens + now.duration_since(g.last).as_secs_f64() * self.rate as f64)
+                    .min(self.burst as f64);
+                g.last = now;
+                if g.tokens >= n {
+                    g.tokens -= n;
+                    return;
+                }
+                (n - g.tokens) / self.rate as f64
+            };
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+        }
+    }
+}
+
+/// Настоящие лимиты одного outbound'а, собранные из раздела `limits`
+/// конфига при сборке движка (`Engine::build`).
+pub struct OutboundLimit {
+    pub rate: Option<Arc<RateLimiter>>,
+    pub max_connections: Option<u64>,
+    /// Сколько соединений к этому outbound'у открыто прямо сейчас.
+    pub active: AtomicU64,
+}
+
 /// Немедленно загруженный движок. Подменяется целиком при перезагрузке
 /// конфига, поэтому читается без блокировок — [`RwLock`] только на саму
 /// ссылку.
@@ -140,68 +200,6 @@ impl Engine {
         };
         (decision, Some(label))
     }
-
-/// Токен-ведро: ограничивает скорость передачи в байт/сек.
-/// `rate == 0` означает «нет лимита» — `acquire` возвращается сразу.
-pub struct RateLimiter {
-    rate: u64,    // долгосрочная скорость, байт/сек
-    burst: u64,   // допустимый скачок, байт
-    state: std::sync::Mutex<BucketState>,
-}
-
-struct BucketState {
-    tokens: f64,
-    last: Instant,
-}
-
-impl RateLimiter {
-    pub fn new(rate: u64, burst: u64) -> Self {
-        Self {
-            rate,
-            burst,
-            state: std::sync::Mutex::new(BucketState {
-                tokens: burst as f64,
-                last: Instant::now(),
-            }),
-        }
-    }
-
-    /// Ждёт, пока в ведре наберется хотя бы `n` токенов, и забирает их.
-    /// Мьютекс не удерживается через `.await`: блокируется только на момент
-    /// проверки и списания токенов.
-    pub async fn acquire(&self, n: u64) {
-        if self.rate == 0 || n == 0 {
-            return;
-        }
-        let n = n as f64;
-        loop {
-            let wait = {
-                let mut g =
-                    self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let now = Instant::now();
-                g.tokens = (g.tokens
-                    + now.duration_since(g.last).as_secs_f64() * self.rate as f64)
-                    .min(self.burst as f64);
-                g.last = now;
-                if g.tokens >= n {
-                    g.tokens -= n;
-                    return;
-                }
-                (n - g.tokens) / self.rate as f64
-            };
-            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
-        }
-    }
-}
-
-/// Настоящие лимиты одного outbound'а, собранные из раздела `limits`
-/// конфига при сборке движка (`Engine::build`).
-pub struct OutboundLimit {
-    pub rate: Option<Arc<RateLimiter>>,
-    pub max_connections: Option<u64>,
-    /// Сколько соединений к этому outbound'у открыто прямо сейчас.
-    pub active: AtomicU64,
-}
 
     /// Открывает соединение по решению правил. `REJECT` и отсутствие
     /// outbound'а — разные ошибки, и это видно в логе.
@@ -553,7 +551,9 @@ rules:
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
 
-        let (u, d) = relay(relay_client, relay_proxy, |_, _| {}, None).await.unwrap();
+        let (u, d) = relay(relay_client, relay_proxy, |_, _| {}, None)
+            .await
+            .unwrap();
         peer.abort();
         app.abort();
         assert!(u >= 5, "5 байт ушло в прокси, получили {u}");
