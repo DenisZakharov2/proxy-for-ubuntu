@@ -354,7 +354,7 @@ pub fn build_resolver(cfg: pfu::config::Config) -> Result<std::sync::Arc<dns::Re
 async fn geo_auto_update(
     geo: GeoRegistry,
     interval: std::time::Duration,
-    sources: Vec<crate::config::GeoSource>,
+    sources: Vec<pfu::config::GeoSource>,
 ) {
     let mut tick = tokio::time::interval(interval);
     loop {

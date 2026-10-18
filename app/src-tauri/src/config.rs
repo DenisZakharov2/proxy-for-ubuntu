@@ -548,7 +548,7 @@ impl GroupConfig {
 ///
 /// Есть глобальные значения (действуют на весь проксируемый трафик) и
 /// переопределения для отдельных outbound'ов по имени.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Долгосрочная скорость всего проксируемого трафика, байт/сек.
@@ -562,16 +562,6 @@ pub struct LimitsConfig {
     /// Переопределения для конкретных outbound'ов — ключ — имя outbound'а.
     #[serde(default)]
     pub outbound: HashMap<String, OutboundLimit>,
-}
-
-impl Default for LimitsConfig {
-    fn default() -> Self {
-        Self {
-            rate_limit: None,
-            max_connections: None,
-            outbound: HashMap::new(),
-        }
-    }
 }
 
 /// Лимиты одного outbound'а. Переопределяют глобальные из `limits`.
@@ -1630,7 +1620,7 @@ limits:
             .expect("лимит для outbound 'Работа'");
         assert_eq!(w.rate_limit, Some(524_288));
         assert_eq!(w.max_connections, Some(10));
-        assert!(cfg.limits.outbound.get("DIRECT").is_none());
+        assert!(!cfg.limits.outbound.contains_key("DIRECT"));
     }
 
     #[test]

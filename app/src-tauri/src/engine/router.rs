@@ -307,8 +307,8 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut cr, mut cw) = tokio::io::split(client);
-    let (mut pr, mut pw) = tokio::io::split(proxy);
+    let (cr, cw) = tokio::io::split(client);
+    let (pr, pw) = tokio::io::split(proxy);
     let up = pump(cr, pw, limiter);
     let down = pump(pr, cw, limiter);
     let (u, d) = tokio::join!(up, down);
