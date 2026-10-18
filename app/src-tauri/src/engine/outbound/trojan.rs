@@ -24,7 +24,8 @@ use tokio_rustls::client::TlsStream;
 
 use crate::config::OutboundTrojan;
 use crate::engine::outbound::{
-    connect_proxy, poll_read_into, socks_addr_bytes, AsyncReadWrite, Outbound, Request, UdpSession,
+    connect_proxy, parse_socks_addr, poll_read_into, socks_addr_bytes, AsyncReadWrite, Outbound,
+    Request, UdpSession,
 };
 use crate::engine::rules::Target;
 use crate::engine::tls::build_tls_config;

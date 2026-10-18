@@ -81,7 +81,7 @@ pub struct OutboundLimit {
     pub rate: Option<Arc<RateLimiter>>,
     pub max_connections: Option<u64>,
     /// Сколько соединений к этому outbound'у открыто прямо сейчас.
-    pub active: AtomicU64,
+    pub active: Arc<AtomicU64>,
 }
 
 /// Немедленно загруженный движок. Подменяется целиком при перезагрузке
@@ -127,7 +127,7 @@ impl Engine {
             let mut lim = OutboundLimit {
                 rate: None,
                 max_connections: max,
-                active: AtomicU64::new(0),
+                active: Arc::new(AtomicU64::new(0)),
             };
             if let Some(rate) = rate.filter(|&r| r > 0) {
                 // Разрешаем скачок на одну секунду во всю скорость.
@@ -312,13 +312,6 @@ where
     let up = pump(cr, pw, limiter);
     let down = pump(pr, cw, limiter);
     let (u, d) = tokio::join!(up, down);
-    // Одна из сторон всегда завершится ошибкой: это нормальный способ
-    // закончить relay, когда удалённый узел закрыл соединение.
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        let _ = cw.shutdown().await;
-        let _ = pw.shutdown().await;
-    })
-    .await;
     let (up_bytes, down_bytes) = (u.unwrap_or(0), d.unwrap_or(0));
     on_bytes(up_bytes, down_bytes);
     Ok((up_bytes, down_bytes))
