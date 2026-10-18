@@ -81,6 +81,8 @@ jobs:
             usr/bin/proxy-for-ubuntud \
             usr/bin/pfu-cli \
             lib/systemd/system/proxy-for-ubuntud.service \
+            lib/systemd/system/pfu-web.service \
+            usr/bin/pfu-web \
             usr/share/applications/proxy-for-ubuntu.desktop \
             usr/share/proxy-for-ubuntu/profiles/default.yaml ; do
             if ! grep -q -- "$f" <<<"$CONTENTS"; then
