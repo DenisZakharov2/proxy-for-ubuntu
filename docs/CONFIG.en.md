@@ -25,13 +25,13 @@ dns:
   fallback: [9.9.9.9, 1.0.0.1]
 
 tun:
-  enabled: false        # see section "Interception modes"
+  enabled: false        # not implemented, see "Interception modes"
   device: pfu0
   mtu: 9000
   strict_route: true
 
 intercept:
-  tcp: redirect          # redirect | tproxy
+  tcp: redirect          # redirect | off (tproxy for TCP is not implemented)
   udp: tproxy            # tproxy | off
   exclude_uid: []        # uid whose traffic is not touched (e.g. the daemon itself = 0)
   exclude_ports: [22]    # SSH outbound, so as not to lose access to the machine
@@ -66,15 +66,17 @@ final: DIRECT
 
 | Mode | Captures | Requirements | When to enable |
 |---|---|---|---|
-| `redirect` (TCP) | all outgoing TCP | `nftables`, root | default, fastest |
-| `tproxy` (TCP/UDP) | TCP + UDP, including QUIC | `nftables` + `IP_TRANSPARENT` | UDP/QUIC/games |
+| `redirect` (TCP) | all outgoing TCP | `nftables`, root | default, the only supported TCP mode |
+| `tproxy` (UDP) | forwarded UDP (containers) | `nftables`, `IP_TRANSPARENT` | UDP from containers; local UDP is not intercepted |
 | `off` | nothing, system environment variables only | — | checking everything works after install |
 
 Why not TUN as the primary mode: TUN requires a userspace network stack to parse
-IP packets fully, and is 10x more CPU-expensive. The task "intercept all system
-traffic, including DNS and QUIC, and route it by rules" is solved more precisely
-and reliably by a pair of nftables rules. The `tun` mode is kept for scenarios
-where non-TCP traffic is needed (ESP, GRE), and is disabled by default.
+IP packets fully, and is 10x more CPU-expensive. TCP and forwarded UDP are
+caught more reliably by a pair of nftables rules. But that is exactly why local
+UDP (DNS, QUIC) goes direct today: `REDIRECT` does not preserve a datagram's
+real destination, and without a userspace stack it cannot be recovered. The
+`tun` mode exists in the config but is **not implemented**; it is needed for
+this and for non-TCP protocols (ESP, GRE).
 
 ## `outbounds`
 

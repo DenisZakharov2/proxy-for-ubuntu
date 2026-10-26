@@ -27,9 +27,9 @@
 │         └───────────────┴──────────────────┴────────────────┘        │
 │                              │                                       │
 │                    ┌─────────▼──────────┐                            │
-│                    │  TUN + nftables    │                            │
-│                    │  политическая      │                            │
-│                    │  маршрутизация     │                            │
+│                    │  nftables          │                            │
+│                    │  REDIRECT/TPROXY   │                            │
+│                    │  → слушатели       │                            │
 │                    └────────────────────┘                            │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -46,11 +46,11 @@ GUI работает от имени пользователя, демон — о
 | Запускается | из `.desktop` от пользователя | `systemd`, `Type=simple`, от root |
 | Права | обычные | root |
 | Файлы | `~/.config/proxy-for-ubuntu/` | `/etc/proxy-for-ubuntu/`, `/var/lib/proxy-for-ubuntu/` |
-| Что делает | рисует интерфейс, шлёт команды | держит TUN, nftables, сокеты, правила |
+| Что делает | рисует интерфейс, шлёт команды | держит nftables, слушатели, сокеты, правила |
 
 Причины разделения:
 
-1. **TUN и nftables требуют `CAP_NET_ADMIN`.** Выдавать его GUI-процессу — плохая
+1. **nftables, `ip rule` и прозрачные сокеты требуют `CAP_NET_ADMIN`.** Выдавать его GUI-процессу — плохая
    практика: упавший или взломанный WebView-процесс получил бы права менять сеть.
 2. **Системные изменения переживают перезапуск GUI.** Закрыли окно — трафик идёт
    через прокси дальше, как и должен.
@@ -158,45 +158,110 @@ xray-сервера. Формально в UI такие протоколы по
 
 ## 6. Системный слой
 
-### 6.1 TUN
+### 6.1 Перехват трафика
 
-`/dev/net/tun`, ioctl `TUNSETIFF`, имя `pfu0`, адрес `172.19.0.1/30`, MTU 9000.
-MTU 9000 обязателен: TCP через прокси добавляет заголовки, и при 1500 большие
-загрузки встают. Дополнительно ядро включается с `tcp_mtu_probing=1`, чтобы
-устойчиво переживать потерю пакетов на больших размерах.
+TUN не используется: ядро само отдаёт соединения в сокеты демона.
+
+- **TCP.** Цепочка `nat output` (hook `output`, priority `dstnat`) делает
+  `redirect to :15000` для локального TCP. Демон принимает соединение
+  слушателем на `0.0.0.0:15000` и читает настоящего получателя из
+  `SO_ORIGINAL_DST` (`SOL_IP`-опция 80) уже принятого сокета.
+- **UDP форвардинга.** В `prerouting` (priority `mangle`) UDP помечается
+  `meta mark set 0x1` и уходит в `tproxy to :15001`. По метке `ip rule`
+  отправляет пакет в таблицу 100, где лежит `local default dev lo`;
+  настоящий получатель приходит контрольным сообщением `IP_ORIGDSTADDR`.
+  На каждый поток создаётся сокет, привязанный к этому получателю
+  (`IP_TRANSPARENT` + `SO_REUSEPORT`): ответ уходит с правильного порта, а
+  не с 15001 — иначе клиент его отбросит.
+- **TCP из контейнеров** (`intercept.docker: true`) перехватывается в
+  `nat prerouting` тем же `redirect to :15000`.
+
+Что не перехватывается и почему:
+
+- **локальный UDP** (DNS, QUIC, игры). `redirect` для локально
+  сгенерированной датаграммы переписывает адрес получателя, и
+  `IP_ORIGDSTADDR` возвращает уже `127.0.0.1:15001`, а не настоящий адрес —
+  восстановить его нечем. Такой трафик идёт напрямую, мимо прокси;
+- трафик `uid 0` (сам демон), `lo`, локальные адреса (`fib daddr type
+  local`), multicast `224.0.0.0/4`, broadcast, приватные сети при
+  `bypass_private: true` и порты из `exclude_ports`.
+
+TUN (`config.tun`, интерфейс `pfu0`) **не реализован**: поле и проверка
+`/dev/net/tun` остались от первоначального плана. Именно он нужен, чтобы
+закрыть локальный UDP; до тех пор ограничение выше действует.
+
+Слушатели живут ровно столько, сколько включён перехват: `Capture` держит
+`CancellationToken`, `disconnect` отменяет циклы и дожидается, пока задачи
+закроют сокеты. В юните `LimitNOFILE=65536`; при `EMFILE`/`ENFILE` цикл
+accept спит секунду и пишет одно предупреждение в секунду, а не в каждом
+витке.
 
 ### 6.2 Маршрутизация (nftables)
 
-Маршруты не трогаются. Используется **политическая маршрутизация по метке**:
+Маршруты системы не трогаются. Фактический набор правил (`nft list table
+inet pfu`) после `connect`:
 
 ```
 table inet pfu {
-    chain prerouting { type filter hook prerouting priority mangle; meta mark set 0x1 }
-    chain output      { type filter hook output  priority mangle; meta mark set 0x1 }
+    set loopback_ips  { elements = { 127.0.0.0/8 } }
+    set private_ips   { elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } }
+    set exclude_ports { elements = { 22 } }
+
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname "lo" return
+        fib daddr type local return
+        ip daddr 224.0.0.0/4 return
+        ip daddr 255.255.255.255 return
+        ip daddr @loopback_ips return
+        ip daddr @private_ips return
+        meta l4proto { tcp, udp } th dport @exclude_ports return
+        meta l4proto udp meta mark set 0x1 tproxy to :15001
+    }
+
+    chain nat_output {
+        type nat hook output priority -100; policy accept;
+        oifname "lo" return
+        fib daddr type local return
+        ip daddr 224.0.0.0/4 return
+        ip daddr 255.255.255.255 return
+        ip daddr @loopback_ips return
+        ip daddr @private_ips return
+        meta l4proto { tcp, udp } th dport @exclude_ports return
+        meta skuid 0 return
+        meta l4proto tcp redirect to :15000
+    }
+
+    chain nat_prerouting {          # только при intercept.docker: true
+        type nat hook prerouting priority -100; policy accept;
+        ...
+        meta l4proto tcp redirect to :15000
+    }
 }
 ip rule add fwmark 0x1 lookup 100 priority 100
-ip route add default dev pfu0 table 100
-```
-
-Плюс `nft` набор для исключений, чтобы не зациклить собственный трафик демона:
-
-```
-oifname "pfu0" accept          # уже в TUN
-meta mark 0x1 tcp dport 22 accept   # SSH, чтобы не потерять доступ
-uid != 0 meta mark 0x1 accept      # трафик других пользователей напрямую? нет — решает правило
+ip route replace local default dev lo table 100
 ```
 
 Правила генерируются в `engine/nft.rs` и применяются одним `nft -f`, а не
-поштучно — это атомарно и быстро.
+поштучно — это атомарно и быстро. `ip rule` добавляется только если его
+ещё нет; `teardown` удаляет все свои правила, маршрут и таблицу, проверяет
+результат и возвращает ошибку со списком неудач, а не глотает её.
+
+Цепочка `prerouting` без исключений забирала трафик, адресованный самой
+машине: mDNS уходил в прокси-сокет десятками тысяч датаграмм. Поэтому там
+стоят `fib daddr type local`, multicast и broadcast.
 
 ### 6.3 DNS
 
-Весь DNS (UDP/53 и TCP/53) перехватывается и обрабатывается встроенным резолвером
-(`engine/dns.rs`): кэш с TTL, параллельные A/AAAA, fallback на DoH/DoT при
-неудаче. Для проксируемых доменов резолвится через DNS самого прокси
-(для `socks5h`/`vless`/`vmess` — неявный remote DNS), для прямых — через
-системные резолверы. Это убирает утечку DNS, из-за которой «прокси включён,
-а трафик всё равно палится».
+Встроенный резолвер (`engine/dns.rs`: кэш с TTL, параллельные A/AAAA,
+fallback) подключён к движку и используется health-check'ом и протоколами,
+но **локальный DNS не перехватывается** — он относится к локальному UDP
+(см. 6.1) и идёт через системный резолвер. `dns.strategy` (`fake-ip`,
+`redir-host`) на локальные запросы пока не влияет; `fake-ip` в текущей
+схеме не работает.
+
+Домены не теряются там, где это важно: `socks5h`, `vless`, `vmess`,
+`trojan` передают имя хоста на прокси, и резолвит его уже он.
 
 ### 6.4 Apply и откат
 
@@ -207,7 +272,7 @@ uid != 0 meta mark 0x1 accept      # трафик других пользова�
 2. **Dry-run валидация.** YAML парсится, правила компилируются, каждый outbound
    проверяется на успешное TCP-соединение до цели. Ничего не применено.
 3. **Commit.** Записывается новый конфиг, генерируются nft-правила, `nft -f`,
-   поднимается TUN, перечитывается конфиг демоном.
+   поднимаются слушатели перехвата, перечитывается конфиг демоном.
 4. **Health-check.** Проверяется, что DNS отвечает и тестовый URL открывается.
 5. **Любая ошибка → `rollback()`.** Восстановление снапшота, откат symlink,
    в журнал — причина. Конфиг, который не прошёл health-check, не остаётся активным.

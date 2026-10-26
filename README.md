@@ -6,8 +6,9 @@
 
 <img src="packaging/icons/proxy-for-ubuntu.svg" width="96" alt="proxy-for-ubuntu">
 
-Весь TCP и UDP-трафик системы — включая DNS и QUIC — направляется через прокси
-по правилам в духе Clash. Ядро написано с нуля на Rust, без sing-box, Xray и clash.
+TCP-трафик системы и UDP из контейнеров направляется через прокси по правилам
+в духе Clash. Ядро написано с нуля на Rust, без sing-box, Xray и clash.
+Локальный UDP — DNS, QUIC — пока идёт напрямую, см. «Ограничения перехвата».
 
 [![Лицензия](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Версия](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
@@ -86,8 +87,8 @@ sudo systemctl reload proxy-for-ubuntud
 ┌──────────────▼───────────────────┐
 │  демон (root, systemd)           │
 │                                 │
-│  nftables: пометка пакетов      │
-│  ip rule:  таблица 100          │
+│  TCP: REDIRECT → :15000            │
+│  UDP: TPROXY :15001 (mark+100)     │
 │      ↓                          │
 │  rule engine → outbound         │
 │      ↓                          │
@@ -96,10 +97,23 @@ sudo systemctl reload proxy-for-ubuntud
 └─────────────────────────────────┘
 ```
 
-Маршруты не меняются. Используется политическая маршрутизация по метке: пакеты
-помечаются, помеченные уходят в таблицу 100, где их встречает наш обработчик.
-Нетронутым остаётся всё, что не перехватывается, — и после `apt remove`
-система возвращается в обычное состояние самостоятельно.
+Маршруты системы не меняются. TCP ядро перенаправляет в сокет демона через
+`nftables` REDIRECT, а UDP — через TPROXY и политическую маршрутизацию по
+метке: пакет помечается, по метке уходит в таблицу 100, где его встречает
+слушатель демона. Нетронутым остаётся всё, что не перехватывается, — и после
+`apt remove` система возвращается в обычное состояние самостоятельно.
+
+### Ограничения перехвата
+
+- **Локальный UDP не перехватывается.** DNS, QUIC и игровой трафик с самой
+  машины идут напрямую, мимо прокси: `REDIRECT` не оставляет способа узнать
+  настоящего получателя датаграммы. Для этого нужен TUN, он пока не
+  реализован. Опция `dns.strategy: fake-ip` в текущей схеме не работает.
+- **UDP перехватывается только для форвардинга** — трафика контейнеров.
+  TCP контейнеров перехватывается при `intercept.docker: true`, UDP — при
+  `intercept.udp: tproxy`.
+- Исключены из перехвата: `uid 0` (сам демон), `lo`, локальные и приватные
+  адреса, multicast, порты из `exclude_ports` (по умолчанию 22).
 
 Подробности: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -139,7 +153,7 @@ Shadowsocks, `alterId != 0` у VMess.
 api: 1
 
 dns:
-  strategy: fake-ip      # домен известен движку, локальный резолвер ничего не видит
+  strategy: fake-ip      # пока не влияет: локальный DNS не перехватывается (см. выше)
   servers: [1.1.1.1, 8.8.8.8]
 
 intercept:
@@ -220,15 +234,14 @@ pfu-cli validate < my.yaml
 |---|---|
 | После `apt install` тумблер не работает | Не запущен демон: `sudo systemctl start proxy-for-ubuntud` |
 | «nftables отклонил набор правил» | Нет прав или правила заняты: `sudo nft list ruleset` |
-| QUIC/игры не идут через прокси | Нужен `intercept.udp: tproxy` и outbound с `udp: true` |
+| QUIC/игры не идут через прокси | Ограничение схемы: локальный UDP не перехватывается, для него нужен TUN (не реализован). UDP перехватывается только у контейнеров |
 | Интернет пропал после Apply | Демон не откатил изменения: `sudo systemctl stop proxy-for-ubuntud && sudo nft delete table inet pfu; sudo ip rule del fwmark 0x1 lookup 100; sudo ip route flush table 100` |
 | `Permission denied` на `/run/proxy-for-ubuntu/ctl.sock` | Пользователь не в группе `proxy-for-ubuntu`. При установке через `sudo apt` группа добавляется автоматически; если ставили из графического менеджера — `sudo usermod -aG proxy-for-ubuntu $USER` и повторный вход в систему |
 | Окно приложения открывается пустым | WebKitGTK не рисует интерфейс на LXQt/Xfce с Openbox. `proxy-for-ubuntu` сам выставляет `WEBKIT_DISABLE_DMABUF_RENDERER=1`; если не помогло — `LIBGL_ALWAYS_SOFTWARE=1 proxy-for-ubuntu`. Диагностика: `proxy-for-ubuntu --diagnose` |
 | `proxy-for-ubuntu --version` ничего не выводит | Устаревшая сборка: команда добавлена в 0.1.1. Переустановите пакет |
 | `ssh` перестал работать | Он по умолчанию исключён из перехвата (`exclude_ports: ["22"]`). Проверьте, не переписали ли это |
-| Docker не использует прокси | Трафик контейнеров идёт через `FORWARD`, а не `OUTPUT`. Смотрите [docs/TESTING.md](docs/TESTING.md) |
+| Docker не использует прокси | Включите `intercept.docker: true` — TCP контейнеров пойдёт через `nat prerouting`. Без флага трафик контейнеров идёт напрямую. См. [docs/TESTING.md](docs/TESTING.md) |
 | Часть правил не срабатывает | Не скачаны geo-наборы: вкладка «Geo-наборы» → «Обновить» |
-| `systemd-resolved` ругается на порт 53 | Перехват DNS перехватывает и его — это ожидаемо, в логе будет информационная запись |
 
 Подробный чек-лист: [docs/TESTING.md](docs/TESTING.md).
 

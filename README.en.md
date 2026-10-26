@@ -6,9 +6,10 @@
 
 <img src="packaging/icons/proxy-for-ubuntu.svg" width="96" alt="proxy-for-ubuntu">
 
-All of the system's TCP and UDP traffic — DNS and QUIC included — is routed
-through a proxy according to Clash-style rules. The core is written from
-scratch in Rust: no sing-box, no Xray, no clash.
+All of the system's TCP traffic and UDP from containers is routed through a
+proxy according to Clash-style rules. The core is written from scratch in
+Rust: no sing-box, no Xray, no clash. Local UDP — DNS, QUIC — still goes
+direct, see "Interception limits".
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
@@ -75,8 +76,8 @@ rerouting an entire system is not something a package should do on your behalf.
 ┌──────────────▼───────────────────┐
 │  daemon (root, systemd)          │
 │                                 │
-│  nftables: mark packets         │
-│  ip rule:  lookup table 100     │
+│  TCP: REDIRECT → :15000          │
+│  UDP: TPROXY :15001 (mark+100)   │
 │      ↓                          │
 │  rule engine → outbound         │
 │      ↓                          │
@@ -85,10 +86,25 @@ rerouting an entire system is not something a package should do on your behalf.
 └─────────────────────────────────┘
 ```
 
-Routes are never modified. Instead, packets are marked and marked traffic is
-sent to routing table 100, where the daemon picks it up. Everything not
-intercepted keeps working normally — and `apt remove` restores the system on
-its own.
+The system's routes are never modified. The kernel redirects TCP into the
+daemon's socket with `nftables` REDIRECT, and UDP goes through TPROXY and
+policy routing by mark: the packet is marked, routed by that mark into table
+100, where the daemon's listener picks it up. Everything not intercepted keeps
+working normally — and `apt remove` restores the system on its own.
+
+### Interception limits
+
+- **Local UDP is not intercepted.** DNS, QUIC and game traffic from the
+  machine itself goes direct, past the proxy: `REDIRECT` leaves no way to
+  learn the datagram's real destination. That needs TUN, which is not
+  implemented yet. `dns.strategy: fake-ip` has no effect in the current
+  scheme.
+- **UDP is intercepted for forwarded traffic only** — containers. Container
+  TCP is intercepted with `intercept.docker: true`, UDP with
+  `intercept.udp: tproxy`.
+- Excluded from interception: `uid 0` (the daemon itself), `lo`, local and
+  private addresses, multicast, and ports from `exclude_ports` (22 by
+  default).
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -119,7 +135,7 @@ Not supported: Reality/XTLS in VLESS, the gRPC transport, Shadowsocks plugins,
 api: 1
 
 dns:
-  strategy: fake-ip      # the engine knows the domain; the local resolver does not
+  strategy: fake-ip      # no effect yet: local DNS is not intercepted (see above)
   servers: [1.1.1.1, 8.8.8.8]
 
 intercept:
@@ -198,15 +214,14 @@ sudo pfu-cli apply < my.yaml
 |---|---|
 | Toggle does nothing after `apt install` | Daemon not running: `sudo systemctl start proxy-for-ubuntud` |
 | "nftables rejected the ruleset" | Missing privileges or conflicting rules: `sudo nft list ruleset` |
-| QUIC/games bypass the proxy | Needs `intercept.udp: tproxy` and an outbound with `udp: true` |
+| QUIC/games bypass the proxy | A scheme limitation: local UDP is not intercepted, that needs TUN (not implemented). UDP is intercepted for containers only |
 | Internet gone after Apply | Daemon did not roll back: `sudo systemctl stop proxy-for-ubuntud && sudo nft delete table inet pfu; sudo ip rule del fwmark 0x1 lookup 100; sudo ip route flush table 100` |
 | `Permission denied` на `/run/proxy-for-ubuntu/ctl.sock` | Пользователь не в группе `proxy-for-ubuntu`. При установке через `sudo apt` группа добавляется автоматически; если ставили из графического менеджера — `sudo usermod -aG proxy-for-ubuntu $USER` и повторный вход в систему |
 | Окно приложения открывается пустым | WebKitGTK не рисует интерфейс на LXQt/Xfce с Openbox. `proxy-for-ubuntu` сам выставляет `WEBKIT_DISABLE_DMABUF_RENDERER=1`; если не помогло — `LIBGL_ALWAYS_SOFTWARE=1 proxy-for-ubuntu`. Диагностика: `proxy-for-ubuntu --diagnose` |
 | `proxy-for-ubuntu --version` ничего не выводит | Устаревшая сборка: команда добавлена в 0.1.1. Переустановите пакет |
 | `ssh` stopped working | SSH is excluded from interception by default (`exclude_ports: ["22"]`). Check you did not override it |
-| Docker ignores the proxy | Container traffic goes through `FORWARD`, not `OUTPUT`. See [docs/TESTING.md](docs/TESTING.md) |
+| Docker ignores the proxy | Enable `intercept.docker: true` — container TCP then goes through `nat prerouting`. Without the flag container traffic stays direct. See [docs/TESTING.md](docs/TESTING.md) |
 | Some rules never match | Geo sets not downloaded: Geo sets tab → Update |
-| `systemd-resolved` complains about port 53 | DNS interception catches it too; an informational log line is expected |
 
 Full checklist: [docs/TESTING.md](docs/TESTING.md).
 

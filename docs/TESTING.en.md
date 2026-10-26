@@ -70,47 +70,48 @@ ip route show table 100
 - [ ] The rule `REJECT` really drops the connection
 - [ ] Rule order works: swapping two rules changes the result
 
-### Checking that all traffic is intercepted
+### Checking that interception works
 
 ```bash
-# Before turning on
-ip route get 1.1.1.1
-# After turning on — should be dev pfu0 / table 100
-ip route get 1.1.1.1
+# Daemon listeners and rules
+ss -ltn | grep 15000          # TCP REDIRECT
+ss -lun | grep 15001          # UDP TPROXY (forwarded traffic only)
+nft list table inet pfu | head -30
+pfu-cli metrics               # connection and byte counters
 ```
 
 - [ ] `apt update` goes through the proxy (not just the browser)
 - [ ] `git clone` from an external host goes through the proxy
-- [ ] DNS requests are intercepted: `ss -tunp | grep :53` shows the daemon
-  process
+- [ ] `curl https://example.com` → 200, and `pfu-cli metrics` shows growing
+      `connections` and bytes once connections close
+- [ ] Local DNS queries bypass the daemon (expected, see §5):
+      `ss -tunap | grep :53` does not show the daemon
 
-## 5. DNS leak — the key item
+## 5. DNS — a known limitation
 
-```bash
-# In one terminal
-sudo tcpdump -ni any port 53
+Local DNS is **not intercepted**: it is local UDP, and `REDIRECT` does not
+preserve a datagram's real destination (see `docs/ARCHITECTURE.md` §6.1).
+Queries go through the system resolver, `dns.strategy` does not affect them,
+`fake-ip` does not work. A DNS leak here is a documented limitation, not a
+defect; it goes away with TUN.
 
-# In another — generate a unique domain and access it
-curl -s "https://dnsleaktest.com" >/dev/null
-dig +short example.com
-```
-
-- [ ] In `tcpdump` there are **no** queries to your DNS provider for domains
-  you opened in the browser
-- [ ] With `dns.strategy: fake-ip` the client gets addresses from 198.18.0.0/16:
-  `dig +short example.com` → `198.18.x.x`
-- [ ] The same holds when an outbound with `remote_dns: true` is selected
-
-If this fails — it is a defect, not a "system quirk". Mark the release as
-experimental.
+- [ ] After `connect` DNS still works: `dig +short example.com`
+- [ ] `dig +short example.com` returns the real address, not `198.18.x.x`
+- [ ] The limitation is described in README, not hidden
 
 ## 6. UDP and QUIC
 
-- [ ] `NETWORK,udp,DIRECT` really sends UDP directly
-- [ ] DNS works over UDP (Google Chrome uses QUIC — check that with
-  `intercept.udp: tproxy` and `udp: true` on the proxy everything is live)
+Local UDP is not intercepted. Only forwarding is checked — containers, TCP
+with `intercept.docker: true`, UDP with `intercept.udp: tproxy`.
+
+- [ ] `docker run --rm curlimages/curl -s https://ifconfig.me` shows the
+      proxy server address (container TCP is intercepted)
+- [ ] UDP from a container reaches the destination, and replies come from the
+      real port, not 15001 (echo server on another host)
+- [ ] Local QUIC (`curl --http3 https://cloudflare.com`) goes direct —
+      expected until TUN exists
 - [ ] With a proxy that does not support UDP, the engine does not silently
-  drop packets, but writes a clear message to the log
+      drop packets, but writes a clear message to the log
 
 ## 7. Apply and rollback — the most important part
 
@@ -182,13 +183,15 @@ sudo apt remove proxy-for-ubuntu
 
 ## 11. Docker and virtual machines
 
-Container traffic goes through the `FORWARD` chain, not `OUTPUT`.
+Container traffic goes through the `FORWARD` chain, not `OUTPUT`, so
+`intercept.docker: true` adds a `nat prerouting` chain with `redirect`.
 
-- [ ] `docker pull` does **not** go through the proxy (expected for version
-  0.1.0)
-- [ ] This limitation is described in README, not concealed
-- [ ] For transparent mode inside a container the user understands that a rule
-  in the `DOCKER-USER` chain is needed
+- [ ] With `intercept.docker: true`, `docker run --rm curlimages/curl -s
+      https://ifconfig.me` shows the proxy server address
+- [ ] Without the flag container traffic stays direct
+- [ ] Container UDP is intercepted through `tproxy` in `prerouting` and
+      replies come from the real port
+- [ ] The limitation is described in README, not concealed
 
 ## 12. Documentation
 
