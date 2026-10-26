@@ -11,7 +11,7 @@ TCP-трафик системы и UDP из контейнеров направ�
 Локальный UDP — DNS, QUIC — пока идёт напрямую, см. «Ограничения перехвата».
 
 [![Лицензия](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Версия](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
+[![Версия](https://img.shields.io/badge/version-0.1.2-blue.svg)](CHANGELOG.md)
 [![Платформа](https://img.shields.io/badge/Ubuntu-22.04%20|%2024.04-orange.svg)](https://ubuntu.com/)
 
 </div>
