@@ -20,6 +20,7 @@ use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{TcpMode, UdpMode};
 use crate::engine::router::{self, Engine};
@@ -38,14 +39,30 @@ const IP_ORIGDSTADDR: libc::c_int = 20;
 /// Сколько живёт UDP-поток без единой датаграммы в любую сторону.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
-/// Запущенные слушатели. `Drop` закрывает порты: после отключения перехвата
-/// приложение не оставляет открытых сокетов.
+/// Запущенные слушатели. `stop`/`Drop` закрывают порты: после отключения
+/// перехвата приложение не оставляет открытых сокетов.
 pub struct Capture {
     tasks: Vec<JoinHandle<()>>,
+    /// Общий признак остановки. По нему завершаются не только циклы приёма,
+    /// но и уже открытые UDP-потоки: каждый держит `Arc<UdpSocket>` и без
+    /// этого жил бы до истечения `UDP_IDLE`, не давая закрыть порт 15001.
+    cancel: CancellationToken,
 }
 
 impl Capture {
-    pub fn stop(&mut self) {
+    /// Останавливает слушатели и дожидается, пока задачи отпустят сокеты:
+    /// повторный `start` (SIGHUP, повторный `connect`) должен найти порты
+    /// свободными.
+    pub async fn stop(&mut self) {
+        tracing::info!("слушатели перехвата останавливаются");
+        self.abort();
+        for t in self.tasks.drain(..) {
+            let _ = t.await;
+        }
+    }
+
+    fn abort(&mut self) {
+        self.cancel.cancel();
         for t in self.tasks.drain(..) {
             t.abort();
         }
@@ -54,13 +71,14 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        self.stop();
+        self.abort();
     }
 }
 
 /// Поднимает слушатели под текущий конфиг. Ошибка (занятый порт) приходит
 /// до применения правил, поэтому система остаётся нетронутой.
 pub async fn start(engine: Arc<Engine>) -> Result<Capture> {
+    let cancel = CancellationToken::new();
     let mut tasks = Vec::new();
 
     if engine.config.intercept.tcp != TcpMode::Off {
@@ -70,35 +88,74 @@ pub async fn start(engine: Arc<Engine>) -> Result<Capture> {
                 "не удалось занять порт {port} для перехвата TCP: {e}"
             ))
         })?;
-        tasks.push(tokio::spawn(tcp_loop(engine.clone(), listener)));
+        tasks.push(tokio::spawn(tcp_loop(
+            engine.clone(),
+            listener,
+            cancel.clone(),
+        )));
     }
 
     if engine.config.intercept.udp != UdpMode::Off {
         let sock = Arc::new(udp_socket(paths::tproxy_port())?);
-        tasks.push(tokio::spawn(udp_loop(engine.clone(), sock)));
+        tasks.push(tokio::spawn(udp_loop(engine.clone(), sock, cancel.clone())));
     }
 
     tracing::info!(listeners = tasks.len(), "перехват включён");
-    Ok(Capture { tasks })
+    Ok(Capture { tasks, cancel })
 }
 
 // ─────────────────────────────────── TCP ───────────────────────────────────
 
-async fn tcp_loop(engine: Arc<Engine>, listener: TcpListener) {
+async fn tcp_loop(engine: Arc<Engine>, listener: TcpListener, cancel: CancellationToken) {
+    // Под нагрузкой accept ошибается каждые несколько миллисекунд (EMFILE):
+    // без паузы и ограничения частоты журнал распухает на десятки тысяч строк
+    // и хоронит остальные сообщения.
+    let mut last_log: Option<std::time::Instant> = None;
+
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
             Ok((client, peer)) => {
-                tokio::spawn(tcp_conn(engine.clone(), client, peer));
+                tokio::spawn(tcp_conn(engine.clone(), client, peer, cancel.clone()));
             }
             Err(e) => {
-                tracing::warn!(error = %e, "не удалось принять перехваченное соединение");
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                let exhausted = matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE));
+                let now = std::time::Instant::now();
+                let should_log = match last_log {
+                    Some(t) => now.duration_since(t) >= Duration::from_secs(1),
+                    None => true,
+                };
+                if should_log {
+                    if exhausted {
+                        tracing::warn!(
+                            error = %e,
+                            "accept: кончились файловые дескрипторы — пауза 1 с, проверьте LimitNOFILE"
+                        );
+                    } else {
+                        tracing::warn!(error = %e, "не удалось принять перехваченное соединение");
+                    }
+                    last_log = Some(now);
+                }
+                let pause = if exhausted {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(50)
+                };
+                tokio::time::sleep(pause).await;
             }
         }
     }
 }
 
-async fn tcp_conn(engine: Arc<Engine>, client: TcpStream, peer: SocketAddr) {
+async fn tcp_conn(
+    engine: Arc<Engine>,
+    client: TcpStream,
+    peer: SocketAddr,
+    cancel: CancellationToken,
+) {
     let Some(dst) = original_dst(&client) else {
         tracing::warn!(%peer, "не удалось узнать настоящий адрес получателя");
         return;
@@ -130,7 +187,7 @@ async fn tcp_conn(engine: Arc<Engine>, client: TcpStream, peer: SocketAddr) {
         .get(ob.name())
         .and_then(|l| l.rate.clone());
     let stats = &engine.stats;
-    let relayed = router::relay(
+    let relay = router::relay(
         client,
         upstream,
         |up, down| {
@@ -138,15 +195,24 @@ async fn tcp_conn(engine: Arc<Engine>, client: TcpStream, peer: SocketAddr) {
             stats.add_down(down);
         },
         limiter.as_deref(),
-    )
-    .await;
+    );
+    tokio::pin!(relay);
+    let relayed = tokio::select! {
+        r = &mut relay => Some(r),
+        // Выключение перехвата обрывает и уже открытые соединения: иначе они
+        // продолжали бы идти через демон после `disconnect`.
+        _ = cancel.cancelled() => None,
+    };
     engine.stats.conn_closed();
 
     match relayed {
-        Ok((up, down)) => tracing::debug!(
+        Some(Ok((up, down))) => tracing::debug!(
             target = %target.key(), outbound = ob.name(), up, down, "соединение закрыто"
         ),
-        Err(e) => tracing::debug!(target = %target.key(), error = %e, "соединение оборвалось"),
+        Some(Err(e)) => {
+            tracing::debug!(target = %target.key(), error = %e, "соединение оборвалось")
+        }
+        None => tracing::debug!(target = %target.key(), "соединение закрыто выключением перехвата"),
     }
 }
 
@@ -189,6 +255,22 @@ fn addr_to_sockaddr(addr: SocketAddr) -> libc::sockaddr_in {
 /// UDP-сокет, которому ядро отдаёт TPROXY-пакеты: прозрачный (можно
 /// принимать чужие адреса) и с контролем настоящего получателя.
 fn udp_socket(port: u16) -> Result<UdpSocket> {
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    udp_socket_bound(bind, true, false)
+}
+
+/// Сокет для ответов клиенту, привязанный к настоящему получателю.
+///
+/// Одного `IP_PKTINFO` мало: он подменяет только IP источника, а порт берётся
+/// из `bind`. Клиент, отправивший датаграмму на `198.51.100.1:9999`, ждёт
+/// ответ именно с порта 9999 и молча отбросит пакет с порта 15001.
+/// `SO_REUSEPORT` позволяет держать такой сокет на каждый поток: несколько
+/// клиентов могут общаться с одним и тем же получателем.
+fn udp_reply_socket(dst: SocketAddr) -> Result<UdpSocket> {
+    udp_socket_bound(dst, false, true)
+}
+
+fn udp_socket_bound(bind: SocketAddr, recv_orig: bool, reuse_port: bool) -> Result<UdpSocket> {
     unsafe {
         let fd = libc::socket(
             libc::AF_INET,
@@ -202,11 +284,17 @@ fn udp_socket(port: u16) -> Result<UdpSocket> {
             )));
         }
         let one: libc::c_int = 1;
-        for (level, opt) in [
+        let mut opts = vec![
             (libc::SOL_IP, libc::IP_TRANSPARENT),
-            (libc::SOL_IP, IP_RECVORIGDSTADDR),
             (libc::SOL_SOCKET, libc::SO_REUSEADDR),
-        ] {
+        ];
+        if recv_orig {
+            opts.push((libc::SOL_IP, IP_RECVORIGDSTADDR));
+        }
+        if reuse_port {
+            opts.push((libc::SOL_SOCKET, libc::SO_REUSEPORT));
+        }
+        for (level, opt) in opts {
             let rc = libc::setsockopt(
                 fd,
                 level,
@@ -223,7 +311,7 @@ fn udp_socket(port: u16) -> Result<UdpSocket> {
             }
         }
 
-        let addr = addr_to_sockaddr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+        let addr = addr_to_sockaddr(bind);
         let rc = libc::bind(
             fd,
             &addr as *const libc::sockaddr_in as *const libc::sockaddr,
@@ -233,7 +321,7 @@ fn udp_socket(port: u16) -> Result<UdpSocket> {
             let e = io::Error::last_os_error();
             libc::close(fd);
             return Err(Error::Internal(format!(
-                "не удалось занять порт {port} для перехвата UDP: {e}"
+                "не удалось занять {bind} для перехвата UDP: {e}"
             )));
         }
 
@@ -247,19 +335,36 @@ type FlowKey = (SocketAddr, SocketAddr);
 /// Каналы в живые UDP-потоки: ключ — тройка «клиент, получатель».
 type FlowSenders = Arc<tokio::sync::Mutex<HashMap<FlowKey, mpsc::Sender<Arc<Vec<u8>>>>>>;
 
-async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>) {
+async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>, cancel: CancellationToken) {
     let flows: FlowSenders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; 65_535];
+    let mut last_err_log: Option<std::time::Instant> = None;
+    tracing::info!(port = paths::tproxy_port(), "UDP-слушатель запущен");
 
     loop {
-        let (n, src, dst) = match recv_with_origdst(&sock, &mut buf).await {
+        let received = tokio::select! {
+            _ = cancel.cancelled() => break,
+            received = recv_with_origdst(&sock, &mut buf) => received,
+        };
+        let (n, src, dst) = match received {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "не удалось принять UDP-датаграмму");
+                // Одна строка в секунду: при потоке пакетов без контрольного
+                // сообщения журнал иначе распухает так же, как на accept.
+                let now = std::time::Instant::now();
+                let should_log = match last_err_log {
+                    Some(t) => now.duration_since(t) >= Duration::from_secs(1),
+                    None => true,
+                };
+                if should_log {
+                    tracing::warn!(error = %e, "не удалось принять UDP-датаграмму");
+                    last_err_log = Some(now);
+                }
                 continue;
             }
         };
         let key = (src, dst);
+        tracing::debug!(%src, %dst, n, "UDP-датаграмма принята");
         let data = Arc::new(buf[..n].to_vec());
 
         let mut map = flows.lock().await;
@@ -275,8 +380,8 @@ async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>) {
 
         tokio::spawn(udp_flow(
             engine.clone(),
-            sock.clone(),
             flows.clone(),
+            cancel.clone(),
             key,
             rx,
             data,
@@ -287,8 +392,8 @@ async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>) {
 /// Один UDP-поток: своя сессия outbound'а, свои датаграммы в обе стороны.
 async fn udp_flow(
     engine: Arc<Engine>,
-    sock: Arc<UdpSocket>,
     flows: FlowSenders,
+    cancel: CancellationToken,
     key: FlowKey,
     mut rx: mpsc::Receiver<Arc<Vec<u8>>>,
     first: Arc<Vec<u8>>,
@@ -323,6 +428,16 @@ async fn udp_flow(
         flows.lock().await.remove(&key);
         return;
     };
+    // Ответы клиенту шлём со сокета, привязанного к настоящему получателю:
+    // иначе источником будет 15001 и клиент отбросит ответ.
+    let reply = match udp_reply_socket(dst) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::warn!(%dst, error = %e, "не удалось создать сокет для ответов UDP");
+            flows.lock().await.remove(&key);
+            return;
+        }
+    };
 
     if session.send_to(first.as_slice(), &target).await.is_err() {
         flows.lock().await.remove(&key);
@@ -333,6 +448,9 @@ async fn udp_flow(
     let mut buf = vec![0u8; 65_535];
     loop {
         tokio::select! {
+            // Выключение перехвата: поток обязан выйти и отпустить сокет,
+            // иначе порт 15001 останется занятым до UDP_IDLE.
+            _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(UDP_IDLE) => break,
             next = rx.recv() => match next {
                 Some(data) => {
@@ -346,7 +464,7 @@ async fn udp_flow(
             got = session.recv_from(&mut buf, UDP_IDLE) => match got {
                 Ok((n, _from)) => {
                     engine.stats.add_down(n as u64);
-                    if send_from(&sock, &buf[..n], client, dst.ip()).await.is_err() {
+                    if send_from(&reply, &buf[..n], client).await.is_err() {
                         break;
                     }
                 }
@@ -410,47 +528,8 @@ async fn recv_with_origdst(
     .await
 }
 
-/// Отправляет датаграмму клиенту с подменой источника на настоящего
-/// получателя: иначе клиент не узнает ответ и соединение «зависнет».
-async fn send_from(sock: &UdpSocket, data: &[u8], to: SocketAddr, src: IpAddr) -> io::Result<()> {
-    let IpAddr::V4(src) = src else {
-        return Err(io::Error::other("UDP поддерживает только IPv4"));
-    };
-    sock.async_io(Interest::WRITABLE, || {
-        let mut dst = addr_to_sockaddr(to);
-        let mut iov = libc::iovec {
-            iov_base: data.as_ptr() as *mut libc::c_void,
-            iov_len: data.len(),
-        };
-        let mut control = [0u8; 64];
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_name = &mut dst as *mut libc::sockaddr_in as *mut libc::c_void;
-        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-
-        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) };
-        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = space as _;
-
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_level = libc::SOL_IP;
-            (*cmsg).cmsg_type = libc::IP_PKTINFO;
-            (*cmsg).cmsg_len =
-                libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
-            let info = libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo;
-            (*info).ipi_ifindex = 0;
-            (*info).ipi_spec_dst.s_addr = u32::from_ne_bytes(src.octets());
-            (*info).ipi_addr.s_addr = 0;
-        }
-
-        let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    })
-    .await
+/// Отправляет датаграмму клиенту. Источник уже задан сокетом: он привязан
+/// к настоящему получателю, поэтому подменять что-то через `sendmsg` не нужно.
+async fn send_from(sock: &UdpSocket, data: &[u8], to: SocketAddr) -> io::Result<()> {
+    sock.send_to(data, to).await.map(|_| ())
 }

@@ -119,13 +119,26 @@ impl Server {
         tracing::info!(socket = %path.display(), "IPC слушает");
 
         let me = self.clone();
+        let mut last_log: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, _) = match accepted {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!("accept: {e}");
+                            // Та же история, что и в перехвате: при EMFILE
+                            // accept ошибается постоянно, а warn на каждом
+                            // витке превращает журнал в мусор.
+                            let now = std::time::Instant::now();
+                            let should_log = match last_log {
+                                Some(t) => now.duration_since(t) >= std::time::Duration::from_secs(1),
+                                None => true,
+                            };
+                            if should_log {
+                                tracing::warn!("accept: {e}");
+                                last_log = Some(now);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             continue;
                         }
                     };
@@ -380,7 +393,11 @@ impl Server {
     async fn sync_capture(&self) {
         let engine = self.engine.read().await.clone();
         let mut guard = self.capture.lock().await;
-        guard.take();
+        if let Some(mut old) = guard.take() {
+            // Дожидаемся закрытия сокетов: иначе повторный bind на те же порты
+            // может упасть с «address already in use».
+            old.stop().await;
+        }
         let Some(engine) = engine.filter(|e| e.enabled.load(std::sync::atomic::Ordering::Relaxed))
         else {
             return;
@@ -393,7 +410,9 @@ impl Server {
                 engine
                     .enabled
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                nft::teardown().await.ok();
+                if let Err(t) = nft::teardown().await {
+                    tracing::error!(error = %t, "не удалось снять правила после сбоя перехвата");
+                }
             }
         }
     }
@@ -403,7 +422,7 @@ impl Server {
             Ok(path) => {
                 *self.engine.write().await = None;
                 if let Some(mut c) = self.capture.lock().await.take() {
-                    c.stop();
+                    c.stop().await;
                 }
                 Ok(json!({ "ok": true, "restored_from": path }))
             }
@@ -416,6 +435,7 @@ impl Server {
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        tracing::info!(enabled, "system.toggle: переключение перехвата");
         let mut guard = self.engine.write().await;
 
         if enabled && guard.is_none() {
@@ -431,12 +451,27 @@ impl Server {
             e.enabled
                 .store(enabled, std::sync::atomic::Ordering::Relaxed);
             if enabled {
+                // Повторный `connect` не должен падать на уже занятом порту:
+                // перехват уже работает, состояние менять не нужно.
+                if self.capture.lock().await.is_some() {
+                    return Ok(json!({
+                        "enabled": true, "status": "connected",
+                        "message": "перехват уже включён",
+                    }));
+                }
                 let plan = nft::build_plan(&e.config);
                 // Сначала слушатели, потом правила: если порт занят, система
                 // остаётся в прежнем состоянии, а не уходит в никуда.
-                let mut capture = capture::start(e.clone()).await?;
+                let mut capture = match capture::start(e.clone()).await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        // Иначе status показывал бы «включено» без слушателей.
+                        e.enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return Err(err);
+                    }
+                };
                 if let Err(err) = nft::apply(&plan).await {
-                    capture.stop();
+                    capture.stop().await;
                     e.enabled.store(false, std::sync::atomic::Ordering::Relaxed);
                     return Err(err);
                 }
@@ -445,7 +480,7 @@ impl Server {
             }
             // Выключаем: сперва закрываем порты, потом снимаем правила.
             if let Some(mut old) = self.capture.lock().await.take() {
-                old.stop();
+                old.stop().await;
             }
             nft::teardown().await?;
             return Ok(json!({ "enabled": false, "status": "disconnected", "message": "" }));
@@ -489,6 +524,17 @@ impl Server {
             "id": "root", "name": "Права демона", "ok": is_root,
             "detail": if is_root { "root" } else { "не root" },
             "fix": if is_root { Value::Null } else { json!("sudo systemctl restart proxy-for-ubuntud") },
+        }));
+
+        // Файловые дескрипторы: при 1024 демон ловит EMFILE под браузером.
+        let (fd_open, fd_soft) = fd_usage();
+        let fd_ok = fd_soft >= 65_536;
+        checks.push(json!({
+            "id": "fds", "name": "Файловые дескрипторы", "ok": fd_ok,
+            "detail": format!("открыто {fd_open}, soft-лимит {fd_soft}"),
+            "fix": if fd_ok { Value::Null } else {
+                json!("Добавьте LimitNOFILE=65536 в [Service] юнита proxy-for-ubuntud и выполните systemctl daemon-reload")
+            },
         }));
 
         // systemd-resolved на порту 53
@@ -1015,6 +1061,23 @@ fn version_ge(v: &str, maj: u32, min: u32, patch: u32) -> bool {
     };
     let (a, b, c) = (p(0), p(1), p(2));
     (a, b, c) >= (maj, min, patch)
+}
+
+/// Сколько дескрипторов открыто и каков soft-лимит (`/proc/self/limits`).
+fn fd_usage() -> (usize, u64) {
+    let open = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0);
+    let soft = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("Max open files"))
+                // Max open files  1024  1048576  files
+                .and_then(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    (open, soft)
 }
 
 #[cfg(test)]

@@ -12,7 +12,8 @@
 //! Исключения прописаны явно, чтобы не зацикливать собственный трафик
 //! демона и не потерять SSH к машине, у которой «уехал» интернет.
 
-use std::process::Stdio;
+use std::process::{Output, Stdio};
+use std::time::Duration;
 
 use crate::config::{Config, TcpMode, UdpMode};
 use crate::error::{Error, Result};
@@ -30,8 +31,6 @@ pub struct NftPlan {
     /// Команды `ip`, которые выполняются до и после `nft -f`.
     pub ip_pre: Vec<String>,
     pub ip_post: Vec<String>,
-    /// Что делать для отката.
-    pub rollback: Vec<String>,
 }
 
 /// Собирает план правил из конфигурации. Ничего не применяет — вызывающий
@@ -78,6 +77,13 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("    chain prerouting {\n");
         r.push_str("        type filter hook prerouting priority mangle; policy accept;\n");
         r.push_str("        iifname \"lo\" return\n");
+        // TPROXY в prerouting видит и входящий трафик к самой машине. Без этих
+        // исключений mDNS (224.0.0.251), NTP-ответы и любые пакеты на локальный
+        // адрес уходят в прокси-сокет вместо приложения: службы ломаются, а
+        // демон захлёбывается десятками тысяч датаграмм.
+        r.push_str("        fib daddr type local return\n");
+        r.push_str("        ip daddr 224.0.0.0/4 return\n");
+        r.push_str("        ip daddr 255.255.255.255 return\n");
         r.push_str("        ip daddr @loopback_ips return\n");
         if cfg.intercept.bypass_private {
             r.push_str("        ip daddr @private_ips return\n");
@@ -100,6 +106,9 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("    chain nat_output {\n");
         r.push_str("        type nat hook output priority -100; policy accept;\n");
         r.push_str("        oifname \"lo\" return\n");
+        r.push_str("        fib daddr type local return\n");
+        r.push_str("        ip daddr 224.0.0.0/4 return\n");
+        r.push_str("        ip daddr 255.255.255.255 return\n");
         r.push_str("        ip daddr @loopback_ips return\n");
         if cfg.intercept.bypass_private {
             r.push_str("        ip daddr @private_ips return\n");
@@ -131,6 +140,11 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("    chain nat_prerouting {\n");
         r.push_str("        type nat hook prerouting priority -100; policy accept;\n");
         r.push_str("        iifname \"lo\" return\n");
+        // Тот же принцип, что в mangle prerouting: не трогаем трафик,
+        // адресованный самой машине (входящие сервисы), и multicast.
+        r.push_str("        fib daddr type local return\n");
+        r.push_str("        ip daddr 224.0.0.0/4 return\n");
+        r.push_str("        ip daddr 255.255.255.255 return\n");
         r.push_str("        ip daddr @loopback_ips return\n");
         if cfg.intercept.bypass_private {
             r.push_str("        ip daddr @private_ips return\n");
@@ -148,13 +162,13 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
 
     r.push_str("}\n");
 
+    // Правило добавляется только если его ещё нет: после неудачного teardown
+    // и повторного `connect` дубликаты копились, и убрать их потом было нечем.
     let mut ip_pre = vec![format!(
-        "ip rule add fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"
+        "ip -o rule show | grep -q 'fwmark {FW_MARK:#x} lookup {ROUTE_TABLE}' \
+         || ip rule add fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100"
     )];
     let mut ip_post = Vec::new();
-    for cmd in &ip_pre {
-        let _ = cmd;
-    }
 
     // `local` обязателен: без него помеченный пакет не доставляется локально
     // в TPROXY-сокет, а уходит в никуда по маршруту через lo.
@@ -168,51 +182,131 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         ruleset: r,
         ip_pre: std::mem::take(&mut ip_pre),
         ip_post,
-        rollback: vec![
-            format!("ip rule del fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"),
-            format!("ip route flush table {ROUTE_TABLE} 2>/dev/null || true"),
-            "nft delete table inet pfu 2>/dev/null || true".to_string(),
-        ],
     }
 }
 
 /// Применяет план. Возвращает ошибку с текстом, который пользователь может
 /// выполнить руками, если что-то пойдёт не так.
 pub async fn apply(plan: &NftPlan) -> Result<()> {
-    for cmd in &plan.ip_pre {
-        run_sh(cmd).await?;
-    }
-    for cmd in &plan.ip_post {
-        run_sh(cmd).await?;
-    }
-    // Порядок важен: сначала маршрут, потом правила пометки. Иначе между
-    // двумя операциями трафик пойдёт в пустую таблицу и пропадёт.
-    if let Err(e) = apply_ruleset(&plan.ruleset).await {
-        for cmd in &plan.rollback {
-            let _ = run_sh(cmd).await;
+    // Сначала маршрут, потом правило пометки: пакетов с меткой до применения
+    // nft ещё нет, поэтому трафик не может уйти в пустую таблицу 100.
+    for cmd in plan.ip_post.iter().chain(plan.ip_pre.iter()) {
+        if let Err(e) = run_sh(cmd).await {
+            rollback_after_failure().await;
+            return Err(e);
         }
+    }
+    if let Err(e) = apply_ruleset(&plan.ruleset).await {
+        rollback_after_failure().await;
         return Err(e);
     }
     Ok(())
 }
 
-/// Убирает всё, что приложение добавило. Вызывается при откате, остановке и
-/// удалении пакета.
-pub async fn teardown() -> Result<()> {
-    for cmd in &base_rollback() {
-        let _ = run_sh(cmd).await;
+/// Откат после неудачного применения: ошибки не глотаются, иначе машина
+/// остаётся с полуприменёнными правилами и без следа в журнале.
+async fn rollback_after_failure() {
+    if let Err(e) = teardown().await {
+        tracing::error!(error = %e, "откат после неудачного применения не удался");
     }
-    Ok(())
 }
 
-pub fn base_rollback() -> Vec<String> {
-    vec![
-        format!(
-            "ip rule del fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"
-        ),
-        format!("ip route flush table {ROUTE_TABLE} 2>/dev/null || true"),
-        "nft delete table inet pfu 2>/dev/null || true".to_string(),
-    ]
+/// Убирает всё, что приложение добавило. Идемпотентен: отсутствие таблицы,
+/// правила или маршрута — норма, а вот неудачное удаление существующего
+/// объекта возвращается ошибкой и пишется в журнал.
+pub async fn teardown() -> Result<()> {
+    let mut failures = Vec::new();
+    remove_ip_rules(&mut failures).await;
+    remove_route_table(&mut failures).await;
+    remove_nft_table(&mut failures).await;
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+    for failure in &failures {
+        tracing::error!(failure = %failure, "teardown: не удалось снять");
+    }
+    Err(Error::Apply(format!(
+        "перехват снят не полностью: {}",
+        failures.join("; ")
+    )))
+}
+
+/// Селектор наших правил в выводе `ip rule show`.
+fn rule_selector() -> String {
+    format!("fwmark {FW_MARK:#x} lookup {ROUTE_TABLE}")
+}
+
+/// Удаляет все наши правила, а не одно: при повторных `connect` их могло
+/// накопиться несколько, в том числе с другими приоритетами.
+async fn remove_ip_rules(failures: &mut Vec<String>) {
+    let show = match run_capture("ip rule show").await {
+        Ok(v) => v,
+        Err(e) => {
+            failures.push(format!("ip rule show: {e}"));
+            return;
+        }
+    };
+    let needle = rule_selector();
+    for line in show.lines().filter(|l| l.contains(&needle)) {
+        // Строка вида `100:\tfrom all fwmark 0x1 lookup 100`.
+        let Some((prio, _)) = line.split_once(':') else {
+            continue;
+        };
+        let prio = prio.trim();
+        if prio.parse::<u32>().is_err() {
+            continue;
+        }
+        let cmd = format!("ip rule del priority {prio} fwmark {FW_MARK} lookup {ROUTE_TABLE}");
+        if let Err(e) = run_sh(&cmd).await {
+            failures.push(format!("{cmd}: {e}"));
+        }
+    }
+    match run_capture("ip rule show").await {
+        Ok(after) if after.contains(&needle) => {
+            failures.push(format!("правило «{needle}» осталось после удаления"));
+        }
+        Err(e) => failures.push(format!("ip rule show (проверка): {e}")),
+        Ok(_) => {}
+    }
+}
+
+async fn remove_route_table(failures: &mut Vec<String>) {
+    // `ip route flush` на пустой таблице завершается успешно.
+    if let Err(e) = run_sh(&format!("ip route flush table {ROUTE_TABLE}")).await {
+        failures.push(format!("ip route flush table {ROUTE_TABLE}: {e}"));
+    }
+}
+
+async fn remove_nft_table(failures: &mut Vec<String>) {
+    // `nft delete` на отсутствующей таблице — ошибка, поэтому сначала смотрим,
+    // есть ли она: teardown должен быть идемпотентным.
+    match run_output("nft list table inet pfu").await {
+        Ok(out) if out.status.success() => {
+            let mut last = String::new();
+            // Ядро может быть занято другим экземпляром nft — короткий повтор
+            // дешевле, чем оставленная таблица, уводящая трафик в никуда.
+            for attempt in 0..3 {
+                match run_sh("nft delete table inet pfu").await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        last = e.to_string();
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+            failures.push(format!("nft delete table inet pfu: {last}"));
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.contains("No such file or directory") {
+                failures.push(format!("nft list table inet pfu: {}", err.trim()));
+            }
+        }
+        Err(e) => failures.push(format!("nft list table inet pfu: {e}")),
+    }
 }
 
 async fn apply_ruleset(ruleset: &str) -> Result<()> {
@@ -248,14 +342,7 @@ async fn apply_ruleset(ruleset: &str) -> Result<()> {
 }
 
 async fn run_sh(cmd: &str) -> Result<()> {
-    let out = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| Error::Internal(format!("не удалось выполнить {cmd:?}: {e}")))?;
+    let out = run_output(cmd).await?;
     if !out.status.success() {
         return Err(Error::Apply(format!(
             "команда {cmd:?} завершилась с ошибкой: {}",
@@ -263,6 +350,30 @@ async fn run_sh(cmd: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Выполняет команду и возвращает stdout. Ненулевой код — ошибка с текстом
+/// stderr: вызывающий решает, считается ли она нормальной.
+async fn run_capture(cmd: &str) -> Result<String> {
+    let out = run_output(cmd).await?;
+    if !out.status.success() {
+        return Err(Error::Apply(format!(
+            "команда {cmd:?} завершилась с ошибкой: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+async fn run_output(cmd: &str) -> Result<Output> {
+    tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| Error::Internal(format!("не удалось выполнить {cmd:?}: {e}")))
 }
 
 /// Проверка окружения для `system.diagnose`.
@@ -330,6 +441,33 @@ mod tests {
     }
 
     #[test]
+    fn ip_rule_is_added_once() {
+        let plan = build_plan(&base_cfg());
+        // Повторный connect не должен плодить правила: перед add стоит проверка.
+        assert_eq!(
+            plan.ip_pre,
+            vec!["ip -o rule show | grep -q 'fwmark 0x1 lookup 100' \
+                 || ip rule add fwmark 1 lookup 100 priority 100"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn prerouting_skips_local_and_multicast_traffic() {
+        let plan = build_plan(&base_cfg());
+        let pre = plan
+            .ruleset
+            .split("chain prerouting")
+            .nth(1)
+            .expect("цепочка prerouting есть");
+        // TPROXY видит и входящий трафик к самой машине: без этих исключений
+        // mDNS и ответы локальным службам уходят в прокси-сокет.
+        assert!(pre.contains("fib daddr type local return"));
+        assert!(pre.contains("ip daddr 224.0.0.0/4 return"));
+        assert!(pre.contains("ip daddr 255.255.255.255 return"));
+    }
+
+    #[test]
     fn disabled_intercept_produces_no_marking() {
         let mut c = base_cfg();
         c.intercept.tcp = TcpMode::Off;
@@ -355,17 +493,5 @@ mod tests {
         c.intercept.bypass_private = false;
         let plan = build_plan(&c);
         assert!(!plan.ruleset.contains("@private_ips"));
-    }
-
-    #[test]
-    fn rollback_removes_everything_we_add() {
-        let plan = build_plan(&base_cfg());
-        for cmd in &plan.rollback {
-            if cmd.contains("ip rule") || cmd.contains("ip route") || cmd.contains("nft delete") {
-                continue;
-            }
-            panic!("непокрытая команда отката: {cmd}");
-        }
-        assert!(!plan.rollback.is_empty());
     }
 }
