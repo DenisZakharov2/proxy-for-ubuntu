@@ -211,7 +211,7 @@ $EDITOR my.yaml
 sudo pfu-cli apply < my.yaml
 
 # валидация конфига без применения (код возврата 0 — ок, 1 — ошибки)
-pfu-cli config validate --dry-run < my.yaml
+pfu-cli validate < my.yaml
 ```
 
 ## Решение проблем

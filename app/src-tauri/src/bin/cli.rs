@@ -49,7 +49,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         "connect" => simple("system.toggle", serde_json::json!({ "enabled": true })),
         "disconnect" => simple("system.toggle", serde_json::json!({ "enabled": false })),
         "doctor" => simple("system.diagnose", serde_json::json!({})),
-        "config" => simple("config.get", serde_json::json!({})),
+        "config" => print_config(),
         "rules" => print_rules(),
         "proxies" => print_proxies(),
         "metrics" => simple("metrics.live", serde_json::json!({})),
@@ -113,6 +113,16 @@ fn call(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
 fn simple(method: &str, params: serde_json::Value) -> Result<ExitCode> {
     let out = call(method, params)?;
     println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Печатает активный конфиг в YAML — в том виде, который принимают
+/// `pfu-cli apply` и `pfu-cli validate`. Демон отвечает конвертом
+/// `{"config": ..., "path": ...}`, его печатать нельзя.
+fn print_config() -> Result<ExitCode> {
+    let out = call("config.get", serde_json::json!({}))?;
+    let cfg = out.get("config").cloned().unwrap_or(out);
+    print!("{}", serde_yaml::to_string(&cfg)?);
     Ok(ExitCode::SUCCESS)
 }
 
