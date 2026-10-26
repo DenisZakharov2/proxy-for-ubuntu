@@ -245,10 +245,12 @@ async fn run_check(strict: bool) -> Result<()> {
     }
 
     let tun = std::path::Path::new("/dev/net/tun").exists();
-    println!("/dev/net/tun: {}", if tun { "есть" } else { "НЕТ" });
-    if !tun {
-        problems += 1;
-    }
+    // TUN не реализован, поэтому отсутствие устройства не мешает работе:
+    // строка нужна только для диагностики.
+    println!(
+        "/dev/net/tun: {} (необязательно: TUN не реализован)",
+        if tun { "есть" } else { "НЕТ" }
+    );
 
     let root = unsafe { libc::geteuid() } == 0;
     println!("права: {}", if root { "root" } else { "не root" });

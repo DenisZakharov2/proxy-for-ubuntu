@@ -159,13 +159,18 @@ What is not intercepted, and why:
   datagram rewrites the destination address, and `IP_ORIGDSTADDR` then
   returns `127.0.0.1:15001` instead of the real destination — there is no
   way to recover it. Such traffic goes direct, past the proxy;
+- **IPv6**: the daemon's listeners are IPv4-only, so `prerouting`,
+  `nat output` and `nat prerouting` all contain `meta nfproto ipv6 return`
+  and v6 traffic goes direct. Full support (v6 sets, `sockaddr_in6`,
+  `IP6T_SO_ORIGINAL_DST`, `IPV6_TRANSPARENT`) is a separate task;
 - traffic of `uid 0` (the daemon itself), `lo`, local addresses
   (`fib daddr type local`), multicast `224.0.0.0/4`, broadcast, private
   networks with `bypass_private: true`, and `exclude_ports`.
 
-TUN (`config.tun`, interface `pfu0`) is **not implemented**: the field and
-the `/dev/net/tun` check are left over from the original plan. TUN is what
-closing local UDP would need; until then the limitation above stands.
+TUN (`config.tun`, interface `pfu0`) is **not implemented**: the field is
+left over from the original plan, and the `/dev/net/tun` check in `--check`
+is now informational only. TUN is what closing local UDP would need; until
+then the limitation above stands.
 
 Listeners live exactly as long as interception is on: `Capture` holds a
 `CancellationToken`, `disconnect` cancels the loops and waits for the tasks
@@ -187,6 +192,7 @@ table inet pfu {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
         iifname "lo" return
+        meta nfproto ipv6 return
         fib daddr type local return
         ip daddr 224.0.0.0/4 return
         ip daddr 255.255.255.255 return
@@ -199,6 +205,7 @@ table inet pfu {
     chain nat_output {
         type nat hook output priority -100; policy accept;
         oifname "lo" return
+        meta nfproto ipv6 return
         fib daddr type local return
         ip daddr 224.0.0.0/4 return
         ip daddr 255.255.255.255 return

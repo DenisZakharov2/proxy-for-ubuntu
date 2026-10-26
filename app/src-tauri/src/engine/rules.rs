@@ -211,6 +211,13 @@ impl RuleSet {
         self.entries.len()
     }
 
+    /// Текст сработавшего правила для статистики: `raw` записи или `FINAL`.
+    pub fn label(&self, idx: Option<usize>) -> String {
+        idx.and_then(|i| self.entries.get(i))
+            .map(|e| e.raw.clone())
+            .unwrap_or_else(|| "FINAL".to_string())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

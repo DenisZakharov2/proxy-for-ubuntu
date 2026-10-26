@@ -11,7 +11,7 @@ TCP-трафик системы и UDP из контейнеров направ�
 Локальный UDP — DNS, QUIC — пока идёт напрямую, см. «Ограничения перехвата».
 
 [![Лицензия](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Версия](https://img.shields.io/badge/version-0.1.2-blue.svg)](CHANGELOG.md)
+[![Версия](https://img.shields.io/badge/version-0.1.3-blue.svg)](CHANGELOG.md)
 [![Платформа](https://img.shields.io/badge/Ubuntu-22.04%20|%2024.04-orange.svg)](https://ubuntu.com/)
 
 </div>
@@ -112,6 +112,9 @@ sudo systemctl reload proxy-for-ubuntud
 - **UDP перехватывается только для форвардинга** — трафика контейнеров.
   TCP контейнеров перехватывается при `intercept.docker: true`, UDP — при
   `intercept.udp: tproxy`.
+- **IPv6 идёт напрямую.** Слушатели демона — IPv4, поэтому в каждой цепочке
+  стоит `meta nfproto ipv6 return`. Полной поддержки v6 нет: нужны v6-наборы,
+  `sockaddr_in6` и `IPV6_TRANSPARENT` — это отдельная работа.
 - Исключены из перехвата: `uid 0` (сам демон), `lo`, локальные и приватные
   адреса, multicast, порты из `exclude_ports` (по умолчанию 22).
 

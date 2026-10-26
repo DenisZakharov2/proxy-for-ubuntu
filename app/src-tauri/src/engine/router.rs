@@ -185,11 +185,12 @@ impl Engine {
         None
     }
 
-    /// Решение по потоку: имя outbound'а либо терминальное действие.
-    pub fn route(&self, flow: &Flow) -> (Decision, Option<String>) {
-        let decision = {
+    /// Решение по потоку: действие, имя outbound'а и текст сработавшего
+    /// правила (нужен для статистики по правилам).
+    pub fn route(&self, flow: &Flow) -> (Decision, Option<String>, String) {
+        let (decision, matched) = {
             let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
-            self.rules.decide_cached(flow, &mut cache).0
+            self.rules.decide_cached(flow, &mut cache)
         };
         let label = match &decision {
             Decision::Proxy(name) => self
@@ -198,17 +199,18 @@ impl Engine {
                 .unwrap_or_else(|| "DIRECT".to_string()),
             other => other.label(),
         };
-        (decision, Some(label))
+        (decision, Some(label), self.rules.label(matched))
     }
 
     /// Открывает соединение по решению правил. `REJECT` и отсутствие
-    /// outbound'а — разные ошибки, и это видно в логе.
+    /// outbound'а — разные ошибки, и это видно в логе. Третий элемент —
+    /// текст сработавшего правила: вызывающий пишет по нему статистику.
     pub async fn open(
         &self,
         target: &Target,
         flow: &Flow,
-    ) -> Result<(Arc<dyn Outbound>, Box<dyn outbound::AsyncReadWrite>)> {
-        let (decision, label) = self.route(flow);
+    ) -> Result<(Arc<dyn Outbound>, Box<dyn outbound::AsyncReadWrite>, String)> {
+        let (decision, label, rule) = self.route(flow);
         match decision {
             Decision::Reject | Decision::RejectDrop => {
                 return Err(Error::Reject(format!(
@@ -273,7 +275,7 @@ impl Engine {
             stream = Box::new(MeteredStream::new(stream, Arc::clone(&lim.active)));
         }
         self.stats.conn_opened();
-        Ok((ob, stream))
+        Ok((ob, stream, rule))
     }
 
     /// Открывает UDP-канал, если outbound его умеет. `None` — честный
@@ -429,9 +431,10 @@ rules:
             is_tcp: true,
             ..Default::default()
         };
-        let (d, label) = e.route(&f);
+        let (d, label, rule) = e.route(&f);
         assert!(matches!(d, Decision::Proxy(_)));
         assert_eq!(label.as_deref(), Some("Локальный"));
+        assert_eq!(rule, "DOMAIN,proxy.example,Локальный");
     }
 
     #[tokio::test]
@@ -461,9 +464,26 @@ rules:
             is_tcp: true,
             ..Default::default()
         };
-        let (d, label) = e.route(&f);
+        let (d, label, rule) = e.route(&f);
         assert_eq!(d, Decision::Direct);
         assert_eq!(label.as_deref(), Some("DIRECT"));
+        // Сработало последнее правило списка (`MATCH`), а не `final`.
+        assert_eq!(rule, "MATCH,DIRECT");
+    }
+
+    #[tokio::test]
+    async fn final_policy_is_reported_when_no_rule_matches() {
+        let yaml = BASE.replace("  - MATCH,DIRECT\n", "");
+        let e = engine(&yaml);
+        let f = Flow {
+            domain: Some("unknown.net".into()),
+            dst_port: 80,
+            is_tcp: true,
+            ..Default::default()
+        };
+        let (d, _, rule) = e.route(&f);
+        assert_eq!(d, Decision::Direct);
+        assert_eq!(rule, "FINAL");
     }
 
     #[tokio::test]
@@ -619,7 +639,8 @@ rules:
             ..Default::default()
         };
 
-        let (_, stream) = e.open(&target, &flow).await.expect("первое соединение");
+        let (_, stream, rule) = e.open(&target, &flow).await.expect("первое соединение");
+        assert_eq!(rule, "MATCH,DIRECT", "имя правила доходит до вызывающего");
         let err = e
             .open(&target, &flow)
             .await
@@ -631,7 +652,7 @@ rules:
         );
         // Освобождаем слот — следующее открытие снова доходит до connect().
         drop(stream);
-        let (_, stream) = e.open(&target, &flow).await.expect("снова открыто");
+        let (_, stream, _) = e.open(&target, &flow).await.expect("снова открыто");
         drop(stream);
         holder.abort();
     }

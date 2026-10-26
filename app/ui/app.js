@@ -171,7 +171,7 @@ function mock(method, params) {
   };
   switch (method) {
     case 'daemon.status':
-      return { daemon: 'running', version: '0.1.0', api: 1, pid: 1, uptime_sec: 120, config_valid: true, enabled: state.connected };
+      return { daemon: 'running', version: '0.1.0', api: 1, pid: 1, uptime_sec: 120, engine_loaded: true, config_valid: true, enabled: state.connected };
     case 'config.get': return { config: cfg, path: '/etc/proxy-for-ubuntu/config.yaml', is_default: false };
     case 'config.validate': return { valid: true, warnings: [], errors: [] };
     case 'config.apply': return { ok: true, stage: 'done', message: 'applied', rolled_back: false, backup: null, errors: [], warnings: [] };

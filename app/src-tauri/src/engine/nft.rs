@@ -77,6 +77,10 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("    chain prerouting {\n");
         r.push_str("        type filter hook prerouting priority mangle; policy accept;\n");
         r.push_str("        iifname \"lo\" return\n");
+        // Таблица `inet` видит оба семейства, а слушатели демона — только
+        // IPv4. Без явного возврата IPv6-TCP уходит в `redirect` и падает:
+        // получателя из IPv4-сокета не восстановить.
+        r.push_str("        meta nfproto ipv6 return\n");
         // TPROXY в prerouting видит и входящий трафик к самой машине. Без этих
         // исключений mDNS (224.0.0.251), NTP-ответы и любые пакеты на локальный
         // адрес уходят в прокси-сокет вместо приложения: службы ломаются, а
@@ -106,6 +110,8 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("    chain nat_output {\n");
         r.push_str("        type nat hook output priority -100; policy accept;\n");
         r.push_str("        oifname \"lo\" return\n");
+        // См. prerouting: IPv6 идёт напрямую, пока нет v6-слушателей.
+        r.push_str("        meta nfproto ipv6 return\n");
         r.push_str("        fib daddr type local return\n");
         r.push_str("        ip daddr 224.0.0.0/4 return\n");
         r.push_str("        ip daddr 255.255.255.255 return\n");
@@ -140,6 +146,7 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("    chain nat_prerouting {\n");
         r.push_str("        type nat hook prerouting priority -100; policy accept;\n");
         r.push_str("        iifname \"lo\" return\n");
+        r.push_str("        meta nfproto ipv6 return\n");
         // Тот же принцип, что в mangle prerouting: не трогаем трафик,
         // адресованный самой машине (входящие сервисы), и multicast.
         r.push_str("        fib daddr type local return\n");
@@ -465,6 +472,17 @@ mod tests {
         assert!(pre.contains("fib daddr type local return"));
         assert!(pre.contains("ip daddr 224.0.0.0/4 return"));
         assert!(pre.contains("ip daddr 255.255.255.255 return"));
+    }
+
+    #[test]
+    fn ipv6_is_never_intercepted() {
+        let mut c = base_cfg();
+        // С docker включён третий хук — все три обязаны пропускать IPv6.
+        c.intercept.docker = true;
+        let plan = build_plan(&c);
+        // Таблица `inet` покрывает оба семейства, а слушатели демона — только
+        // IPv4: без guard'а IPv6-соединения уходят в `redirect` и рвутся.
+        assert_eq!(plan.ruleset.matches("meta nfproto ipv6 return").count(), 3);
     }
 
     #[test]

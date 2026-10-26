@@ -38,8 +38,13 @@ GUI (Tauri) — тонкая обёртка: команда фронтенда �
     "pid": 1234,
     "uptime_sec": 3600,
     "config_loaded_at": 1728261234,
+    "engine_loaded": true,
     "config_valid": true }
 ```
+
+`engine_loaded` — движок уже собран из конфига. `config_valid` говорит,
+проходит ли валидацию загруженный конфиг; без движка он всегда `false`,
+и это не ошибка — сначала смотрите на `engine_loaded`.
 
 ### `config.get`
 

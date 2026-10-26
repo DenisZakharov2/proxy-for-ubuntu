@@ -102,6 +102,9 @@ working normally — and `apt remove` restores the system on its own.
 - **UDP is intercepted for forwarded traffic only** — containers. Container
   TCP is intercepted with `intercept.docker: true`, UDP with
   `intercept.udp: tproxy`.
+- **IPv6 goes direct.** The daemon's listeners are IPv4, so every chain has
+  `meta nfproto ipv6 return`. There is no full v6 support: v6 sets,
+  `sockaddr_in6` and `IPV6_TRANSPARENT` are a separate task.
 - Excluded from interception: `uid 0` (the daemon itself), `lo`, local and
   private addresses, multicast, and ports from `exclude_ports` (22 by
   default).

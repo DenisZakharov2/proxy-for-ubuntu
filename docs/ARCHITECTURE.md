@@ -182,13 +182,18 @@ TUN не используется: ядро само отдаёт соедине
   сгенерированной датаграммы переписывает адрес получателя, и
   `IP_ORIGDSTADDR` возвращает уже `127.0.0.1:15001`, а не настоящий адрес —
   восстановить его нечем. Такой трафик идёт напрямую, мимо прокси;
+- **IPv6**: слушатели демона — IPv4-only, поэтому в `prerouting`,
+  `nat output` и `nat prerouting` стоит `meta nfproto ipv6 return` и
+  v6-трафик идёт напрямую. Полная поддержка (v6-наборы, `sockaddr_in6`,
+  `IP6T_SO_ORIGINAL_DST`, `IPV6_TRANSPARENT`) — отдельная задача;
 - трафик `uid 0` (сам демон), `lo`, локальные адреса (`fib daddr type
   local`), multicast `224.0.0.0/4`, broadcast, приватные сети при
   `bypass_private: true` и порты из `exclude_ports`.
 
-TUN (`config.tun`, интерфейс `pfu0`) **не реализован**: поле и проверка
-`/dev/net/tun` остались от первоначального плана. Именно он нужен, чтобы
-закрыть локальный UDP; до тех пор ограничение выше действует.
+TUN (`config.tun`, интерфейс `pfu0`) **не реализован**: поле осталось от
+первоначального плана, а проверка `/dev/net/tun` в `--check` теперь только
+информационная. Именно TUN нужен, чтобы закрыть локальный UDP; до тех пор
+ограничение выше действует.
 
 Слушатели живут ровно столько, сколько включён перехват: `Capture` держит
 `CancellationToken`, `disconnect` отменяет циклы и дожидается, пока задачи
@@ -210,6 +215,7 @@ table inet pfu {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
         iifname "lo" return
+        meta nfproto ipv6 return
         fib daddr type local return
         ip daddr 224.0.0.0/4 return
         ip daddr 255.255.255.255 return
@@ -222,6 +228,7 @@ table inet pfu {
     chain nat_output {
         type nat hook output priority -100; policy accept;
         oifname "lo" return
+        meta nfproto ipv6 return
         fib daddr type local return
         ip daddr 224.0.0.0/4 return
         ip daddr 255.255.255.255 return

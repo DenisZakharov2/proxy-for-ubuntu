@@ -98,6 +98,9 @@ jobs:
           echo "пакет в порядке"
 
       - uses: softprops/action-gh-release@v2
+        # Оба matrix-джоба собирают файл с одинаковым именем; грузит только
+        # джоба 22.04, иначе в релиз попадает тот, кто успел последним.
+        if: matrix.target == 'ubuntu-22.04'
         with:
           files: |
             dist/*.deb

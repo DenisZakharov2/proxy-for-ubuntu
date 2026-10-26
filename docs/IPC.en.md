@@ -38,8 +38,14 @@ daemon and returns `result`. No business logic on the GUI side.
     "pid": 1234,
     "uptime_sec": 3600,
     "config_loaded_at": 1728261234,
+    "engine_loaded": true,
     "config_valid": true }
 ```
+
+`engine_loaded` is `false` until the daemon has built an engine from the
+config. `config_valid` reports whether that loaded config passes validation;
+with no engine it is always `false`, which is not an error — check
+`engine_loaded` first.
 
 ### `config.get`
 

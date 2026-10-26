@@ -174,7 +174,7 @@ async fn tcp_conn(
     };
     let target = Target::from_flow(&flow);
 
-    let (ob, upstream) = match engine.open(&target, &flow).await {
+    let (ob, upstream, rule) = match engine.open(&target, &flow).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(target = %target.key(), error = %e, "перехваченное соединение не открыто");
@@ -206,9 +206,14 @@ async fn tcp_conn(
     engine.stats.conn_closed();
 
     match relayed {
-        Some(Ok((up, down))) => tracing::debug!(
-            target = %target.key(), outbound = ob.name(), up, down, "соединение закрыто"
-        ),
+        Some(Ok((up, down))) => {
+            // Статистика по правилам: раньше `Breakdown::record` вызывался
+            // только в тестах, и `metrics.live` всегда отдавал пустые блоки.
+            engine.breakdown.record(&rule, ob.name(), up + down);
+            tracing::debug!(
+                target = %target.key(), outbound = ob.name(), up, down, "соединение закрыто"
+            )
+        }
         Some(Err(e)) => {
             tracing::debug!(target = %target.key(), error = %e, "соединение оборвалось")
         }
@@ -406,19 +411,14 @@ async fn udp_flow(
         is_tcp: false,
         ..Default::default()
     };
-    if matches!(
-        engine.route(&flow).0,
-        Decision::Reject | Decision::RejectDrop
-    ) {
+    let (decision, label, rule) = engine.route(&flow);
+    if matches!(decision, Decision::Reject | Decision::RejectDrop) {
         flows.lock().await.remove(&key);
         return;
     }
     let target = Target::from_flow(&flow);
 
-    let label = engine
-        .route(&flow)
-        .1
-        .unwrap_or_else(|| "DIRECT".to_string());
+    let label = label.unwrap_or_else(|| "DIRECT".to_string());
     let Some(ob) = engine.resolve_outbound(&label) else {
         flows.lock().await.remove(&key);
         return;
@@ -445,6 +445,9 @@ async fn udp_flow(
     }
     engine.stats.add_up(first.len() as u64);
 
+    // Сумма по потоку: пишем в breakdown один раз при закрытии, а не на
+    // каждую датаграмму — лишний лок и аллокация на горячем пути.
+    let mut bytes = first.len() as u64;
     let mut buf = vec![0u8; 65_535];
     loop {
         tokio::select! {
@@ -458,12 +461,14 @@ async fn udp_flow(
                         break;
                     }
                     engine.stats.add_up(data.len() as u64);
+                    bytes += data.len() as u64;
                 }
                 None => break,
             },
             got = session.recv_from(&mut buf, UDP_IDLE) => match got {
                 Ok((n, _from)) => {
                     engine.stats.add_down(n as u64);
+                    bytes += n as u64;
                     if send_from(&reply, &buf[..n], client).await.is_err() {
                         break;
                     }
@@ -473,6 +478,7 @@ async fn udp_flow(
         }
     }
 
+    engine.breakdown.record(&rule, ob.name(), bytes);
     flows.lock().await.remove(&key);
 }
 

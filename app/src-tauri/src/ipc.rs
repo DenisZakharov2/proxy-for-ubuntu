@@ -243,6 +243,7 @@ impl Server {
 
     async fn daemon_status(self: &Arc<Self>) -> Result<Value> {
         let engine = self.engine.read().await;
+        let engine_loaded = engine.is_some();
         let config_valid = engine
             .as_ref()
             .map(|e| e.config.validate().is_ok())
@@ -254,6 +255,9 @@ impl Server {
             "pid": std::process::id(),
             "uptime_sec": now() - self.started_at,
             "config_loaded_at": self.started_at,
+            // `config_valid` без загруженного движка всегда false — это не
+            // «битый конфиг», поэтому рядом едет отдельный признак.
+            "engine_loaded": engine_loaded,
             "config_valid": config_valid,
             "enabled": engine.as_ref().map(|e| e.enabled.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false),
         }))
