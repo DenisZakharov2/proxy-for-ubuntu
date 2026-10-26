@@ -157,6 +157,14 @@ impl Config {
             tracing::warn!("перехват отключён для TCP и UDP: правила не применяются");
         }
 
+        // Схема умеет только REDIRECT для TCP. Молча трактовать `tproxy` как
+        // `redirect` нельзя: пользователь получил бы не то, что написал.
+        if self.intercept.tcp == TcpMode::Tproxy {
+            return Err(Error::ConfigInvalid(
+                "intercept.tcp: tproxy для TCP не реализован — используйте redirect".into(),
+            ));
+        }
+
         // Имена outbound'ов должны быть уникальны, DIRECT — присутствовать.
         let mut names: HashSet<String> = HashSet::new();
         for ob in &self.outbounds {
@@ -1415,6 +1423,23 @@ rules: []
         assert_eq!(expand_env("a=${NOPE}b", &e), "a=b");
         assert_eq!(expand_env("a=$NOPE", &e), "a=$NOPE");
         assert_eq!(expand_env("no vars", &e), "no vars");
+    }
+
+    #[test]
+    fn rejects_tcp_tproxy_mode() {
+        // Режим есть в схеме, но в коде TCP всегда REDIRECT: принять и
+        // проигнорировать его — хуже, чем отказать.
+        let yaml = r#"
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: S, type: socks5, server: 1.2.3.4, port: 1080}
+intercept: {tcp: tproxy}
+"#;
+        let err = Config::parse(yaml, &HashMap::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("tproxy"),
+            "неожиданная ошибка: {err}"
+        );
     }
 
     #[test]

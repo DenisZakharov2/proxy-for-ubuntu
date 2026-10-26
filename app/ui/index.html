@@ -225,13 +225,13 @@
           <div class="card-head"><h3 data-i18n="set.advanced">Параметры перехвата</h3></div>
           <div class="form-grid">
             <label><span>TCP</span>
-              <select id="tcpMode"><option value="redirect">redirect</option><option value="tproxy">tproxy</option><option value="off">выключен</option></select></label>
+              <select id="tcpMode"><option value="redirect">redirect</option><option value="off">выключен</option></select></label>
             <label><span>UDP</span>
               <select id="udpMode"><option value="tproxy">tproxy</option><option value="off">выключен</option></select></label>
             <label><span>DNS</span>
               <select id="dnsStrategy"><option value="fake-ip">fake-ip</option><option value="redir-host">redir-host</option></select></label>
           </div>
-          <p class="hint" data-i18n="set.intercept.hint">fake-ip не допускает утечки DNS, но ломает ping и часть GeoIP-правил. tproxy нужен для QUIC и игр.</p>
+          <p class="hint" data-i18n="set.intercept.hint">Локальный UDP (DNS, QUIC) пока не перехватывается: для него нужен TUN, он не реализован. DNS-стратегия на локальные запросы не влияет.</p>
         </div>
       </section>
     </div>
