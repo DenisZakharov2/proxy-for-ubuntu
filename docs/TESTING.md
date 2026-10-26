@@ -24,6 +24,7 @@ sudo apt install ./dist/proxy-for-ubuntu_0.1.0_amd64.deb
 
 # Демон в автозапуске, но перехват не включён
 systemctl is-enabled proxy-for-ubuntud
+sudo systemctl start proxy-for-ubuntud    # поднять демон (перехват ещё выключен)
 sudo pfu-cli doctor                       # nft, TUN, права, порты — всё ok
 
 # Перехват ещё НЕ включён: это правильное поведение после установки

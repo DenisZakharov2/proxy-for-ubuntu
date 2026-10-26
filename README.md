@@ -199,8 +199,8 @@ final: DIRECT
 ```bash
 sudo pfu-cli connect          # включить перехват
 pfu-cli status                # состояние демона
-pfu-cli doctor                # проверить окружение
-pfu-cli doctor --strict       # то же, но с кодом возврата 1 при проблемах (для systemd ExecStartPre)
+pfu-cli doctor                # проверить окружение (через демон)
+sudo proxy-for-ubuntud --check --strict   # то же без демона: код возврата 1 при проблемах (ExecStartPre)
 pfu-cli rules                 # правила маршрутизации
 pfu-cli proxies               # список прокси
 pfu-cli metrics               # текущий трафик

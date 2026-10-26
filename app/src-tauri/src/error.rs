@@ -28,6 +28,9 @@ pub enum Error {
     #[error("недостаточно прав: {0}")]
     Permission(String),
 
+    #[error("окружение не готово")]
+    NotReady,
+
     #[error("не найдено: {0}")]
     NotFound(String),
 
@@ -81,6 +84,7 @@ impl Error {
             Error::Tls(_) | Error::Protocol { .. } | Error::Timeout(_) => "E_PROBE_FAILED",
             Error::Reject(_) => "E_REJECT",
             Error::Limit(_) => "E_LIMIT",
+            Error::NotReady => "E_NOT_READY",
         }
     }
 

@@ -28,11 +28,14 @@ fn main() -> ExitCode {
         }
     };
 
+    // systemd передаёт флаги отдельными аргументами: `--check --strict`.
+    let strict = args.iter().any(|a| a == "--strict");
+
     let outcome = rt.block_on(async move {
         match mode {
             "--daemon" | "-d" => run_daemon().await,
-            "--check" => run_check().await,
-            "--check --strict" | "--strict" => run_check_strict().await,
+            "--check" => run_check(strict).await,
+            "--check --strict" | "--strict" => run_check(true).await,
             "--version" | "-V" => {
                 println!(
                     "proxy-for-ubuntud {} (api {})",
@@ -77,7 +80,7 @@ fn print_help() {
          Использование:\n  \
            proxy-for-ubuntud --daemon    запустить демон (по умолчанию)\n  \
            proxy-for-ubuntud --check     проверить окружение и выйти\n  \
-           proxy-for-ubuntud --strict    то же, но с кодом возврата 1 при проблемах (для ExecStartPre)\n  \
+           proxy-for-ubuntud --check --strict  то же, но без root — код возврата 1 (для ExecStartPre)\n  \
            proxy-for-ubuntud --version   показать версию",
         pfu::VERSION
     );
@@ -219,8 +222,13 @@ async fn run_daemon() -> Result<()> {
     outcome
 }
 
-/// Проверка окружения для `systemctl start` (ExecStartPre) и для `pfu-cli doctor`.
-async fn run_check() -> Result<()> {
+/// Проверка окружения для `ExecStartPre` в systemd-юните.
+///
+/// Работает без демона: не обращается к управляющему сокету, поэтому годится
+/// для `ExecStartPre`, где демона ещё нет. В режиме `strict` отсутствие root
+/// тоже считается проблемой. Порт-конфликты не фатальны — они только
+/// печатаются.
+async fn run_check(strict: bool) -> Result<()> {
     let mut problems = 0;
 
     let (nft_ok, nft_ver) = nft::check_available().await;
@@ -240,6 +248,9 @@ async fn run_check() -> Result<()> {
 
     let root = unsafe { libc::geteuid() } == 0;
     println!("права: {}", if root { "root" } else { "не root" });
+    if strict && !root {
+        problems += 1;
+    }
 
     let config = paths::config_path();
     println!(
@@ -270,23 +281,10 @@ async fn run_check() -> Result<()> {
 
     if problems > 0 {
         eprintln!("\nОбнаружены проблемы: {problems}. Запуск будет невозможен.");
-        return Err(pfu::Error::Internal(format!(
-            "проблем в окружении: {problems}"
-        )));
+        return Err(pfu::Error::NotReady);
     }
     println!("\nОкружение готово.");
     Ok(())
-}
-
-/// То же самое, что `--check`, но любой отсутствующий критически важный
-/// компонент (nftables, TUN, права root, ядро) возвращает ненулевой код
-/// возврата. Предназначен для `ExecStartPre=` в systemd-юните.
-///
-/// Проверки ровно те, что реально блокируют работу: без них демон не сможет
-/// управлять маршрутизацией. Порт-конфликты здесь не фатальны — они
-/// отображаются, но не блокируют старт.
-async fn run_check_strict() -> Result<()> {
-    run_check().await
 }
 
 fn prepare_dirs() -> Result<()> {

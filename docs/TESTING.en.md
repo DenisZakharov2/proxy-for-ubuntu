@@ -24,6 +24,7 @@ sudo apt install ./dist/proxy-for-ubuntu_0.1.0_amd64.deb
 
 # The daemon is enabled for autostart, but interception is not turned on
 systemctl is-enabled proxy-for-ubuntud
+sudo systemctl start proxy-for-ubuntud    # start the daemon (interception still off)
 sudo pfu-cli doctor                       # nft, TUN, rights, ports — all ok
 
 # Interception is NOT yet on: this is correct behavior right after installation

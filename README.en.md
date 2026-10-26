@@ -180,7 +180,8 @@ Useful on servers and in CI:
 ```bash
 sudo pfu-cli connect          # enable interception
 pfu-cli status                # daemon state
-pfu-cli doctor                # check the environment
+pfu-cli doctor                # check the environment (via the daemon)
+sudo proxy-for-ubuntud --check --strict   # same without the daemon: exit 1 on problems (ExecStartPre)
 pfu-cli rules                 # routing rules
 pfu-cli proxies               # list proxies
 pfu-cli metrics               # live traffic
