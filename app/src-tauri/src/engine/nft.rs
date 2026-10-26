@@ -38,52 +38,67 @@ pub struct NftPlan {
 /// решает, когда это сделать.
 pub fn build_plan(cfg: &Config) -> NftPlan {
     let mut r = String::new();
-    let disabled = cfg.intercept.tcp == TcpMode::Off && cfg.intercept.udp == UdpMode::Off;
+    let tcp_on = cfg.intercept.tcp != TcpMode::Off;
+    let udp_on = cfg.intercept.udp != UdpMode::Off;
+    let disabled = !tcp_on && !udp_on;
 
     r.push_str("table inet pfu\n");
     r.push_str("delete table inet pfu\n");
     r.push_str("table inet pfu {\n");
 
-    // ── Исключения, чтобы не зацилить самих себя ──────────────────────────
+    // ── Наборы исключений ─────────────────────────────────────────────────
+    // Внутри блока set элементы пишутся только через `elements = { ... }`:
+    // «сырой» список nft отвергает с syntax error.
     r.push_str("    set loopback_ips {\n");
     r.push_str("        type ipv4_addr; flags interval;\n");
-    r.push_str("        127.0.0.0/8\n");
+    r.push_str("        elements = { 127.0.0.0/8 }\n");
     r.push_str("    }\n");
     if cfg.intercept.bypass_private {
         r.push_str("    set private_ips {\n");
         r.push_str("        type ipv4_addr; flags interval;\n");
-        r.push_str("        10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16\n");
+        r.push_str(
+            "        elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }\n",
+        );
         r.push_str("    }\n");
     }
     if !cfg.intercept.exclude_ports.is_empty() {
         r.push_str("    set exclude_ports {\n");
         r.push_str("        type inet_service; flags interval;\n");
-        for p in &cfg.intercept.exclude_ports {
-            r.push_str(&format!("        {p}\n"));
-        }
+        r.push_str(&format!(
+            "        elements = {{ {} }}\n",
+            cfg.intercept.exclude_ports.join(", ")
+        ));
         r.push_str("    }\n");
     }
-    for uid in &cfg.intercept.exclude_uid {
-        r.push_str(&format!("    chain skip_{uid} {{ return; }}\n"));
-    }
 
-    // ── prerouting: трафик, приходящий в систему (форвардинг) ────────────
-    r.push_str("    chain prerouting {\n");
-    r.push_str("        type filter hook prerouting priority mangle; policy accept;\n");
+    // ── prerouting: форвардинг (Docker и другие чужие пакеты) ────────────
+    // UDP отдаём в TPROXY-сокет, TCP — в nat-хуке ниже. Метка нужна TPROXY:
+    // по ней `ip rule` отправляет пакет в таблицу 100 с локальным маршрутом.
     if !disabled {
+        r.push_str("    chain prerouting {\n");
+        r.push_str("        type filter hook prerouting priority mangle; policy accept;\n");
         r.push_str("        iifname \"lo\" return\n");
         r.push_str("        ip daddr @loopback_ips return\n");
         if cfg.intercept.bypass_private {
             r.push_str("        ip daddr @private_ips return\n");
         }
-        r.push_str("        meta mark set 0x1\n");
+        if !cfg.intercept.exclude_ports.is_empty() {
+            r.push_str("        meta l4proto { tcp, udp } th dport @exclude_ports return\n");
+        }
+        if udp_on {
+            r.push_str("        meta l4proto udp meta mark set 0x1 tproxy to :");
+            r.push_str(&crate::paths::tproxy_port().to_string());
+            r.push('\n');
+        }
+        r.push_str("    }\n");
     }
-    r.push_str("    }\n");
 
-    // ── output: трафик самой системы, то есть то, что нам нужно перехватить
-    r.push_str("    chain output {\n");
-    r.push_str("        type filter hook output priority mangle; policy accept;\n");
+    // ── nat output: трафик самой системы ────────────────────────────────
+    // REDIRECT переписывает адрес получателя на локальный сокет демона и
+    // сохраняет настоящий адрес доступным через SO_ORIGINAL_DST.
     if !disabled {
+        r.push_str("    chain nat_output {\n");
+        r.push_str("        type nat hook output priority -100; policy accept;\n");
         r.push_str("        oifname \"lo\" return\n");
         r.push_str("        ip daddr @loopback_ips return\n");
         if cfg.intercept.bypass_private {
@@ -92,23 +107,42 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         if !cfg.intercept.exclude_ports.is_empty() {
             r.push_str("        meta l4proto { tcp, udp } th dport @exclude_ports return\n");
         }
-        for uid in &cfg.intercept.exclude_uid {
-            r.push_str(&format!("        meta skuid {uid} jump skip_{uid}\n"));
-        }
-        // Трафик самого демона к прокси-серверу обязан идти напрямую,
-        // иначе он завернётся в перехват и попадёт в бесконечный цикл.
+        // Трафик демона (uid 0) обязан идти напрямую, иначе бесконечный цикл.
         r.push_str("        meta skuid 0 return\n");
-        r.push_str("        meta mark set 0x1\n");
+        for uid in &cfg.intercept.exclude_uid {
+            r.push_str(&format!("        meta skuid {uid} return\n"));
+        }
+        if tcp_on {
+            r.push_str("        meta l4proto tcp redirect to :");
+            r.push_str(&crate::paths::redirect_port().to_string());
+            r.push('\n');
+        }
+        // UDP здесь не перехватываем: REDIRECT переписывает адрес получателя,
+        // и настоящий адрес из сокета уже не достать (IP_ORIGDSTADDR вернёт
+        // 127.0.0.1). Локальный UDP идёт напрямую, TPROXY работает только
+        // для форвардинга — см. цепочку prerouting.
+        r.push_str("    }\n");
     }
-    r.push_str("    }\n");
-    // ── forward: трафик Docker-контейнеров (FORWARD-хук) ───────────────
-    // Приоритет -10 срабатывает раньше цепочки DOCKER-USER (priority 0).
-    // Вердикт не разрывающий: пакет помечается меткой и уходит дальше без
-    // изменений; маршрутизацию забирает ip rule (таблица 100).
-    if cfg.intercept.docker {
-        r.push_str("    chain forward {\n");
-        r.push_str("        type filter hook forward priority -10; policy accept;\n");
-        r.push_str("        meta mark set 0x1\n");
+
+    // ── nat prerouting: TCP из контейнеров (только при `docker: true`) ───
+    // Приоритет dstnat (-100) ниже mangle (-150), поэтому TPROXY успевает
+    // разобрать UDP раньше, а TCP уходит в REDIRECT.
+    if !disabled && cfg.intercept.docker {
+        r.push_str("    chain nat_prerouting {\n");
+        r.push_str("        type nat hook prerouting priority -100; policy accept;\n");
+        r.push_str("        iifname \"lo\" return\n");
+        r.push_str("        ip daddr @loopback_ips return\n");
+        if cfg.intercept.bypass_private {
+            r.push_str("        ip daddr @private_ips return\n");
+        }
+        if !cfg.intercept.exclude_ports.is_empty() {
+            r.push_str("        meta l4proto { tcp, udp } th dport @exclude_ports return\n");
+        }
+        if tcp_on {
+            r.push_str("        meta l4proto tcp redirect to :");
+            r.push_str(&crate::paths::redirect_port().to_string());
+            r.push('\n');
+        }
         r.push_str("    }\n");
     }
 
@@ -122,10 +156,11 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         let _ = cmd;
     }
 
-    if !disabled {
-        // Редирект TCP в локальный сокет демона.
+    // `local` обязателен: без него помеченный пакет не доставляется локально
+    // в TPROXY-сокет, а уходит в никуда по маршруту через lo.
+    if !disabled && udp_on {
         ip_post.push(format!(
-            "ip route replace default dev lo table {ROUTE_TABLE}"
+            "ip route replace local default dev lo table {ROUTE_TABLE}"
         ));
     }
 
@@ -268,6 +303,22 @@ mod tests {
         assert!(plan.ruleset.contains("hook prerouting"));
         assert!(plan.ruleset.contains("hook output"));
         assert!(plan.ruleset.contains("meta mark set 0x1"));
+    }
+
+    #[test]
+    fn plan_uses_valid_set_syntax_and_redirects() {
+        let plan = build_plan(&base_cfg());
+        // Элементы внутри блока set пишутся только так: «сырой» список nft
+        // отвергает с syntax error, и перехват не включается.
+        assert!(plan.ruleset.contains("elements = {"));
+        // TCP уходит в сокет демона через nat REDIRECT.
+        assert!(plan.ruleset.contains("meta l4proto tcp redirect to :"));
+        // UDP — через TPROXY с локальным маршрутом в таблице 100.
+        assert!(plan.ruleset.contains("tproxy to :"));
+        assert!(plan
+            .ip_post
+            .iter()
+            .any(|c| c.contains("local default dev lo table")));
     }
 
     #[test]

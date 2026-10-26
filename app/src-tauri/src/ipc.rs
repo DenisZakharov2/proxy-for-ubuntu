@@ -14,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::Config;
+use crate::engine::capture;
 use crate::engine::geo::{GeoKind, GeoRegistry};
 use crate::engine::nft;
 use crate::engine::router::Engine;
@@ -73,6 +74,9 @@ impl From<&Error> for WireError {
 pub struct Server {
     supervisor: Supervisor,
     engine: Arc<tokio::sync::RwLock<Option<Arc<Engine>>>>,
+    /// Слушатели перехвата. Живут, пока включён перехват: при выключении
+    /// порты закрываются, иначе трафик уходил бы в никуда.
+    capture: tokio::sync::Mutex<Option<capture::Capture>>,
     started_at: i64,
     log_ring: Arc<tokio::sync::Mutex<Vec<LogEntry>>>,
 }
@@ -97,6 +101,7 @@ impl Server {
         Self {
             supervisor: Supervisor::new(),
             engine: Arc::new(tokio::sync::RwLock::new(None)),
+            capture: tokio::sync::Mutex::new(None),
             started_at: now(),
             log_ring: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
@@ -339,6 +344,7 @@ impl Server {
                         .enabled
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     *self.engine.write().await = Some(engine);
+                    self.sync_capture().await;
                 }
             }
         }
@@ -362,16 +368,43 @@ impl Server {
                         .enabled
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     *self.engine.write().await = Some(engine);
+                    self.sync_capture().await;
                 }
             }
         }
         Ok(report)
     }
 
+    /// Переподнимает слушатели под текущий движок: после нового конфига
+    /// старые задачи держали бы старые правила.
+    async fn sync_capture(&self) {
+        let engine = self.engine.read().await.clone();
+        let mut guard = self.capture.lock().await;
+        guard.take();
+        let Some(engine) = engine.filter(|e| e.enabled.load(std::sync::atomic::Ordering::Relaxed))
+        else {
+            return;
+        };
+        match capture::start(engine.clone()).await {
+            Ok(c) => *guard = Some(c),
+            Err(e) => {
+                // Без слушателей правила увели бы трафик в закрытые порты.
+                tracing::error!(error = %e, "не удалось переподнять перехват — выключаю");
+                engine
+                    .enabled
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                nft::teardown().await.ok();
+            }
+        }
+    }
+
     async fn config_rollback(self: &Arc<Self>) -> Result<Value> {
         match self.supervisor.rollback_to_latest().await {
             Ok(path) => {
                 *self.engine.write().await = None;
+                if let Some(mut c) = self.capture.lock().await.take() {
+                    c.stop();
+                }
                 Ok(json!({ "ok": true, "restored_from": path }))
             }
             Err(e) => Ok(json!({ "ok": false, "message": e.to_string() })),
@@ -399,11 +432,20 @@ impl Server {
                 .store(enabled, std::sync::atomic::Ordering::Relaxed);
             if enabled {
                 let plan = nft::build_plan(&e.config);
+                // Сначала слушатели, потом правила: если порт занят, система
+                // остаётся в прежнем состоянии, а не уходит в никуда.
+                let mut capture = capture::start(e.clone()).await?;
                 if let Err(err) = nft::apply(&plan).await {
+                    capture.stop();
                     e.enabled.store(false, std::sync::atomic::Ordering::Relaxed);
                     return Err(err);
                 }
+                *self.capture.lock().await = Some(capture);
                 return Ok(json!({ "enabled": true, "status": "connected", "message": "" }));
+            }
+            // Выключаем: сперва закрываем порты, потом снимаем правила.
+            if let Some(mut old) = self.capture.lock().await.take() {
+                old.stop();
             }
             nft::teardown().await?;
             return Ok(json!({ "enabled": false, "status": "disconnected", "message": "" }));

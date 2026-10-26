@@ -4,6 +4,7 @@
 //! напрямую — они живут в [`crate::supervisor`]. Это позволяет держать
 //! движок полностью тестируемым без root.
 
+pub mod capture;
 pub mod dns;
 pub mod geo;
 pub mod nft;
