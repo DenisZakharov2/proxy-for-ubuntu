@@ -7,6 +7,7 @@
 | `config-live.yaml` | конфиг для живой проверки: `tun.enabled: true`, `mtu: 1500`, `dns.strategy: redir-host`, единственный outbound `DIRECT` (как в установленном конфиге) |
 | `live-check.sh` | измерения `before` / `traffic` / `after`; сам перехват не включает |
 | `quic-probe.py` | QUIC-рукопожатие (ALPN `h3`) через `aioquic` — на машине нет curl с HTTP/3 |
+| `config-restore.yaml` | конфиг после проверки: `tun.enabled: false`, остальное как в 0.3.0 |
 | `release/` | релизный `.deb` 0.3.0 из CI + `.sha256` (4 343 468 байт, sha256 `d7059aa9…d8cb01`) |
 
 ## Что проверено на этой машине
@@ -85,17 +86,20 @@ python3 -m venv ~/.hermes/cache/scratch/quic-venv
 ~/.hermes/cache/scratch/quic-venv/bin/pip install aioquic
 ```
 
-## Вернуть конфиг после проверки
+## Конфиг после проверки
 
-`config-live.yaml` оставляет `tun.enabled: true` — при выключенном перехвате
-это ни на что не влияет, но следующий `connect` поднимет TUN. Если TUN не
-нужен:
+`config-live.yaml` оставлял `tun.enabled: true`. Пользователь решил вернуть
+`false`: при единственном `DIRECT` TUN даёт только более медленный стек, а
+смысл появится вместе с прокси. Выполнено 29.10.2026:
 
 ```bash
-sudo install -m 0600 -o root -g root \
-  /etc/proxy-for-ubuntu/config.yaml.pre-0.3.0 /etc/proxy-for-ubuntu/config.yaml
-sudo systemctl restart proxy-for-ubuntud
+sudo install -m 0600 -o root -g root "материалы сессии 17/config-restore.yaml" \
+  /etc/proxy-for-ubuntu/config.yaml
+sudo systemctl restart proxy-for-ubuntud          # restart, не reload
 ```
+
+`reload` здесь не годится: он применяет конфиг строгой проверкой, а конфиг
+без единого прокси она отвергает; `restart` читает мягкой.
 
 Копия `config.yaml.pre-0.3.0` — исходный конфиг 0.1.2 с `fake-ip`; после
 установки 0.3.0 его снова переведёт postinst, если ставить пакет заново.

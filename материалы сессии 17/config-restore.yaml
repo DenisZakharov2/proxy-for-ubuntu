@@ -1,0 +1,49 @@
+# Конфиг после живой проверки: TUN выключен, всё остальное как в 0.3.0.
+#
+#   sudo install -m 0600 -o root -g root "материалы сессии 17/config-restore.yaml" \
+#       /etc/proxy-for-ubuntu/config.yaml
+#   sudo systemctl restart proxy-for-ubuntud
+#
+# Именно restart, а не reload: reload применяет конфиг строгой проверкой и
+# отвергнет его (в конфиге нет ни одного прокси), а restart читает мягкой.
+#
+# Перехват при этом всё равно включается только `pfu-cli connect`.
+api: 1
+
+log:
+  level: info
+  journal: true
+
+dns:
+  strategy: redir-host
+  cache_size: 4096
+  cache_ttl: 300
+  servers: [1.1.1.1, 8.8.8.8]
+  fallback: [9.9.9.9, 1.0.0.1]
+
+intercept:
+  tcp: redirect
+  udp: tproxy
+  # SSH наружу не перехватываем: иначе потеряете доступ к самой машине,
+  # если прокси ляжет.
+  exclude_ports: ["22"]
+  bypass_private: true
+  loop_protect: true
+
+tun:
+  enabled: false
+  device: pfu0
+  mtu: 1500
+
+geo:
+  auto_update: true
+  update_interval_hours: 24
+  sources: []
+
+outbounds:
+  - name: DIRECT
+    type: direct
+
+rules: []
+
+final: DIRECT
