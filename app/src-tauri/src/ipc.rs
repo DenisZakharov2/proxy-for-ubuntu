@@ -236,9 +236,13 @@ impl Server {
             "profile.import" => self.profile_import(&params),
             "profile.export" => self.profile_export(&params),
             "profile.import_uri" => self.profile_import_uri(&params),
+            "profile.import_links" => self.profile_import_links(&params),
             "subscription.update" => self.subscription_update(&params).await,
             "subscription.preview" => self.subscription_preview(&params).await,
             "subscription.apply" => self.subscription_apply(&params, true).await,
+            "subscription.list" => self.subscription_list(),
+            "subscription.refresh" => self.subscription_refresh(&params).await,
+            "subscription.remove" => self.subscription_remove(&params),
             "log.tail" => self.log_tail(&params).await,
             "log.search" => self.log_search(&params).await,
             "log.export" => self.log_export(&params).await,
@@ -910,6 +914,54 @@ impl Server {
         }))
     }
 
+    /// Импорт набора ссылок, вставленных вручную (`REQ-003`).
+    ///
+    /// Одна строка — одна ссылка. Как и в подписке, битая строка не отменяет
+    /// остальные: пользователь получает «принято N, отклонено M» с номерами
+    /// строк, а профиль перезаписывается один раз — после разбора всего
+    /// списка. Одиночная ссылка идёт через `profile.import_uri`: там ответ
+    /// содержит разобранный outbound, здесь важнее отчёт по строкам.
+    fn profile_import_links(&self, params: &Value) -> Result<Value> {
+        let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("imported");
+        let (path, builtin) = resolve_profile_path(name)?;
+        if builtin {
+            return Err(Error::Permission(format!(
+                "профиль {name:?} встроенный и не редактируется"
+            )));
+        }
+        let parsed = crate::subscription::parse_body(text)
+            .map_err(|e| Error::ConfigInvalid(format!("{}: {e}", e.code())))?;
+        // YAML — это готовый конфиг, а не список ссылок: сливать его в
+        // существующий профиль значило бы молча потерять его правила.
+        if parsed.format == Some(crate::subscription::SubscriptionFormat::Yaml) {
+            return Err(Error::ConfigInvalid(
+                "E_LINKS_IS_YAML: это YAML-конфиг целиком, используйте «Импорт»".into(),
+            ));
+        }
+        let env = crate::config::read_env_file(&paths::env_file());
+        let base = load_or_empty_config(&path, &env)?;
+        let (cfg, accepted) = config_with_parsed(base, &parsed)?;
+        let yaml = cfg.to_yaml()?;
+        paths::ensure_dir(&paths::user_profiles_dir())?;
+        paths::atomic_write(&path, yaml.as_bytes())?;
+        let rejected: Vec<Value> = parsed
+            .rejected
+            .iter()
+            .map(|r| json!({ "line": r.line, "code": r.code, "reason": r.reason }))
+            .collect();
+        Ok(json!({
+            "ok": true,
+            "name": name,
+            "accepted": accepted,
+            "rejected": rejected,
+            "summary": format!("принято {}, отклонено {}", accepted, rejected.len()),
+        }))
+    }
+
     /// Что придёт из подписки — без записи в профиль (`REQ-002`).
     ///
     /// Пользователь должен увидеть «принято N, отклонено M» до того, как
@@ -1048,6 +1100,80 @@ impl Server {
             "activated": activated,
             "summary": format!("принято {}, отклонено {}", accepted, rejected.len()),
         }))
+    }
+
+    /// Подписки из реестра (`REQ-005`) — для экрана профилей.
+    ///
+    /// Без этого списка пользователь не видит, какие подписки вообще
+    /// обновляются по расписанию, и не может обновить одну из них кнопкой.
+    fn subscription_list(&self) -> Result<Value> {
+        let records = crate::subscription::load_store(&crate::subscription::store_path());
+        let tick = now();
+        let list: Vec<Value> = records
+            .iter()
+            .map(|r| {
+                json!({
+                    "name": r.name,
+                    "url": r.url,
+                    "interval_hours": r.interval_hours,
+                    "last_success_unix": r.last_success_unix,
+                    "last_attempt_unix": r.last_attempt_unix,
+                    "last_error": r.last_error,
+                    "due": r.due(tick),
+                })
+            })
+            .collect();
+        Ok(json!({ "subscriptions": list }))
+    }
+
+    /// Немедленное обновление одной подписки из реестра — кнопкой, а не по
+    /// таймеру. Профиль при неудаче не меняется, причина остаётся в
+    /// `last_error` без URL и секретов.
+    async fn subscription_refresh(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let store = crate::subscription::store_path();
+        let mut records = crate::subscription::load_store(&store);
+        let index = records
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| Error::NotFound(format!("подписка {name:?} не найдена")))?;
+        let url = records[index].url.clone();
+        let profile = records[index].name.clone();
+        records[index].last_attempt_unix = now();
+        let attempted = self
+            .subscription_apply(
+                &json!({ "url": url, "name": profile, "auto_activate": false }),
+                false,
+            )
+            .await;
+        match &attempted {
+            Ok(_) => {
+                records[index].last_success_unix = now();
+                records[index].last_error = None;
+            }
+            Err(e) => {
+                records[index].last_error = Some(error_without_url(&e.to_string(), &url));
+            }
+        }
+        if let Err(e) = crate::subscription::save_store(&store, &records) {
+            tracing::warn!("реестр подписок не сохранён: {e}");
+        }
+        attempted
+    }
+
+    /// Убирает запись из реестра: расписание перестаёт ходить по URL.
+    /// Файл профиля остаётся — его удаляют отдельно, как обычный профиль.
+    fn subscription_remove(&self, params: &Value) -> Result<Value> {
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let store = crate::subscription::store_path();
+        let mut records = crate::subscription::load_store(&store);
+        let before = records.len();
+        records.retain(|r| r.name != name);
+        if records.len() == before {
+            return Err(Error::NotFound(format!("подписка {name:?} не найдена")));
+        }
+        crate::subscription::save_store(&store, &records)?;
+        Ok(json!({ "ok": true, "name": name }))
     }
 
     /// Обновляет подписки, у которых вышел срок (`REQ-005`).
@@ -1453,6 +1579,11 @@ fn fd_usage() -> (usize, u64) {
 mod tests {
     use super::*;
 
+    /// Тесты, меняющие `XDG_CONFIG_HOME`, не должны идти параллельно: это
+    /// переменная процесса, а каталоги у тестов разные — иначе `apply`
+    /// пишет профиль в чужой временный каталог.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Мини-сервер на localhost: один запрос — один ответ. Внешняя сеть не
     /// трогается, поэтому тест годится и для машины, где живой сети нет.
     async fn serve_once(body: String) -> std::net::SocketAddr {
@@ -1559,8 +1690,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_links_keeps_good_lines_and_reports_bad_ones() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("pfu-ipc-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let server = Arc::new(Server::new());
+        let text = "vless://11111111-1111-1111-1111-111111111111@example.net:443?security=tls#A\n\
+                    мусор\n\
+                    trojan://secret@203.0.113.4:443#B\n";
+        let result = server
+            .handle(
+                "profile.import_links",
+                json!({ "text": text, "name": "links" }),
+            )
+            .await
+            .expect("импорт списка ссылок");
+        assert_eq!(result["accepted"], 2);
+        assert_eq!(result["rejected"][0]["line"], 2);
+        assert_eq!(result["summary"], "принято 2, отклонено 1");
+        let written = std::fs::read_to_string(paths::user_profiles_dir().join("links.yaml"))
+            .expect("профиль записан");
+        assert!(written.contains("A") && written.contains("B"), "{written}");
+
+        // YAML целиком в поле ссылок — отказ, а не молчаливое слияние.
+        let err = server
+            .handle(
+                "profile.import_links",
+                json!({ "text": "outbounds:\n  - name: A\n    type: trojan\n", "name": "links" }),
+            )
+            .await
+            .expect_err("YAML не список ссылок");
+        assert!(err.to_string().contains("E_LINKS_IS_YAML"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn subscription_registry_lists_refreshes_and_removes() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("pfu-ipc-subs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.net:443?security=tls#A\n";
+        let addr = serve_once(raw.to_string()).await;
+        let store = crate::subscription::store_path();
+        crate::subscription::save_store(
+            &store,
+            &[crate::subscription::SubscriptionRecord::new(
+                "live",
+                &format!("http://{addr}/sub"),
+                crate::subscription::DEFAULT_INTERVAL_HOURS,
+            )],
+        )
+        .expect("реестр записан");
+
+        let server = Arc::new(Server::new());
+        let listed = server
+            .handle("subscription.list", json!({}))
+            .await
+            .expect("список подписок");
+        assert_eq!(listed["subscriptions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(listed["subscriptions"][0]["name"], "live");
+        assert_eq!(
+            listed["subscriptions"][0]["due"], true,
+            "ещё ни разу не обновлялась"
+        );
+
+        let refreshed = server
+            .handle("subscription.refresh", json!({ "name": "live" }))
+            .await
+            .expect("обновление по кнопке");
+        assert_eq!(refreshed["accepted"], 1);
+        let after = crate::subscription::load_store(&store);
+        assert!(after[0].last_success_unix > 0);
+        assert!(after[0].last_error.is_none());
+
+        // Недоступный сервер: ошибка возвращается, профиль не меняется,
+        // причина неудачи остаётся в реестре без URL с токеном.
+        let profile = paths::user_profiles_dir().join("live.yaml");
+        let before = std::fs::read_to_string(&profile).expect("профиль записан");
+        let mut records = crate::subscription::load_store(&store);
+        records[0].url = "http://127.0.0.1:1/sub?token=SECRET-TOKEN".into();
+        crate::subscription::save_store(&store, &records).expect("реестр");
+        let err = server
+            .handle("subscription.refresh", json!({ "name": "live" }))
+            .await
+            .expect_err("недоступный сервер должен дать ошибку");
+        assert!(err.to_string().contains("загрузка подписки"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&profile).expect("профиль на месте"),
+            before,
+            "профиль изменился при неудаче"
+        );
+        let failed = crate::subscription::load_store(&store);
+        assert!(
+            failed[0].last_error.is_some(),
+            "причина неудачи не сохранена"
+        );
+        assert!(
+            !failed[0]
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("SECRET-TOKEN"),
+            "токен утёк в реестр"
+        );
+
+        let removed = server
+            .handle("subscription.remove", json!({ "name": "live" }))
+            .await
+            .expect("удаление подписки");
+        assert_eq!(removed["ok"], true);
+        assert!(crate::subscription::load_store(&store).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn apply_writes_profile_and_keeps_it_on_failure() {
         // Свой каталог конфигурации: тест не должен трогать профили человека.
+        let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("pfu-ipc-apply-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::env::set_var("XDG_CONFIG_HOME", &dir);

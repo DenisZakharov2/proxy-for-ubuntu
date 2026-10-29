@@ -34,8 +34,16 @@ const I18N = {
     'rules.invalid': 'В конфиге ошибки', 'rules.applied': 'Изменения применены',
     'rules.rolled': 'Изменения не применились, система в прежнем состоянии',
     'profiles.title': 'Профили конфигурации', 'profiles.import': 'Импорт', 'profiles.export': 'Экспорт',
+    'profiles.addLink': 'Добавить ссылку',
     'profiles.builtin': 'встроенный', 'profiles.active': 'активный',
-    'subs.title': 'Подписки', 'subs.name': 'Название', 'subs.url': 'URL', 'subs.update': 'Обновить подписку',
+    'subs.title': 'Подписки', 'subs.name': 'Название', 'subs.url': 'URL',
+    'subs.preview': 'Проверить', 'subs.add': 'Добавить подписку', 'subs.refresh': 'Обновить',
+    'subs.interval': 'Интервал', 'subs.last': 'Обновлено', 'subs.never': 'ни разу',
+    'subs.empty': 'Подписок нет — добавьте URL выше', 'subs.hours': 'ч', 'subs.error': 'ошибка',
+    'subs.rejected': 'Отклонённые строки', 'subs.format': 'Формат',
+    'subs.forget.hint': 'Подписка перестанет обновляться по расписанию. Файл профиля останется — удалите его отдельно, если не нужен.',
+    'link.title': 'Импорт ссылок', 'link.text': 'Ссылки', 'link.name': 'Профиль',
+    'link.hint': 'Одна ссылка в строке: vless://, vmess://, ss://, trojan://, socks5://, http://. Битая строка не мешает остальным.',
     'geo.title': 'Geo-наборы', 'geo.update': 'Обновить', 'geo.count': 'Записей',
     'geo.updated': 'Обновлён', 'geo.preview': 'Показать',
     'geo.hint': 'Текстовые списки доменов и CIDR. Хранятся в /var/lib/proxy-for-ubuntu/geo.',
@@ -86,8 +94,16 @@ const I18N = {
     'rules.invalid': 'Configuration has errors', 'rules.applied': 'Changes applied',
     'rules.rolled': 'Changes were not applied, the system is unchanged',
     'profiles.title': 'Configuration profiles', 'profiles.import': 'Import', 'profiles.export': 'Export',
+    'profiles.addLink': 'Add a link',
     'profiles.builtin': 'built-in', 'profiles.active': 'active',
-    'subs.title': 'Subscriptions', 'subs.name': 'Name', 'subs.url': 'URL', 'subs.update': 'Update subscription',
+    'subs.title': 'Subscriptions', 'subs.name': 'Name', 'subs.url': 'URL',
+    'subs.preview': 'Check', 'subs.add': 'Add subscription', 'subs.refresh': 'Refresh',
+    'subs.interval': 'Interval', 'subs.last': 'Updated', 'subs.never': 'never',
+    'subs.empty': 'No subscriptions yet — add a URL above', 'subs.hours': 'h', 'subs.error': 'error',
+    'subs.rejected': 'Rejected lines', 'subs.format': 'Format',
+    'subs.forget.hint': 'The subscription stops refreshing on schedule. The profile file stays — delete it separately if not needed.',
+    'link.title': 'Import links', 'link.text': 'Links', 'link.name': 'Profile',
+    'link.hint': 'One link per line: vless://, vmess://, ss://, trojan://, socks5://, http://. A broken line does not stop the rest.',
     'geo.title': 'Geo sets', 'geo.update': 'Update', 'geo.count': 'Entries',
     'geo.updated': 'Updated', 'geo.preview': 'Show',
     'geo.hint': 'Plain-text domain and CIDR lists, stored in /var/lib/proxy-for-ubuntu/geo.',
@@ -200,6 +216,19 @@ function mock(method, params) {
       { name: 'default', builtin: true, updated_at: 1728200000 },
       { name: 'Работа', builtin: false, updated_at: 1728261234 },
     ] };
+    case 'profile.import_links': return { ok: true, name: params.name, accepted: 2, rejected: [], summary: 'принято 2, отклонено 0' };
+    case 'subscription.list': return { subscriptions: [
+      { name: 'Работа', url: 'https://sub.example.net/api/v1/client?token=demo', interval_hours: 24,
+        last_success_unix: 1728261234, last_attempt_unix: 1728261234, last_error: null, due: false },
+    ] };
+    case 'subscription.preview': return {
+      format: 'base64-link-list', accepted: 2, summary: 'принято 2, отклонено 1',
+      outbounds: [{ name: 'Немецкий сервер', type: 'vless' }, { name: 'Финский сервер', type: 'trojan' }],
+      rejected: [{ line: 3, code: 'E_LINK_MALFORMED', reason: 'строка не похожа на ссылку' }],
+    };
+    case 'subscription.apply': return { ok: true, name: params.name, accepted: 2, rejected: [], summary: 'принято 2, отклонено 0' };
+    case 'subscription.refresh': return { ok: true, name: params.name, accepted: 2, rejected: [], summary: 'принято 2, отклонено 0' };
+    case 'subscription.remove': return { ok: true, name: params.name };
     case 'log.tail': case 'log.search': return { entries: [
       { ts: Date.now() / 1000 | 0, level: 'info', target: 'engine::nft', message: 'правила применены' },
       { ts: Date.now() / 1000 | 0, level: 'warn', target: 'engine::geo', message: 'geo-набор cn не скачан' },
@@ -661,14 +690,126 @@ async function renderProfiles() {
   const list = r.profiles || [];
   if (!list.length) {
     tbl.innerHTML = `<tbody><tr><td class="empty">${esc(t('empty.profiles'))}</td></tr></tbody>`;
+  } else {
+    tbl.innerHTML = `<thead><tr><th>${esc(t('proxies.name'))}</th><th>${esc(t('proxies.status'))}</th><th></th></tr></thead><tbody>` +
+      list.map(p => `<tr><td>${esc(p.name)} ${p.builtin ? `<span class="badge">${esc(t('profiles.builtin'))}</span>` : ''}</td>
+        <td class="muted">${when(p.updated_at)}</td>
+        <td class="actions-cell"><button class="btn-primary sm" data-act="${esc(p.name)}">${esc(t('rule.policy'))}</button></td></tr>`).join('') +
+      '</tbody>';
+    $$('[data-act]', tbl).forEach(b => b.onclick = () => activateProfile(b.dataset.act));
+  }
+  renderSubs();
+}
+
+/** Только хост: в URL подписки бывает токен, и целиком его в список не тащим. */
+function hostOf(url) {
+  try { return new URL(url).host; } catch { return ''; }
+}
+
+async function renderSubs() {
+  const box = $('#subsTable');
+  if (!box) return;
+  const r = await rpc('subscription.list').catch(() => ({ subscriptions: [] }));
+  const list = r.subscriptions || [];
+  if (!list.length) {
+    box.innerHTML = `<tbody><tr><td class="empty">${esc(t('subs.empty'))}</td></tr></tbody>`;
     return;
   }
-  tbl.innerHTML = `<thead><tr><th>${esc(t('proxies.name'))}</th><th>${esc(t('proxies.status'))}</th><th></th></tr></thead><tbody>` +
-    list.map(p => `<tr><td>${esc(p.name)} ${p.builtin ? `<span class="badge">${esc(t('profiles.builtin'))}</span>` : ''}</td>
-      <td class="muted">${when(p.updated_at)}</td>
-      <td class="actions-cell"><button class="btn-primary sm" data-act="${esc(p.name)}">${esc(t('rule.policy'))}</button></td></tr>`).join('') +
-    '</tbody>';
-  $$('[data-act]', tbl).forEach(b => b.onclick = () => activateProfile(b.dataset.act));
+  box.innerHTML = `<thead><tr><th>${esc(t('proxies.name'))}</th><th>${esc(t('subs.interval'))}</th>
+      <th>${esc(t('subs.last'))}</th><th>${esc(t('proxies.status'))}</th><th></th></tr></thead><tbody>` +
+    list.map(s => `<tr>
+      <td><b>${esc(s.name)}</b><div class="muted" style="font-size:11.5px">${esc(hostOf(s.url))}</div></td>
+      <td class="num">${s.interval_hours} ${esc(t('subs.hours'))}</td>
+      <td class="muted">${s.last_success_unix ? when(s.last_success_unix) : esc(t('subs.never'))}</td>
+      <td>${s.last_error
+        ? `<span class="badge proxy">${esc(t('subs.error'))}</span><div class="muted" style="font-size:11.5px">${esc(s.last_error)}</div>`
+        : '<span class="badge direct">ok</span>'}</td>
+      <td class="actions-cell">
+        <button class="btn-ghost sm" data-sub-refresh="${esc(s.name)}">${esc(t('subs.refresh'))}</button>
+        <button class="btn-ghost sm" data-sub-forget="${esc(s.name)}">${esc(t('action.delete'))}</button>
+      </td></tr>`).join('') + '</tbody>';
+  $$('[data-sub-refresh]', box).forEach(b => b.onclick = () => refreshSub(b.dataset.subRefresh));
+  $$('[data-sub-forget]', box).forEach(b => b.onclick = () => forgetSub(b.dataset.subForget));
+}
+
+async function refreshSub(name) {
+  try {
+    const r = await rpc('subscription.refresh', { name });
+    toast(t('subs.refresh'), esc(name) + `<br>${esc(r.summary || '')}`, 'ok');
+    renderProfiles();
+  } catch (e) { toast(t('subs.error'), `${esc(name)}<br>${esc(e.message)}`, 'err'); renderSubs(); }
+}
+
+function forgetSub(name) {
+  modal(t('action.delete'), `<p>${esc(name)}</p><p class="hint">${esc(t('subs.forget.hint'))}</p>`, [
+    { label: t('action.cancel') },
+    { label: t('action.delete'), kind: 'btn-danger', action: async () => {
+        try {
+          await rpc('subscription.remove', { name });
+          toast(t('action.delete'), esc(name), 'ok');
+          renderSubs();
+        } catch (e) { toast(t('err.generic'), esc(e.message), 'err'); }
+      } },
+  ]);
+}
+
+/** Показывает, что придёт из подписки, до записи в профиль. */
+async function previewSubscription() {
+  const url = $('#subUrl').value.trim();
+  if (!url) { toast(t('subs.preview'), esc(t('subs.url')), 'warn'); return; }
+  try {
+    const r = await rpc('subscription.preview', { url });
+    const rows = (r.outbounds || []).map(o =>
+      `<tr><td>${esc(o.name)}</td><td><span class="badge">${esc(o.type)}</span></td></tr>`).join('');
+    const rejected = (r.rejected || []).length
+      ? `<details><summary>${esc(t('subs.rejected'))}: ${r.rejected.length}</summary>
+          <pre class="log">${esc(r.rejected.map(x => `${x.line}: ${x.code} ${x.reason}`).join('\n'))}</pre></details>`
+      : '';
+    modal(t('subs.preview'), `<p><b>${esc(r.summary || '')}</b> · ${esc(t('subs.format'))}: ${esc(r.format || '')}</p>
+      <div class="table-wrap"><table class="table"><tbody>${rows}</tbody></table></div>${rejected}`, [
+      { label: t('action.cancel') },
+      { label: t('subs.add'), kind: 'btn-primary', action: () => applySubscription() },
+    ]);
+  } catch (e) { toast(t('subs.error'), esc(e.message), 'err'); }
+}
+
+/** Запись подписки в профиль; имя — из поля или «subscription». */
+async function applySubscription() {
+  const url = $('#subUrl').value.trim();
+  if (!url) { toast(t('subs.add'), esc(t('subs.url')), 'warn'); return; }
+  try {
+    const r = await rpc('subscription.apply', {
+      name: $('#subName').value.trim() || 'subscription', url, auto_activate: false,
+    });
+    toast(t('subs.add'), esc(r.summary || ''), 'ok');
+    renderProfiles();
+  } catch (e) { toast(t('subs.error'), esc(e.message), 'err'); }
+}
+
+/** Импорт ссылок, вставленных вручную: по одной в строке. */
+function importLinks() {
+  modal(t('link.title'), `<div class="form-grid">
+      <label class="full"><span>${esc(t('link.text'))}</span>
+        <textarea id="l-text" rows="8" placeholder="vless://…&#10;vmess://…&#10;trojan://…"></textarea></label>
+      <label><span>${esc(t('link.name'))}</span><input id="l-name" value="imported" /></label>
+    </div>
+    <p class="hint">${esc(t('link.hint'))}</p>`, [
+    { label: t('action.cancel') },
+    { label: t('action.save'), kind: 'btn-primary', action: async () => {
+        const text = $('#l-text').value.trim();
+        if (!text) { toast(t('link.title'), esc(t('link.hint')), 'warn'); return; }
+        try {
+          const r = await rpc('profile.import_links', {
+            name: $('#l-name').value.trim() || 'imported', text,
+          });
+          const bad = (r.rejected || []).length
+            ? '<br>' + r.rejected.map(x => `${x.line}: ${esc(x.code)} ${esc(x.reason)}`).join('<br>')
+            : '';
+          toast(t('link.title'), esc(r.summary || '') + bad, (r.rejected || []).length ? 'warn' : 'ok');
+          renderProfiles();
+        } catch (e) { toast(t('link.title'), esc(e.message), 'err'); }
+      } },
+  ]);
 }
 
 async function activateProfile(name) {
@@ -894,6 +1035,7 @@ async function boot() {
   $('#addProxy').onclick = addProxy;
   $('#addRule').onclick = addRule;
   $('#validateRules').onclick = validateRules;
+  $('#importLink').onclick = importLinks;
   $('#importProfile').onclick = importProfile;
   $('#exportProfile').onclick = exportProfile;
   $('#runDoctor').onclick = runDoctor;
@@ -919,15 +1061,8 @@ async function boot() {
         await loadConfig(); renderOverview();
       } },
   ]);
-  $('#subUpdate').onclick = async () => {
-    try {
-      const r = await rpc('subscription.update', {
-        name: $('#subName').value.trim() || 'subscription', url: $('#subUrl').value.trim(), auto_activate: false,
-      });
-      toast(t('subs.update'), `outbound: ${r.outbounds_found}, правил: ${r.rules_found}`, 'ok');
-      renderProfiles();
-    } catch (e) { toast(t('err.generic'), esc(e.message), 'err'); }
-  };
+  $('#subPreview').onclick = previewSubscription;
+  $('#subUpdate').onclick = applySubscription;
   for (const [id, key] of [['tcpMode', 'tcp'], ['udpMode', 'udp'], ['dnsStrategy', 'strategy']]) {
     $(`#${id}`).onchange = e => {
       if (!state.config) return;

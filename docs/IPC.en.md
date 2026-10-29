@@ -171,6 +171,24 @@ profile.export ← { "name": "Work", "redact_secrets": true }
 `redact_secrets: true` replaces passwords, UUIDs, and private keys with
 `***REDACTED***` — for bug reports.
 
+### `profile.import_uri` / `profile.import_links`
+
+```json
+profile.import_uri   ← { "uri": "vless://…", "name": "Work" }
+                     → { "ok": true, "name": "Work", "outbound": { … }, "warnings": [ … ] }
+
+profile.import_links ← { "text": "vless://…\ntrojan://…", "name": "Work" }
+                     → { "ok": true, "name": "Work", "accepted": 2,
+                         "rejected": [ { "line": 2, "code": "E_LINK_MALFORMED", "reason": "…" } ],
+                         "summary": "accepted 2, rejected 1" }
+```
+
+`import_uri` takes a single link and returns the outbound that actually landed
+in the profile (a duplicate name is renamed). `import_links` takes a list, one
+link per line: a broken line does not cancel the import but appears in
+`rejected` with its line number. YAML is refused here (`E_LINKS_IS_YAML`) —
+use `profile.import` for a full config.
+
 ### `subscription.update`
 
 ```json
@@ -178,6 +196,45 @@ profile.export ← { "name": "Work", "redact_secrets": true }
     "auto_activate": true }
 → { "ok": true, "outbounds_found": 14, "rules_found": 87, "activated": true }
 ```
+
+Accepts a **full YAML config only** (base64 of it too). For link
+subscriptions use `subscription.preview` / `subscription.apply`.
+
+### `subscription.preview` / `subscription.apply`
+
+```json
+subscription.preview ← { "url": "https://…" }
+                     → { "format": "base64-link-list", "accepted": 14,
+                         "rejected": [ … ], "outbounds": [ … ],
+                         "summary": "accepted 14, rejected 1" }
+
+subscription.apply   ← { "url": "https://…", "name": "Work",
+                         "interval_hours": 24, "auto_activate": false }
+                     → { "ok": true, "name": "Work", "accepted": 14,
+                         "rejected": [ … ], "activated": false,
+                         "summary": "accepted 14, rejected 1" }
+```
+
+`preview` writes nothing: the user sees "accepted N, rejected M" before a
+subscription replaces the profile. `apply` writes the profile only after the
+whole body parsed, and records the entry in the registry (`last_success_unix`).
+
+### `subscription.list` / `subscription.refresh` / `subscription.remove`
+
+```json
+subscription.list    ← {}
+                     → { "subscriptions": [ { "name": "Work", "url": "https://…",
+                         "interval_hours": 24, "last_success_unix": 1793250000,
+                         "last_attempt_unix": 1793250000, "last_error": null,
+                         "due": false } ] }
+
+subscription.refresh ← { "name": "Work" }   → same as `subscription.apply`, registry updated
+subscription.remove  ← { "name": "Work" }   → { "ok": true, "name": "Work" }
+```
+
+`refresh` is the on-demand counterpart of the scheduler. On failure the profile
+is untouched and the reason goes to `last_error` without the URL or token.
+`remove` drops only the registry entry — the profile file stays.
 
 ### `log.tail` / `log.search` / `log.export`
 

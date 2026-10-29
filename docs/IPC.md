@@ -169,6 +169,24 @@ profile.export ← { "name": "Работа", "redact_secrets": true }
 `redact_secrets: true` заменяет пароли, UUID и private-ключи на
 `***REDACTED***` — для баг-репортов.
 
+### `profile.import_uri` / `profile.import_links`
+
+```json
+profile.import_uri   ← { "uri": "vless://…", "name": "Работа" }
+                     → { "ok": true, "name": "Работа", "outbound": { … }, "warnings": [ … ] }
+
+profile.import_links ← { "text": "vless://…\ntrojan://…", "name": "Работа" }
+                     → { "ok": true, "name": "Работа", "accepted": 2,
+                         "rejected": [ { "line": 2, "code": "E_LINK_MALFORMED", "reason": "…" } ],
+                         "summary": "принято 2, отклонено 1" }
+```
+
+`import_uri` — одна ссылка; в ответе тот outbound, который реально лёг в
+профиль (совпавшее имя переименовывается). `import_links` — список, одна
+ссылка в строке: битая строка не отменяет импорт, а попадает в `rejected`
+с номером строки. YAML в этом поле отклоняется (`E_LINKS_IS_YAML`) — для
+готового конфига есть `profile.import`.
+
 ### `subscription.update`
 
 ```json
@@ -176,6 +194,45 @@ profile.export ← { "name": "Работа", "redact_secrets": true }
     "auto_activate": true }
 → { "ok": true, "outbounds_found": 14, "rules_found": 87, "activated": true }
 ```
+
+Принимает только **YAML-конфиг целиком** (в том числе base64 от него). Для
+ссылочных подписок — `subscription.preview` / `subscription.apply`.
+
+### `subscription.preview` / `subscription.apply`
+
+```json
+subscription.preview ← { "url": "https://…" }
+                     → { "format": "base64-link-list", "accepted": 14,
+                         "rejected": [ … ], "outbounds": [ … ],
+                         "summary": "принято 14, отклонено 1" }
+
+subscription.apply   ← { "url": "https://…", "name": "Работа",
+                         "interval_hours": 24, "auto_activate": false }
+                     → { "ok": true, "name": "Работа", "accepted": 14,
+                         "rejected": [ … ], "activated": false,
+                         "summary": "принято 14, отклонено 1" }
+```
+
+`preview` ничего не пишет: пользователь видит «принято N, отклонено M» до
+того, как подписка заменит профиль. `apply` пишет профиль только после
+разбора всего тела и заносит запись в реестр (`last_success_unix`).
+
+### `subscription.list` / `subscription.refresh` / `subscription.remove`
+
+```json
+subscription.list    ← {}
+                     → { "subscriptions": [ { "name": "Работа", "url": "https://…",
+                         "interval_hours": 24, "last_success_unix": 1793250000,
+                         "last_attempt_unix": 1793250000, "last_error": null,
+                         "due": false } ] }
+
+subscription.refresh ← { "name": "Работа" }   → как `subscription.apply`, реестр обновлён
+subscription.remove  ← { "name": "Работа" }   → { "ok": true, "name": "Работа" }
+```
+
+`refresh` — обновление по кнопке: та же операция, что делает планировщик по
+сроку. При неудаче профиль не меняется, причина пишется в `last_error` без URL
+и токена. `remove` убирает только запись реестра — файл профиля остаётся.
 
 ### `log.tail` / `log.search` / `log.export`
 
