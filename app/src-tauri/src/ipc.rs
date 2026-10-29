@@ -118,6 +118,11 @@ impl Server {
         set_socket_permissions(&path)?;
         tracing::info!(socket = %path.display(), "IPC слушает");
 
+        // Планировщик обновления подписок (`REQ-005`). Живёт столько же,
+        // сколько сервер: отдельного места запуска в демоне не требуется.
+        let scheduler = self.clone();
+        tokio::spawn(async move { scheduler.subscription_loop().await });
+
         let me = self.clone();
         let mut last_log: Option<std::time::Instant> = None;
         loop {
@@ -230,7 +235,10 @@ impl Server {
             "profile.activate" => self.profile_activate(&params).await,
             "profile.import" => self.profile_import(&params),
             "profile.export" => self.profile_export(&params),
+            "profile.import_uri" => self.profile_import_uri(&params),
             "subscription.update" => self.subscription_update(&params).await,
+            "subscription.preview" => self.subscription_preview(&params).await,
+            "subscription.apply" => self.subscription_apply(&params, true).await,
             "log.tail" => self.log_tail(&params).await,
             "log.search" => self.log_search(&params).await,
             "log.export" => self.log_export(&params).await,
@@ -863,6 +871,249 @@ impl Server {
         }))
     }
 
+    /// Импорт одной ссылки (`REQ-003`): `vless://`, `vmess://`, `ss://`,
+    /// `trojan://`, `socks5://`, `http://`.
+    ///
+    /// Ссылка разбирается и проверяется **до** записи файла: невалидная строка
+    /// не должна оставлять после себя полупустой профиль.
+    fn profile_import_uri(&self, params: &Value) -> Result<Value> {
+        let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("imported");
+        let (path, builtin) = resolve_profile_path(name)?;
+        if builtin {
+            return Err(Error::Permission(format!(
+                "профиль {name:?} встроенный и не редактируется"
+            )));
+        }
+        let env = crate::config::read_env_file(&paths::env_file());
+        let base = load_or_empty_config(&path, &env)?;
+        let (cfg, outbound) = config_with_uri(base, uri)?;
+        let yaml = cfg.to_yaml()?;
+        paths::ensure_dir(&paths::user_profiles_dir())?;
+        paths::atomic_write(&path, yaml.as_bytes())?;
+
+        let mut warnings = Vec::new();
+        if outbound.is_experimental() {
+            warnings.push(format!(
+                "outbound {:?} не проверен на живом сервере",
+                outbound.name()
+            ));
+        }
+        Ok(json!({
+            "ok": true,
+            "name": name,
+            "outbound": outbound,
+            "warnings": warnings,
+        }))
+    }
+
+    /// Что придёт из подписки — без записи в профиль (`REQ-002`).
+    ///
+    /// Пользователь должен увидеть «принято N, отклонено M» до того, как
+    /// подписка заменит его рабочий конфиг.
+    async fn subscription_preview(&self, params: &Value) -> Result<Value> {
+        let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+        let body = fetch_subscription_body(url).await?;
+        let parsed = crate::subscription::parse_body(&body)
+            .map_err(|e| Error::ConfigInvalid(format!("{}: {e}", e.code())))?;
+
+        // YAML-подписка — это конфиг целиком, а не список ссылок: разбираем её
+        // тем же парсером, что и `subscription.update`.
+        let outbounds = if parsed.format == Some(crate::subscription::SubscriptionFormat::Yaml) {
+            let env = crate::config::read_env_file(&paths::env_file());
+            let cfg = Config::parse(&body, &env)?;
+            cfg.outbounds
+        } else {
+            parsed.outbounds.clone()
+        };
+        let rejected: Vec<Value> = parsed
+            .rejected
+            .iter()
+            .map(|r| json!({ "line": r.line, "code": r.code, "reason": r.reason }))
+            .collect();
+        Ok(json!({
+            "format": parsed.format.map(|f| f.as_str()).unwrap_or("unknown"),
+            "accepted": outbounds.len(),
+            "rejected": rejected,
+            "outbounds": outbounds,
+            "summary": format!("принято {}, отклонено {}", outbounds.len(), rejected.len()),
+        }))
+    }
+
+    /// Загрузка подписки и запись её в профиль (`REQ-002`).
+    ///
+    /// `remember=false` — вызов из планировщика: запись в реестр делает он сам,
+    /// иначе таймер перезаписал бы `last_error` собственным успехом.
+    async fn subscription_apply(self: &Arc<Self>, params: &Value, remember: bool) -> Result<Value> {
+        let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("subscription");
+        let (path, builtin) = resolve_profile_path(name)?;
+        if builtin {
+            return Err(Error::Permission(format!(
+                "профиль {name:?} встроенный и не редактируется"
+            )));
+        }
+        let env = crate::config::read_env_file(&paths::env_file());
+
+        // 1. Загрузка и разбор. Любая ошибка здесь оставляет профиль как был.
+        let body = fetch_subscription_body(url).await?;
+        let parsed = crate::subscription::parse_body(&body)
+            .map_err(|e| Error::ConfigInvalid(format!("{}: {e}", e.code())))?;
+        let (cfg, accepted) =
+            if parsed.format == Some(crate::subscription::SubscriptionFormat::Yaml) {
+                let cfg = Config::parse(&body, &env)?;
+                cfg.validate()?;
+                let found = cfg.outbounds.len();
+                (cfg, found)
+            } else {
+                let base = load_or_empty_config(&path, &env)?;
+                config_with_parsed(base, &parsed)?
+            };
+        let rejected: Vec<Value> = parsed
+            .rejected
+            .iter()
+            .map(|r| json!({ "line": r.line, "code": r.code, "reason": r.reason }))
+            .collect();
+
+        // 2. Запись. `to_yaml` считается до `atomic_write`: если сериализация
+        // упала, старый файл остаётся нетронутым.
+        let yaml = cfg.to_yaml()?;
+        paths::ensure_dir(&paths::user_profiles_dir())?;
+        paths::atomic_write(&path, yaml.as_bytes())?;
+
+        // 3. Реестр подписок: когда удалось в последний раз (`REQ-005`).
+        if remember {
+            let store = crate::subscription::store_path();
+            let mut records = crate::subscription::load_store(&store);
+            let interval = params
+                .get("interval_hours")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::subscription::DEFAULT_INTERVAL_HOURS);
+            let mut record = records
+                .iter()
+                .find(|r| r.name == name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::subscription::SubscriptionRecord::new(name, url, interval)
+                });
+            record.url = url.to_string();
+            if params
+                .get("interval_hours")
+                .and_then(Value::as_u64)
+                .is_some()
+            {
+                record.interval_hours = interval;
+            }
+            record.last_attempt_unix = now();
+            record.last_success_unix = now();
+            record.last_error = None;
+            crate::subscription::upsert_record(&mut records, record);
+            if let Err(e) = crate::subscription::save_store(&store, &records) {
+                tracing::warn!("реестр подписок не сохранён: {e}");
+            }
+        }
+
+        // 4. Активация — только по явной просьбе и только после успешной записи.
+        let mut activated = false;
+        if params
+            .get("auto_activate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let cfg = Config::load(&path, &env)?;
+            let report = self.supervisor.apply(cfg, "подписка").await;
+            activated = report.ok;
+            if report.ok {
+                let geo = GeoRegistry::load(&[]);
+                if let Ok(engine) = Engine::build(self.load_config()?.0, &geo) {
+                    engine
+                        .enabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    *self.engine.write().await = Some(engine);
+                }
+            }
+        }
+
+        Ok(json!({
+            "ok": true,
+            "name": name,
+            "accepted": accepted,
+            "rejected": rejected,
+            "activated": activated,
+            "summary": format!("принято {}, отклонено {}", accepted, rejected.len()),
+        }))
+    }
+
+    /// Обновляет подписки, у которых вышел срок (`REQ-005`).
+    ///
+    /// Ошибка одной подписки не мешает остальным и не меняет рабочий конфиг:
+    /// профиль пишется только после успешного разбора и валидации.
+    pub async fn refresh_due_subscriptions(self: &Arc<Self>) -> Result<()> {
+        let store = crate::subscription::store_path();
+        let mut records = crate::subscription::load_store(&store);
+        if records.is_empty() {
+            return Ok(());
+        }
+        let tick = now();
+        let mut due = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            if record.due(tick) {
+                due.push(index);
+            }
+        }
+        if due.is_empty() {
+            return Ok(());
+        }
+        for index in due {
+            let (url, name) = {
+                let r = &records[index];
+                (r.url.clone(), r.name.clone())
+            };
+            records[index].last_attempt_unix = tick;
+            let attempt = self
+                .subscription_apply(
+                    &json!({ "url": url, "name": name, "auto_activate": false }),
+                    false,
+                )
+                .await;
+            match attempt {
+                Ok(_) => {
+                    records[index].last_success_unix = tick;
+                    records[index].last_error = None;
+                }
+                Err(e) => {
+                    // Сообщение об ошибке может содержать URL подписки с
+                    // токеном — в реестр и журнал он попадать не должен.
+                    let reason = error_without_url(&e.to_string(), &url);
+                    records[index].last_error = Some(reason.clone());
+                    tracing::warn!(name = %name, "подписка не обновлена: {reason}");
+                }
+            }
+        }
+        crate::subscription::save_store(&store, &records)?;
+        Ok(())
+    }
+
+    /// Проверяет срок раз в минуту. Срок измеряется в часах, поэтому минута
+    /// опоздания ничего не меняет, а таймер почти не жжёт процессор.
+    async fn subscription_loop(self: Arc<Self>) {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(SUBSCRIPTION_TICK_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(e) = self.refresh_due_subscriptions().await {
+                tracing::warn!("обновление подписок по расписанию: {e}");
+            }
+        }
+    }
+
     async fn log_tail(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let lines = params.get("lines").and_then(Value::as_u64).unwrap_or(500) as usize;
         let level = params.get("level").and_then(Value::as_str);
@@ -986,6 +1237,10 @@ fn set_socket_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Как часто планировщик проверяет, не пора ли обновить подписку (`REQ-005`).
+/// Срок измеряется часами, поэтому минута проверки ничего не сдвигает.
+const SUBSCRIPTION_TICK_SECS: u64 = 60;
+
 fn resolve_profile_path(name: &str) -> Result<(PathBuf, bool)> {
     if name.is_empty() {
         return Err(Error::ConfigInvalid("имя профиля не указано".into()));
@@ -1002,6 +1257,116 @@ fn resolve_profile_path(name: &str) -> Result<(PathBuf, bool)> {
     // Такого профиля нет, но мы всё равно возвращаем безопасный путь для
     // записи: `profile.write` создаст файл.
     Ok((user, false))
+}
+
+/// Минимальный валидный конфиг: `DIRECT` обязателен, поэтому пустой список
+/// серверов сам по себе валидацию не проходит.
+const EMPTY_PROFILE_YAML: &str = "outbounds:\n  - name: DIRECT\n    type: direct\n";
+
+/// Заготовка профиля для первого импорта.
+///
+/// Строгая `Config::validate` считает конфиг без единого прокси ошибкой
+/// (`E_NO_OUTBOUND`) — это правильно перед применением, но неверно для файла,
+/// который мы собираемся наполнить. Поэтому здесь мягкая проверка.
+fn base_profile(env: &std::collections::HashMap<String, String>) -> Result<Config> {
+    let text = crate::config::expand_env(EMPTY_PROFILE_YAML, env);
+    let cfg: Config = serde_yaml::from_str(&text)
+        .map_err(|e| Error::ConfigInvalid(format!("заготовка профиля: {e}")))?;
+    cfg.validate_for_read()?;
+    Ok(cfg)
+}
+
+/// Загружает профиль, а если файла ещё нет — заготовку.
+/// Импорт первой ссылки/подписки не должен требовать «сначала создайте профиль».
+fn load_or_empty_config(
+    path: &Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<Config> {
+    if path.exists() {
+        Config::load(path, env)
+    } else {
+        base_profile(env)
+    }
+}
+
+/// Добавляет разобранную ссылку к конфигу. Чистая функция: файл пишет
+/// вызывающий, поэтому правило «сначала проверили, потом записали» видно в коде.
+fn config_with_uri(mut cfg: Config, uri: &str) -> Result<(Config, crate::config::Outbound)> {
+    let parsed = crate::link::parse(uri)
+        .map_err(|e| Error::ConfigInvalid(crate::subscription::rejection_note(&e)))?;
+    cfg.outbounds = crate::subscription::merge_outbounds(&cfg.outbounds, vec![parsed]);
+    cfg.validate()?;
+    // Возвращаем тот сервер, который реально лёг в конфиг: при совпадении имён
+    // `merge_outbounds` переименовывает копию, и GUI должен увидеть новое имя,
+    // а не исходное из ссылки.
+    let effective = cfg.outbounds.last().cloned().ok_or(Error::NoOutbound)?;
+    Ok((cfg, effective))
+}
+
+/// Добавляет к конфигу всё принятое из подписки. Если не принято ни одной
+/// ссылки — ошибка: пустая подписка не должна затирать рабочий профиль.
+fn config_with_parsed(
+    mut cfg: Config,
+    parsed: &crate::subscription::ParsedSubscription,
+) -> Result<(Config, usize)> {
+    if parsed.outbounds.is_empty() {
+        return Err(Error::ConfigInvalid(format!(
+            "E_SUB_NO_LINKS: ни одной ссылки не принято, отклонено {}",
+            parsed.rejected.len()
+        )));
+    }
+    let accepted = parsed.outbounds.len();
+    cfg.outbounds = crate::subscription::merge_outbounds(&cfg.outbounds, parsed.outbounds.clone());
+    cfg.validate()?;
+    Ok((cfg, accepted))
+}
+
+/// Загружает тело подписки: только http/https, только разумный размер.
+///
+/// Проверка схемы идёт **до** запроса: `file://` в поле URL — это чтение
+/// произвольного файла с правами демона (`REQ-013`).
+async fn fetch_subscription_body(url: &str) -> Result<String> {
+    crate::subscription::validate_url(url)
+        .map_err(|e| Error::ConfigInvalid(format!("{}: {e}", e.code())))?;
+    let client = crate::engine::http_client()?;
+    let response = client
+        .get(url.trim())
+        .send()
+        .await
+        .map_err(|e| Error::Internal(format!("загрузка подписки: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::Internal(format!("сервер подписки ответил {status}")));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| Error::Internal(format!("чтение подписки: {e}")))?;
+    if bytes.len() > crate::subscription::MAX_BODY_BYTES {
+        return Err(Error::ConfigInvalid(format!(
+            "E_SUB_TOO_LARGE: ответ подписки больше {} байт",
+            crate::subscription::MAX_BODY_BYTES
+        )));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| Error::ConfigInvalid("E_SUB_ENCODING: тело подписки не UTF-8".into()))
+}
+
+/// Убирает URL подписки из текста ошибки: в нём бывает токен, а `last_error`
+/// и журнал читает человек и `journalctl`.
+fn error_without_url(message: &str, url: &str) -> String {
+    let url = url.trim();
+    let cleaned = if url.is_empty() {
+        message.to_string()
+    } else {
+        message.replace(url, "<URL подписки>")
+    };
+    // Длинный ответ сервера тоже не нужен в реестре.
+    if cleaned.chars().count() > 300 {
+        cleaned.chars().take(300).collect::<String>() + "…"
+    } else {
+        cleaned
+    }
 }
 
 /// Имя профиля превращается в имя файла. Без этой проверки `../../.ssh/authorized_keys`
@@ -1087,6 +1452,162 @@ fn fd_usage() -> (usize, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Мини-сервер на localhost: один запрос — один ответ. Внешняя сеть не
+    /// трогается, поэтому тест годится и для машины, где живой сети нет.
+    async fn serve_once(body: String) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind localhost");
+        let addr = listener.local_addr().expect("адрес слушателя");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn preview_reports_partial_subscription() {
+        use base64::Engine as _;
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.net:443?security=tls#A\n\
+                   trojan://secret@203.0.113.4:443#B\n\
+                   мусор\n";
+        let body = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+        let addr = serve_once(body).await;
+        let server = Arc::new(Server::new());
+        let result = server
+            .handle(
+                "subscription.preview",
+                json!({ "url": format!("http://{addr}/sub") }),
+            )
+            .await
+            .expect("предпросмотр подписки");
+
+        assert_eq!(result["format"], "base64-link-list");
+        assert_eq!(result["accepted"], 2);
+        let rejected = result["rejected"].as_array().expect("rejected[]");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["line"], 3);
+        assert_eq!(result["summary"], "принято 2, отклонено 1");
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_file_scheme_before_any_request() {
+        let server = Arc::new(Server::new());
+        let err = server
+            .handle(
+                "subscription.preview",
+                json!({ "url": "file:///etc/shadow" }),
+            )
+            .await
+            .expect_err("file:// должен быть отклонён");
+        assert_eq!(err.code(), "E_CONFIG_INVALID");
+        assert!(err.to_string().contains("E_SUB_URL_SCHEME"), "{err}");
+    }
+
+    #[test]
+    fn uri_import_keeps_existing_outbounds_and_renames_duplicates() {
+        let env = std::collections::HashMap::new();
+        let base = base_profile(&env).expect("заготовка профиля");
+        let (cfg, outbound) = config_with_uri(
+            base,
+            "vless://11111111-1111-1111-1111-111111111111@example.net:443?security=tls#DIRECT",
+        )
+        .expect("импорт ссылки");
+        assert_eq!(cfg.outbounds.len(), 2, "старый сервер не должен исчезнуть");
+        assert_eq!(outbound.name(), "DIRECT (2)", "дубль имени переименован");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn uri_import_rejects_unsupported_scheme() {
+        let env = std::collections::HashMap::new();
+        let base = base_profile(&env).expect("заготовка профиля");
+        let err = config_with_uri(base, "gopher://example.net:70").expect_err("схема отклонена");
+        assert!(err.to_string().contains("E_LINK_SCHEME"), "{err}");
+    }
+
+    #[test]
+    fn empty_subscription_does_not_touch_the_profile() {
+        let env = std::collections::HashMap::new();
+        let base = base_profile(&env).expect("заготовка профиля");
+        let parsed = crate::subscription::parse_body("текст без единой ссылки").expect("тело");
+        let err = config_with_parsed(base, &parsed).expect_err("пустая подписка — ошибка");
+        assert!(err.to_string().contains("E_SUB_NO_LINKS"), "{err}");
+    }
+
+    #[test]
+    fn error_text_drops_the_subscription_url() {
+        let url = "https://example.net/sub?token=SECRET-TOKEN";
+        let text = error_without_url(
+            &format!("загрузка подписки: error sending request for url ({url})"),
+            url,
+        );
+        assert!(!text.contains("SECRET-TOKEN"), "токен утёк: {text}");
+        assert!(text.contains("<URL подписки>"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn apply_writes_profile_and_keeps_it_on_failure() {
+        // Свой каталог конфигурации: тест не должен трогать профили человека.
+        let dir = std::env::temp_dir().join(format!("pfu-ipc-apply-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.net:443?security=tls#A\n\
+                   trojan://secret@203.0.113.4:443#B\n";
+        let addr = serve_once(raw.to_string()).await;
+        let server = Arc::new(Server::new());
+        let result = server
+            .handle(
+                "subscription.apply",
+                json!({ "url": format!("http://{addr}/sub"), "name": "e2e" }),
+            )
+            .await
+            .expect("импорт подписки");
+        assert_eq!(result["accepted"], 2);
+        assert_eq!(result["activated"], false);
+
+        let profile = paths::user_profiles_dir().join("e2e.yaml");
+        let written = std::fs::read_to_string(&profile).expect("профиль записан");
+        assert!(written.contains("A") && written.contains("B"), "{written}");
+
+        // Реестр знает, когда обновление удалось в последний раз (REQ-005).
+        let store = crate::subscription::load_store(&crate::subscription::store_path());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store[0].name, "e2e");
+        assert!(store[0].last_success_unix > 0);
+
+        // Неудачная загрузка не меняет рабочий профиль и не двигает дату успеха.
+        let err = server
+            .handle(
+                "subscription.apply",
+                json!({ "url": "http://127.0.0.1:1/sub", "name": "e2e" }),
+            )
+            .await
+            .expect_err("недоступный сервер должен дать ошибку");
+        assert!(err.to_string().contains("загрузка подписки"), "{err}");
+        let after_failure = std::fs::read_to_string(&profile).expect("профиль на месте");
+        assert_eq!(written, after_failure, "рабочий конфиг изменился");
+        let store_after = crate::subscription::load_store(&crate::subscription::store_path());
+        assert_eq!(
+            store_after[0].last_success_unix, store[0].last_success_unix,
+            "дата успешного обновления сдвинулась после неудачи"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sanitize_name_blocks_traversal() {

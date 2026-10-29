@@ -12,12 +12,21 @@
 //! получает «принято N, отклонено M» с номерами строк и причинами, а не
 //! сообщение «подписка не разобрана».
 
+use std::path::{Path, PathBuf};
+
 use crate::config::Outbound;
 use crate::link::{self, LinkError};
 
 /// Ответ подписки ограничен: 1 МиБ. Реальная подписка на сотни серверов —
 /// десятки килобайт; всё, что больше, — либо ошибка, либо атака.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Длина URL подписки. Реальный URL — десятки байт; килобайт означает, что в
+/// поле вставили что-то не то.
+pub const MAX_URL_LEN: usize = 2048;
+
+/// Интервал обновления по умолчанию, часы (`REQ-005`: «по умолчанию 24 ч»).
+pub const DEFAULT_INTERVAL_HOURS: u64 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionFormat {
@@ -77,6 +86,14 @@ pub enum SubscriptionError {
     TooLarge,
     #[error("в подписке нет ни одной ссылки и это не YAML-конфиг")]
     NoLinks,
+    #[error("URL подписки не указан")]
+    UrlEmpty,
+    #[error("URL подписки длиннее {MAX_URL_LEN} байт")]
+    UrlTooLong,
+    #[error("подписка загружается только по http или https, а не {0:?}")]
+    UrlScheme(String),
+    #[error("в URL подписки нет адреса сервера")]
+    UrlNoHost,
 }
 
 impl SubscriptionError {
@@ -85,8 +102,36 @@ impl SubscriptionError {
             SubscriptionError::Empty => "E_SUB_EMPTY",
             SubscriptionError::TooLarge => "E_SUB_TOO_LARGE",
             SubscriptionError::NoLinks => "E_SUB_NO_LINKS",
+            SubscriptionError::UrlEmpty => "E_SUB_URL_EMPTY",
+            SubscriptionError::UrlTooLong => "E_SUB_URL_TOO_LONG",
+            SubscriptionError::UrlScheme(_) => "E_SUB_URL_SCHEME",
+            SubscriptionError::UrlNoHost => "E_SUB_URL_NO_HOST",
         }
     }
+}
+
+/// Проверка URL до сетевого запроса.
+///
+/// `file://` и `data:` здесь не «просто не поддерживаются»: подмена URL
+/// подписки на локальный файл — это чтение произвольного файла с правами root
+/// по команде из GUI. Схема проверяется до `reqwest`, а не после.
+pub fn validate_url(url: &str) -> Result<(), SubscriptionError> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(SubscriptionError::UrlEmpty);
+    }
+    if url.len() > MAX_URL_LEN {
+        return Err(SubscriptionError::UrlTooLong);
+    }
+    let parsed = url::Url::parse(url).map_err(|_| SubscriptionError::UrlScheme(url.to_string()))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(SubscriptionError::UrlScheme(other.to_string())),
+    }
+    if parsed.host_str().unwrap_or("").is_empty() {
+        return Err(SubscriptionError::UrlNoHost);
+    }
+    Ok(())
 }
 
 /// Похоже ли тело на YAML конфига proxy-for-ubuntu.
@@ -214,6 +259,97 @@ pub fn rejection_note(err: &LinkError) -> String {
     format!("{}: {}", err.code(), err)
 }
 
+// ───────────────────────── реестр подписок ─────────────────────────
+
+/// Что известно о подписке между запусками демона.
+///
+/// Без этой записи «обновление по расписанию» невозможно: после перезапуска
+/// демон не знает ни URL, ни когда обновление удалось в последний раз, и
+/// либо не обновляет ничего, либо обновляет всё при каждом старте.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubscriptionRecord {
+    /// Имя профиля, в который пишется подписка.
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_interval_hours")]
+    pub interval_hours: u64,
+    /// Unix-время последнего **успешного** обновления; 0 — ещё ни разу.
+    #[serde(default)]
+    pub last_success_unix: i64,
+    #[serde(default)]
+    pub last_attempt_unix: i64,
+    /// Причина последней неудачи — без URL с токеном и без секретов.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+fn default_interval_hours() -> u64 {
+    DEFAULT_INTERVAL_HOURS
+}
+
+impl SubscriptionRecord {
+    pub fn new(name: &str, url: &str, interval_hours: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            url: url.to_string(),
+            interval_hours: if interval_hours == 0 {
+                DEFAULT_INTERVAL_HOURS
+            } else {
+                interval_hours
+            },
+            last_success_unix: 0,
+            last_attempt_unix: 0,
+            last_error: None,
+        }
+    }
+
+    /// Пора ли обновлять. Ноль в `last_success_unix` — «ещё ни разу», значит
+    /// пора; интервал 0 трактуется как значение по умолчанию, а не как
+    /// «дёргать сервер на каждом витке таймера».
+    pub fn due(&self, now_unix: i64) -> bool {
+        if self.url.trim().is_empty() {
+            return false;
+        }
+        if self.last_success_unix <= 0 {
+            return true;
+        }
+        let interval = self.interval_hours.max(1) as i64;
+        now_unix.saturating_sub(self.last_success_unix) >= interval * 3600
+    }
+}
+
+/// Файл реестра подписок рядом с профилями пользователя.
+pub fn store_path() -> PathBuf {
+    crate::paths::user_profiles_dir().join("subscriptions.json")
+}
+
+/// Читает реестр. Битый или отсутствующий файл — пустой реестр, а не ошибка:
+/// сломанный реестр не должен мешать демону стартовать.
+pub fn load_store(path: &Path) -> Vec<SubscriptionRecord> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Записывает реестр атомарно (`tempfile` + `rename`).
+pub fn save_store(path: &Path, records: &[SubscriptionRecord]) -> crate::Result<()> {
+    if let Some(dir) = path.parent() {
+        crate::paths::ensure_dir(dir)?;
+    }
+    let text = serde_json::to_vec_pretty(records)?;
+    crate::paths::atomic_write(path, &text)
+}
+
+/// Вставляет запись или обновляет существующую с тем же именем. Одна
+/// подписка — один профиль, иначе два таймера пишут в один файл.
+pub fn upsert_record(records: &mut Vec<SubscriptionRecord>, record: SubscriptionRecord) {
+    match records.iter_mut().find(|r| r.name == record.name) {
+        Some(slot) => *slot = record,
+        None => records.push(record),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +446,105 @@ mod tests {
         let incoming = vec![link::parse(TROJAN).expect("trojan")];
         let merged = merge_outbounds(&existing, incoming);
         assert_eq!(merged[1].name(), "B");
+    }
+
+    #[test]
+    fn url_scheme_is_checked_before_the_request() {
+        assert!(validate_url("https://example.net/sub?token=abc").is_ok());
+        assert!(validate_url("http://127.0.0.1:8080/sub").is_ok());
+        // file:// — это чтение произвольного файла с правами демона.
+        for bad in [
+            "file:///etc/shadow",
+            "data:text/plain,vless://x",
+            "gopher://example.net/",
+            "",
+            "   ",
+            "https://",
+        ] {
+            let err = validate_url(bad).expect_err("схема должна быть отклонена");
+            assert!(
+                matches!(
+                    err,
+                    SubscriptionError::UrlScheme(_)
+                        | SubscriptionError::UrlEmpty
+                        | SubscriptionError::UrlNoHost
+                ),
+                "{bad:?} дал {err:?}"
+            );
+        }
+        let long = format!("https://example.net/{}", "a".repeat(MAX_URL_LEN));
+        assert_eq!(
+            validate_url(&long).unwrap_err().code(),
+            "E_SUB_URL_TOO_LONG"
+        );
+    }
+
+    #[test]
+    fn record_is_due_only_after_the_interval() {
+        let mut record = SubscriptionRecord::new("sub", "https://example.net/s", 24);
+        // Ни разу не обновлялась — обновляем при первой возможности.
+        assert!(record.due(1_000_000));
+        record.last_success_unix = 1_000_000;
+        assert!(!record.due(1_000_000));
+        assert!(!record.due(1_000_000 + 23 * 3600));
+        assert!(record.due(1_000_000 + 24 * 3600));
+        // Интервал из конфига уважается: 1 час — это не 24.
+        record.interval_hours = 1;
+        assert!(record.due(1_000_000 + 3600));
+        // Пустой URL — нечего обновлять, даже если срок вышел.
+        record.url = String::new();
+        assert!(!record.due(9_999_999));
+    }
+
+    #[test]
+    fn zero_interval_means_default_not_hammering() {
+        let record = SubscriptionRecord::new("sub", "https://example.net/s", 0);
+        assert_eq!(record.interval_hours, DEFAULT_INTERVAL_HOURS);
+    }
+
+    #[test]
+    fn store_roundtrip_and_upsert_by_name() {
+        let dir = std::env::temp_dir().join(format!("pfu-sub-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("subscriptions.json");
+
+        // Отсутствующий файл — пустой реестр, а не ошибка.
+        assert!(load_store(&path).is_empty());
+
+        let mut records = vec![SubscriptionRecord::new("sub", "https://a.example/1", 24)];
+        records[0].last_success_unix = 42;
+        upsert_record(
+            &mut records,
+            SubscriptionRecord::new("other", "https://b.example/2", 12),
+        );
+        assert_eq!(records.len(), 2);
+        save_store(&path, &records).expect("запись реестра");
+
+        let loaded = load_store(&path);
+        assert_eq!(loaded, records);
+        assert_eq!(loaded[0].last_success_unix, 42);
+
+        // Одно имя — одна запись: таймер не должен задваивать профиль.
+        let mut one = vec![SubscriptionRecord::new("sub", "https://a.example/1", 24)];
+        let mut replacement = SubscriptionRecord::new("sub", "https://a.example/9", 6);
+        replacement.last_success_unix = 77;
+        upsert_record(&mut one, replacement);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].url, "https://a.example/9");
+        assert_eq!(one[0].last_success_unix, 77);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn broken_store_does_not_stop_the_daemon() {
+        let dir = std::env::temp_dir().join(format!("pfu-sub-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("subscriptions.json");
+        std::fs::write(&path, "{ не json").expect("битый файл");
+        assert!(load_store(&path).is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
