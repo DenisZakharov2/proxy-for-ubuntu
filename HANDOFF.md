@@ -1,13 +1,15 @@
-# HANDOFF — proxy-for-ubuntu: статус на 26 октября 2026
+# HANDOFF — proxy-for-ubuntu: статус на 29 октября 2026
 
 Точка входа для следующей сессии. Всё, что ниже, проверено на этой машине;
 где не проверено — сказано прямо.
 
 - **Репозиторий:** https://github.com/DenisZakharov2/proxy-for-ubuntu
 - **Ветка:** `main`, рабочее дерево чистое
-- **HEAD:** `262008e` (`docs: бейдж 0.1.3 в README.en`); код релиза — `721d6d3`
+- **HEAD:** `a3f4405` (`fix(security): секреты вне Debug и логов, права 0600, umask демона`); код релиза — `721d6d3`
+- **База документации:** `a1613a4` (рабочие документы, материалы сессий 9–12) + `48ac264` (`feat(0.2.0)`: `link.rs`, `subscription.rs`, `test-outbound`, teardown без ложных ERROR) + `29861e2`, `144a99b`, `a3f4405` (сессия 13)
 - **Тег:** `v0.1.3` — на `721d6d3`, опубликован, `.deb` + `.sha256` в Release
-- **Версия кода:** 0.1.3; **установленный пакет:** 0.1.2 (релизный `.deb` 0.1.3 проверен, но не ставился)
+- **Версия кода:** 0.1.3 (0.2.0 в работе, тег не выставлен); **установленный пакет:** 0.1.2 (релизный `.deb` 0.1.3 проверен, но не ставился)
+- **Тесты:** `cargo test --lib` — **178** passed (139 до `48ac264`, 163 на `48ac264`, 175 на `29861e2`, 178 на `a3f4405`)
 - **История по сессиям:** `PROGRESS_2026-10-26.md` (§9 — сессия 10, §10 — сессия 11, §11 — сессия 12), `SESSION_SUMMARY.md` (сессии 1–8), `материалы сессии 12/README.md`
 
 ---
@@ -20,11 +22,15 @@
 3. Восстановить клон, если его нет: `git clone`, `git checkout main` — нужен
    GitHub-токен, попросить у пользователя.
 4. Базовый регресс: `cargo fmt --all -- --check`,
-   `cargo clippy --all-targets -- -D warnings`, `cargo test` (ожидается 139).
-5. Начать с §7.2 — e2e-проверка `vless`/`vmess` через наш outbound, не требует
-   TUN; альтернатива — TUN (§7.3), но это 3–4 сессии.
+   `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (ожидается 178).
+5. Начать с §7.2 — переключение `protocols.yml` на `pfu-cli test-outbound`
+   (сам инструмент готов, CI-шаг — нет); TUN (§7.3) — 3–4 сессии.
 6. После релиза обновить §2, §4 и §7 этого файла — он должен оставаться
    актуальным, а не превращаться в историю.
+7. Фабрика `pfu-1-0` (`/home/anony/autonomous-sw-factory`): состояние и
+   принятые задачи — §2.4. Полный `factory verify --stage s4_build` запускать
+   только когда приняты все 13 задач, иначе он красный на несделанных
+   `deliverable.md` и это не дефект.
 
 ---
 
@@ -44,7 +50,7 @@
 | TUN (`pfu0`) | Не реализован (поле в конфиге есть) |
 | Статистика по правилам | **Работает**: `metrics.live` отдаёт `active_rules` и `by_outbound`, проверено TCP и UDP |
 | Протоколы | direct, http, socks5/socks5h, shadowsocks, trojan, ssh — рабочие; vless/vmess — **не проверены end-to-end** |
-| GUI (Tauri) | 7 экранов, реальный IPC, без моков; на живом рабочем столе в этих сессиях не запускался |
+| GUI (Tauri) | 7 экранов, реальный IPC, без моков; проверено в headless Chromium (`--dump-dom`) на демо-данных: рендер, тумблер, форма, валидация. На живом рабочем столе не запускалось |
 | Web UI (`pfu-web`) | Реализован (вариант Б: 127.0.0.1 → Unix-сокет демона) |
 | CLI (`pfu-cli`) | status/connect/disconnect/doctor/config/rules/proxies/metrics/geo/logs/apply/validate/version |
 | Geo-наборы | Обновление по кнопке и по расписанию (`geo.auto_update`) |
@@ -110,6 +116,28 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
 сборка 22.04.
 
 ---
+
+### 2.4 Сессия 13 (29.10.2026): 0.2.0 в работе, фабрика `pfu-1-0`
+
+Не запушено, только локальные коммиты на `main`:
+
+| Коммит | Что |
+|---|---|
+| `a1613a4` | рабочие документы: `HANDOFF`, `PROGRESS`, `SESSION_SUMMARY`, `материалы сессий 9–12` |
+| `48ac264` | `feat(0.2.0)`: `link.rs` (vless/vmess/ss SIP002+legacy/trojan/socks5/http, reality и grpc отклоняются с причиной), `subscription.rs` (YAML / список / base64, `rejected[]` с номерами строк), `pfu-cli test-outbound` + `outbound::http_check`, teardown без ложных ERROR на отсутствующей FIB-таблице. 163 теста (было 139) |
+| `29861e2` | IPC импорта: `profile.import_uri`, `subscription.preview`, `subscription.apply`, реестр `subscriptions.json`, планировщик обновления в `Server::serve`. 175 тестов |
+| `144a99b` | GUI: хелпер `ipc` → `rpc` (WRY ставит свой `window.ipc`, из-за чего окно в поставочной сборке оставалось мёртвым), `enabled` из `daemon.status`, `engine_loaded` в окне, транспорт `tcp/ws` у vless/vmess, проверка формы до сохранения |
+| `a3f4405` | безопасность: `Debug` для `Outbound` редактирует пароли/UUID/passphrase, `${VAR}` без значения — ошибка разбора, `env`/`config.yaml` 0600 root при каждом `configure`, `UMask=0077` и `RestrictAddressFamilies` в юните. 178 тестов |
+
+Состояние фабрики (`/home/anony/autonomous-sw-factory`, прогон `pfu-1-0`,
+режим brownfield, 56 событий в журнале):
+
+- приняты: `TASK-001` (ссылки и подписки), `TASK-002` (IPC), `TASK-003` (GUI),
+  `TASK-005` (teardown), `TASK-011` (безопасность);
+- открыт: `TASK-004` — `protocols.yml` не переключён на `test-outbound`
+  (инструмент готов, нужен прогон workflow);
+- ждут очереди: `TASK-006`…`TASK-010`, `TASK-012`, `TASK-013` (TUN, DNS, IPv6,
+  apt-репозиторий, документация, netns-стенд, приёмка).
 
 ## 3. Машина и окружение (важно для следующей сессии)
 
@@ -244,17 +272,19 @@ ip route replace local default dev lo table 100
 Порты — константы в `app/src-tauri/src/paths.rs` (`redirect_port()` 15000,
 `tproxy_port()` 15001).
 
-### 5.3 Код (размеры на 26.10.2026)
+### 5.3 Код (размеры на 29.10.2026)
 
 | Файл | Строк | Что |
 |---|---:|---|
 | `app/src-tauri/src/engine/capture.rs` | 541 | TCP/UDP-слушатели, потоки, отмена, breakdown |
-| `app/src-tauri/src/engine/nft.rs` | 515 | план правил, apply/teardown |
+| `app/src-tauri/src/engine/nft.rs` | 551 | план правил, apply/teardown, `is_missing_table_error` |
 | `app/src-tauri/src/engine/router.rs` | 659 | Engine, выбор outbound, relay, лимиты |
 | `app/src-tauri/src/engine/stats.rs` | 153 | счётчики и breakdown |
-| `app/src-tauri/src/config.rs` | 1662 | схема YAML, валидация |
-| `app/src-tauri/src/ipc.rs` | 1205 | JSON-RPC, диагностика, apply/rollback |
-| `app/ui/app.js` / `index.html` / `style.css` | 895 / 254 / 293 | GUI: 7 экранов, 19 IPC-методов |
+| `app/src-tauri/src/link.rs` | 665 | разбор `vless/vmess/ss/trojan/socks5/http` в `Outbound` |
+| `app/src-tauri/src/subscription.rs` | 550 | тело подписки, `rejected[]`, реестр и срок обновления |
+| `app/src-tauri/src/config.rs` | 1862 | схема YAML, валидация, `missing_env_refs`, редактирующий `Debug` |
+| `app/src-tauri/src/ipc.rs` | 1726 | JSON-RPC, импорт ссылок и подписок, apply/rollback |
+| `app/ui/app.js` / `index.html` / `style.css` | 944 / 255 / 297 | GUI: 7 экранов, хелпер `rpc`, проверка формы сервера |
 
 Модули движка: `engine/{nft,capture,router,rules,stats,geo,dns,tls}.rs`,
 outbound'ы — `engine/outbound/*`.
@@ -357,14 +387,16 @@ README и пустая матрица — честные.
 - GUI ни разу не запускался на живом рабочем столе в сессиях 9–12
   (проверялись только `node --check`, сборка пакета и IPC-контракт).
 
-### 6.9 `teardown` на первом старте пишет ERROR — P2
+### 6.9 `teardown` на первом старте пишет ERROR — исправлено в `48ac264`
 
 Если таблица 100 ещё ни разу не создавалась, `ip route flush table 100`
-завершается с «FIB table does not exist», и `teardown` возвращает ошибку
-(две строки ERROR в журнале при старте демона). Работе не мешает; лечится
-терпимостью к этой ошибке в `remove_route_table` (`nft.rs:281`). Замечено
-живым прогоном сессии 12; в 0.1.3 не правилось, чтобы не менять teardown
-перед релизом.
+завершается с «FIB table does not exist», и `teardown` возвращал ошибку
+(две строки ERROR в журнале при старте демона). Исправлено: правило вынесено
+в `is_missing_table_error` (`nft.rs`), любая другая ошибка `ip route flush`
+по-прежнему считается сбоем. Покрыто тестами
+`missing_fib_table_is_not_a_teardown_failure` и
+`real_teardown_errors_are_still_failures`. Живой первый старт в свежем netns
+не воспроизводился — проверка правила unit-тестом, живая — в `TASK-012`/`TASK-013`.
 
 ---
 
@@ -384,11 +416,17 @@ README и пустая матрица — честные.
 
 ### 7.2 0.2.0 — честная проверка протоколов (1–2 сессии)
 
-- `pfu-cli test-outbound` / интеграционный тест: реальный HTTP-обмен через
-  `engine::outbound`, а не сырые байты в порт.
+- ~~`pfu-cli test-outbound` / `http_check`: реальный HTTP-обмен через
+  `engine::outbound`, а не сырые байты в порт~~ — **сделано** `48ac264`,
+  проверено вручную: без конфига и на несуществующем файле команда возвращает
+  `1` с внятным сообщением, `help` показывает строку и пример.
 - `protocols.yml`: заменить шаги на новый тест, закрепить образ Xray по digest.
+  **Не сделано** (`TASK-004` в фабрике): живой прогон workflow здесь недоступен.
 - Снять ⚠ с vless/vmess **только если тест прошёл**; заполнить матрицу
   (сервер, версия, дата); закрыть issue #2.
+- Импорт ссылок и подписок: парсер `48ac264`, IPC `29861e2`, GUI-форма
+  ручного ввода `144a99b`. Не подключено в GUI: вставка ссылки и URL
+  подписки, кнопка «обновить по кнопке» (IPC-методы уже есть).
 
 ### 7.3 0.3.0 — TUN и локальный UDP (3–4 сессии)
 
@@ -401,7 +439,7 @@ README и пустая матрица — честные.
 
 ### 7.4 0.1.4 — мелкое (можно вместе с 0.2.0)
 
-- Убрать ERROR из `teardown` на первом старте (§6.9).
+- ~~Убрать ERROR из `teardown` на первом старте (§6.9)~~ — сделано в `48ac264`.
 - Дописать в `CONFIG.md`/`IPC.md`, что `metrics.connections` — активные
   соединения (§6.8).
 - При случае прогнать GUI и `pfu-web` на живом рабочем столе.
