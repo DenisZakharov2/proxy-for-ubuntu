@@ -119,6 +119,124 @@ fn humantime(d: Duration) -> String {
     format!("{:.0} мс", d.as_millis())
 }
 
+/// Результат сквозной проверки outbound'а.
+///
+/// Отличается от [`ProbeResult`] принципиально: `probe` доказывает только то,
+/// что соединение открылось. Здесь через протокол уходит настоящий HTTP-запрос
+/// и проверяется настоящий ответ. Именно этой проверки не хватало CI: старый
+/// `protocols.yml` стучался в порт Xray мимо нашего кода и оставался зелёным,
+/// даже если `vless` сломан.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HttpCheckResult {
+    pub ok: bool,
+    pub target: String,
+    pub status: Option<u16>,
+    pub bytes: usize,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Отправляет `GET` через `ob` и проверяет, что ответ действительно пришёл.
+///
+/// Поддержан только `http://`. `https://` требует TLS-обёртки поверх тоннеля;
+/// её здесь нет намеренно: имитировать TLS «как получится» — значит снова
+/// получить зелёную проверку, которая ничего не проверяет. Для https нужен
+/// отдельный шаг с настоящим TLS-клиентом.
+pub async fn http_check(ob: &dyn Outbound, url: &str, timeout: Duration) -> HttpCheckResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let started = Instant::now();
+    let mut result = HttpCheckResult {
+        ok: false,
+        target: url.to_string(),
+        status: None,
+        bytes: 0,
+        latency_ms: 0,
+        error: None,
+    };
+
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => {
+            result.error = Some(format!("некорректный URL: {e}"));
+            return result;
+        }
+    };
+    if parsed.scheme() != "http" {
+        result.error = Some(format!(
+            "поддержан только http://; для https нужна TLS-обёртка, которой у проверки нет (схема {:?})",
+            parsed.scheme()
+        ));
+        return result;
+    }
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        result.error = Some("в URL нет хоста".into());
+        return result;
+    };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pfu-test-outbound/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        crate::VERSION
+    );
+
+    let mut stream =
+        match tokio::time::timeout(timeout, ob.connect(&Request::tcp(host.clone(), port))).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                result.error = Some(format!("соединение через {} не открылось: {e}", ob.name()));
+                return result;
+            }
+            Err(_) => {
+                result.error = Some(format!("нет соединения за {}", humantime(timeout)));
+                return result;
+            }
+        };
+
+    if let Err(e) = stream.write_all(request.as_bytes()).await {
+        result.error = Some(format!("запрос не отправлен: {e}"));
+        return result;
+    }
+    if let Err(e) = stream.flush().await {
+        result.error = Some(format!("сброс буфера не удался: {e}"));
+        return result;
+    }
+
+    let mut buf = vec![0u8; 8192];
+    let read = match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            result.error = Some(format!("ответ не прочитан: {e}"));
+            return result;
+        }
+        Err(_) => {
+            result.error = Some(format!("ответ не пришёл за {}", humantime(timeout)));
+            return result;
+        }
+    };
+    result.bytes = read;
+    result.latency_ms = started.elapsed().as_millis() as u64;
+
+    let head = String::from_utf8_lossy(&buf[..read]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok());
+    result.status = status;
+    match status {
+        Some(code) if (200..400).contains(&code) => result.ok = true,
+        Some(code) => result.error = Some(format!("сервер ответил {code}")),
+        None => result.error = Some("ответ не похож на HTTP".into()),
+    }
+    result
+}
+
 /// Подключается к серверу прокси с таймаутом и корректным поведением при
 /// недоступности: без этого `connect()` может висеть минуту на SYN к
 /// недоступному адресу, и Apply «зависнет» вместо отката.

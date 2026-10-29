@@ -56,6 +56,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         "geo" => simple("geo.list", serde_json::json!({})),
         "logs" => simple("log.tail", serde_json::json!({ "lines": 200 })),
         "validate" => config_validate(),
+        "test-outbound" => test_outbound(&args[1..]),
         "profile-export" => profile_export(&args[1..]),
         "apply" => {
             // Конфиг читается из stdin: `pfu-cli apply < config.yaml`
@@ -87,13 +88,95 @@ fn print_help() {
            geo                        список geo-наборов (geo update — обновить)\n  \
            logs                       последние строки журнала\n  \
            apply                      применить конфиг из stdin\n  \
+           test-outbound              проверить протокол настоящим HTTP-запросом\n  \
            version                    версия\n\
          \n\
          Примеры:\n  \
            sudo pfu-cli connect\n  \
-           pfu-cli config > my.yaml && $EDITOR my.yaml && sudo pfu-cli apply < my.yaml",
+           pfu-cli config > my.yaml && $EDITOR my.yaml && sudo pfu-cli apply < my.yaml\n  \
+           pfu-cli test-outbound --config my.yaml --name vless-1 --url http://example.com/",
         pfu::VERSION
     );
+}
+
+/// Сквозная проверка протокола: настоящий HTTP-запрос через выбранный outbound.
+///
+/// Демон для этого не нужен: конфиг читается с диска, outbound собирается в
+/// этом процессе. Так проверку можно запускать в CI и на машине без root.
+fn test_outbound(args: &[String]) -> Result<ExitCode> {
+    let mut config_path: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut url = "http://example.com/".to_string();
+    let mut timeout_ms: u64 = 5000;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                config_path = args.get(index).cloned();
+            }
+            "--name" => {
+                index += 1;
+                name = args.get(index).cloned();
+            }
+            "--url" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    url = value.clone();
+                }
+            }
+            "--timeout-ms" => {
+                index += 1;
+                timeout_ms = args
+                    .get(index)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(5000);
+            }
+            other => {
+                return Err(Error::ConfigInvalid(format!(
+                    "неизвестный аргумент {other:?}; поддержаны --config, --name, --url, --timeout-ms"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let config_path =
+        config_path.ok_or_else(|| Error::ConfigInvalid("нужен --config <path>".into()))?;
+    let name = name.ok_or_else(|| Error::ConfigInvalid("нужен --name <outbound>".into()))?;
+
+    let env = pfu::config::read_env_file(&pfu::paths::env_file());
+    let cfg = pfu::config::Config::load(std::path::Path::new(&config_path), &env)?;
+    let outbound_cfg = cfg
+        .outbounds
+        .iter()
+        .find(|outbound| outbound.name() == name)
+        .ok_or_else(|| {
+            let available: Vec<&str> = cfg.outbounds.iter().map(|o| o.name()).collect();
+            Error::NotFound(format!(
+                "outbound {name:?} не найден; в конфиге: {}",
+                available.join(", ")
+            ))
+        })?;
+
+    let outbound = pfu::engine::outbound::build(outbound_cfg)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    let result = rt.block_on(pfu::engine::outbound::http_check(
+        outbound.as_ref(),
+        &url,
+        std::time::Duration::from_millis(timeout_ms),
+    ));
+    println!("{}", serde_json::to_string_pretty(&result)?);
+
+    Ok(if result.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn crate_version() -> &'static str {

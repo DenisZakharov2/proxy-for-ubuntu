@@ -279,10 +279,25 @@ async fn remove_ip_rules(failures: &mut Vec<String>) {
 }
 
 async fn remove_route_table(failures: &mut Vec<String>) {
-    // `ip route flush` на пустой таблице завершается успешно.
+    // На системе, где таблица 100 ещё ни разу не создавалась, ядро отвечает
+    // «Error: ipv4: FIB table does not exist». Это не сбой очистки: удалять
+    // нечего. Раньше такая строка попадала в журнал как ERROR при каждом
+    // первом старте демона и обесценивала диагностику.
     if let Err(e) = run_sh(&format!("ip route flush table {ROUTE_TABLE}")).await {
+        let text = e.to_string();
+        if is_missing_table_error(&text) {
+            return;
+        }
         failures.push(format!("ip route flush table {ROUTE_TABLE}: {e}"));
     }
+}
+
+/// Отличает «таблицы ещё нет» от настоящей ошибки. Вынесено отдельно, чтобы
+/// правило проверялось тестом без root и без реального `ip route`.
+fn is_missing_table_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("fib table does not exist")
+        || (lower.contains("table does not exist") && lower.contains("ipv4"))
 }
 
 async fn remove_nft_table(failures: &mut Vec<String>) {
@@ -511,5 +526,26 @@ mod tests {
         c.intercept.bypass_private = false;
         let plan = build_plan(&c);
         assert!(!plan.ruleset.contains("@private_ips"));
+    }
+
+    #[test]
+    fn missing_fib_table_is_not_a_teardown_failure() {
+        // Точный текст ядра на системе, где таблица 100 ещё не создавалась.
+        assert!(is_missing_table_error(
+            "ip route flush table 100: Error: ipv4: FIB table does not exist."
+        ));
+        assert!(is_missing_table_error("FIB table does not exist"));
+        assert!(is_missing_table_error("ipv4: table does not exist"));
+    }
+
+    #[test]
+    fn real_teardown_errors_are_still_failures() {
+        assert!(!is_missing_table_error("Operation not permitted"));
+        assert!(!is_missing_table_error(
+            "RTNETLINK answers: Invalid argument"
+        ));
+        // «таблица не существует» без ipv4 — не наш случай, такое молча
+        // проглатывать нельзя.
+        assert!(!is_missing_table_error("table does not exist"));
     }
 }
