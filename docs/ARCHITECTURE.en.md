@@ -238,15 +238,26 @@ there.
 
 ### 6.3 DNS
 
-The built-in resolver (`engine/dns.rs`: TTL cache, parallel A/AAAA,
-fallback) is wired into the engine and used by the health check and the
-protocols, but **local DNS is not intercepted** — it is local UDP (see 6.1)
-and goes through the system resolver. `dns.strategy` (`fake-ip`,
-`redir-host`) does not affect local queries yet; `fake-ip` does not work in
-the current scheme.
+With TUN (`tun.enabled: true`) DNS is intercepted: a datagram to any external
+`:53` lands in `pfu0`, is parsed by the userspace stack and leaves as an
+ordinary UDP flow through the outbound chosen by the rules. The answer is
+returned to the application unchanged — this is `redir-host`, and the
+application sees the real address.
 
-Hostnames are not lost where it matters: `socks5h`, `vless`, `vmess` and
-`trojan` pass the hostname to the proxy, and the proxy resolves it.
+The main side effect: A/AAAA records are taken from the answer, and
+`engine/dns.rs` remembers "IP → domain" for `cache_ttl` seconds. Before a
+decision is made, `Engine::enrich_domain` puts the name into `Flow`, so
+`DOMAIN`, `DOMAIN-SUFFIX` and `GEOSITE` rules apply to a connection the
+application opens by address (TUN TCP/UDP and redirected TCP).
+
+`fake-ip` is not implemented and is rejected by validation: a setting that
+silently does nothing is worse than a refusal. `HIJACK-DNS` in the rules means
+"answer it ourselves": the resolver resolves the name locally (system
+resolver, then DoH with pinned addresses) and builds an A/AAAA answer; the
+query never leaves the machine.
+
+Hostnames are also preserved where DNS is not involved: `socks5h`, `vless`,
+`vmess` and `trojan` pass the hostname to the proxy, and the proxy resolves it.
 
 ### 6.4 Apply and rollback
 

@@ -107,7 +107,7 @@ log:
   level: info
   journal: true
 dns:
-  strategy: fake-ip
+  strategy: redir-host
   servers: [1.1.1.1, 8.8.8.8]
   fallback: [9.9.9.9, 1.0.0.1]
 intercept:
@@ -125,6 +125,26 @@ YAML
             fi
             chown root:"$PFU_GROUP" /etc/proxy-for-ubuntu/config.yaml
             chmod 0640 /etc/proxy-for-ubuntu/config.yaml
+        fi
+
+        # ── миграция dns.strategy ─────────────────────────────────────────
+        # До 0.3.0 `fake-ip` был значением по умолчанию и ничего не делал.
+        # Теперь он отклоняется валидацией: без правки существующий конфиг
+        # перестал бы применяться после обновления, и прокси «сломался» бы у
+        # того, кто просто поставил новый пакет. Меняем значение на
+        # работающее и оставляем копию, чтобы правку можно было отменить.
+        if [ -f /etc/proxy-for-ubuntu/config.yaml ] &&
+           grep -qE '^[[:space:]]*strategy:[[:space:]]*fake-ip' \
+               /etc/proxy-for-ubuntu/config.yaml; then
+            if [ ! -f /etc/proxy-for-ubuntu/config.yaml.pre-0.3.0 ]; then
+                cp -p /etc/proxy-for-ubuntu/config.yaml \
+                      /etc/proxy-for-ubuntu/config.yaml.pre-0.3.0
+                chown root:root /etc/proxy-for-ubuntu/config.yaml.pre-0.3.0
+                chmod 0600 /etc/proxy-for-ubuntu/config.yaml.pre-0.3.0
+            fi
+            sed -i -E 's/^([[:space:]]*strategy:[[:space:]]*)fake-ip/\1redir-host/' \
+                /etc/proxy-for-ubuntu/config.yaml
+            echo "proxy-for-ubuntu: dns.strategy fake-ip → redir-host (копия: config.yaml.pre-0.3.0)"
         fi
 
         # ── env-файл для секретов ─────────────────────────────────────────

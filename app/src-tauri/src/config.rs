@@ -248,12 +248,11 @@ impl Config {
             }
         }
 
-        if self.dns.strategy == DnsStrategy::FakeIp
-            && self.intercept.udp == UdpMode::Off
-            && !self.tun.enabled
-        {
+        if self.dns.strategy == DnsStrategy::FakeIp {
             return Err(Error::ConfigInvalid(
-                "dns.strategy: fake-ip требует перехвата UDP (intercept.udp: tproxy или tun.enabled)"
+                "dns.strategy: fake-ip не реализован — используйте redir-host: \
+                 приложению возвращается настоящий адрес, а домен восстанавливается \
+                 из перехваченных DNS-ответов"
                     .into(),
             ));
         }
@@ -389,13 +388,14 @@ impl Default for LogConfig {
 #[serde(rename_all = "kebab-case")]
 #[derive(Default)]
 pub enum DnsStrategy {
-    /// Выдаёт синтетический 198.18.0.0/16 и держит маппинг имя↔IP в демоне.
-    /// Самая надёжная схема против утечек, но ломает `ping` и GeoIP-правила
-    /// по реальному адресу.
-    #[default]
+    /// Синтетический 198.18.0.0/16 — **не реализовано**. Значение осталось
+    /// в схеме, чтобы старый конфиг получил внятную ошибку с указанием на
+    /// `redir-host`, а не «unknown variant».
     FakeIp,
-    /// Перехватывает DNS и подставляет реальный адрес. Совместимо, но при
-    /// кэшировании на стороне клиента возможна утечка через CNAME.
+    /// Перехватывает DNS и отдаёт настоящий адрес; соответствие «IP → домен»
+    /// демон берёт из самих ответов и применяет доменные правила к
+    /// последующим соединениям.
+    #[default]
     RedirHost,
 }
 
@@ -1655,7 +1655,7 @@ outbounds:
     }
 
     #[test]
-    fn dns_fake_ip_accepts_tun_as_udp_capture() {
+    fn fake_ip_is_rejected_with_hint_to_redir_host() {
         let yaml = r#"
 dns:
   strategy: fake-ip
@@ -1668,9 +1668,13 @@ outbounds:
   - {name: DIRECT, type: direct}
   - {name: X, type: http, server: a, port: 80}
 "#;
-        // fake-ip пока не реализован, но требование «нужен перехват UDP»
-        // выполнено: TUN ловит локальный UDP.
-        Config::parse(yaml, &HashMap::new()).unwrap();
+        // Настройка, которая ничего не делает, хуже отказа: fake-ip не
+        // реализован, и конфиг обязан это сказать, а не притворяться.
+        let err = Config::parse(yaml, &HashMap::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("redir-host"),
+            "в ошибке нет подсказки: {err}"
+        );
     }
 
     #[test]
@@ -1821,12 +1825,24 @@ intercept: {tcp: tproxy}
 outbounds:
   - {name: DIRECT, type: direct}
   - {name: S, type: socks5h, server: 1.2.3.4, port: 1080}
-dns: {strategy: fake-ip}
+dns: {strategy: redir-host}
 intercept: {udp: tproxy}
 "#;
         let c = Config::parse(yaml, &HashMap::new()).unwrap();
-        assert_eq!(c.dns.strategy, DnsStrategy::FakeIp);
-        assert!(c.to_yaml().unwrap().contains("fake-ip"));
+        assert_eq!(c.dns.strategy, DnsStrategy::RedirHost);
+        assert!(c.to_yaml().unwrap().contains("redir-host"));
+    }
+
+    #[test]
+    fn dns_defaults_to_redir_host() {
+        // Стратегия по умолчанию обязана быть той, которая работает.
+        let yaml = r#"
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: S, type: socks5h, server: 1.2.3.4, port: 1080}
+"#;
+        let c = Config::parse(yaml, &HashMap::new()).unwrap();
+        assert_eq!(c.dns.strategy, DnsStrategy::RedirHost);
     }
 
     #[test]

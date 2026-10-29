@@ -233,9 +233,9 @@
             <label><span>UDP</span>
               <select id="udpMode"><option value="tproxy">tproxy</option><option value="off">выключен</option></select></label>
             <label><span>DNS</span>
-              <select id="dnsStrategy"><option value="fake-ip">fake-ip</option><option value="redir-host">redir-host</option></select></label>
+              <select id="dnsStrategy"><option value="redir-host">redir-host</option></select></label>
           </div>
-          <p class="hint" data-i18n="set.intercept.hint">Локальный UDP (DNS, QUIC) пока не перехватывается: для него нужен TUN, он не реализован. DNS-стратегия на локальные запросы не влияет.</p>
+          <p class="hint" data-i18n="set.intercept.hint">Локальный UDP (DNS, QUIC) перехватывается при включённом TUN. DNS-запросы к внешним серверам идут через прокси, ответ запоминается как «IP → домен»; запросы к 127.0.0.53 идут мимо.</p>
         </div>
       </section>
     </div>

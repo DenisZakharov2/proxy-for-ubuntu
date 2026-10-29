@@ -189,13 +189,14 @@ async fn conn(
     peer_mss: u16,
 ) {
     let (app_ip, app_port, remote_ip, remote_port) = key;
-    let flow = Flow {
+    let mut flow = Flow {
         dst_ip: Some(IpAddr::V4(remote_ip)),
         dst_port: remote_port,
         src_port: app_port,
         is_tcp: true,
         ..Default::default()
     };
+    engine.enrich_domain(&mut flow);
     let target = Target::from_flow(&flow);
     let (ob, mut upstream, rule) = match engine.open(&target, &flow).await {
         Ok(v) => v,

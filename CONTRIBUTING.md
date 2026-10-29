@@ -63,7 +63,7 @@ app/src-tauri/src/
 │   ├── geo.rs           текстовые geo-наборы, обновление по URL
 │   ├── router.rs        маршрутизация потока и relay
 │   ├── nft.rs           генерация и применение правил nftables
-│   ├── dns.rs           резолвер, fake-ip, кэш
+│   ├── dns.rs           резолвер, карта «IP → домен», HIJACK-DNS
 │   ├── tls.rs           общая настройка TLS
 │   ├── stats.rs         счётчики трафика
 │   └── outbound/        по модулю на протокол

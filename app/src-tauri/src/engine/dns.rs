@@ -1,19 +1,23 @@
-//! Встроенный DNS-резолвер.
+//! DNS: карта «адрес → имя» и локальный ответ для правила `HIJACK-DNS`.
 //!
-//! Зачем он нужен при прозрачном перехвате: если мы просто перенаправим
-//! запросы на 53-й порт нашему обработчику, мы узнаем домен, который
-//! приложение хочет разрешить, и сможем применить доменные правила. Без
-//! этого весь трафик пришлось бы классифицировать по IP, а DNS-утечка через
-//! локальный резолвер осталась бы.
+//! При прозрачном перехвате приложение обращается к IP, а правилам и
+//! remote-DNS прокси нужен домен. Поэтому DNS-запросы, проходящие через
+//! перехват, не только проксируются, но и запоминаются: из ответа берутся
+//! A/AAAA-записи, и дальше любой поток к этому адресу получает имя в
+//! `Flow::domain`.
 //!
-//! Стратегии:
-//! * `fake-ip` — отдаём синтетический адрес из 198.18.0.0/16 и держим
-//!   обратную карту. Клиент thinks it talks to a real IP, мы знаем домен.
-//! * `redir-host` — резолвим нашим же резолвером и отдаём настоящий адрес.
+//! Стратегия одна — `redir-host`: приложению возвращается настоящий адрес,
+//! а соответствие «IP → домен» держит демон. `fake-ip` не реализован и
+//! отклоняется валидацией конфига: настройка, которая молча ничего не
+//! делает, хуже отказа.
+//!
+//! `Resolver` нужен для правила `HIJACK-DNS`: ответ собирается локально,
+//! запрос не уходит наружу. Обычный путь DNS — проксирование через
+//! выбранный правилами outbound (`engine::tun::udp`, `engine::capture`).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,13 +25,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::DnsConfig;
 use crate::error::{Error, Result};
 
-/// Сеть для fake-ip. Зарезервирована для бенчмарков, в обычном интернете
-/// не маршрутизируется — идеальное место, чтобы не конфликтовать с чужой сетью.
-const FAKE_IPV4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(198, 18, 0, 0);
-const FAKE_IPV4_END: u32 = 0x00FF_FFFF; // /16
-
+/// Запись «адрес → имя» из настоящего DNS-ответа.
 #[derive(Debug, Clone)]
-struct FakeEntry {
+struct NameEntry {
     domain: String,
     expires: Instant,
 }
@@ -38,71 +38,121 @@ struct CacheEntry {
     expires: Instant,
 }
 
-/// Резолвер с кэшем, fake-ip-подменой и ленивой загрузкой ответов.
+/// Резолвер с кэшем и картой «IP → домен», заполняемой из перехваченных
+/// DNS-ответов.
 pub struct Resolver {
     cfg: DnsConfig,
-    fake: Mutex<FakeState>,
     cache: Mutex<HashMap<String, CacheEntry>>,
-    client: reqwest::Client,
+    names: Mutex<HashMap<IpAddr, NameEntry>>,
+    /// Клиент DoH создаётся при первом обращении: большинство запросов
+    /// закрывается кэшем или системным резолвером.
+    client: OnceLock<reqwest::Client>,
 }
 
-struct FakeState {
-    /// domain -> fake ip
-    forward: HashMap<IpAddr, FakeEntry>,
-    /// fake ip -> domain
-    reverse: HashMap<String, IpAddr>,
-    next: u32,
+/// Что удалось достать из ответа: домен из вопроса и адреса из A/AAAA.
+#[derive(Debug, Default)]
+pub struct Answer {
+    pub domain: String,
+    pub addrs: Vec<IpAddr>,
 }
 
 impl Resolver {
     pub fn new(cfg: DnsConfig) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            fake: Mutex::new(FakeState {
-                forward: HashMap::new(),
-                reverse: HashMap::new(),
-                next: 1,
-            }),
-            cache: Mutex::new(HashMap::new()),
-            client: crate::engine::http_client()?,
             cfg,
+            cache: Mutex::new(HashMap::new()),
+            names: Mutex::new(HashMap::new()),
+            client: OnceLock::new(),
         }))
     }
 
-    /// Записывает домен в реестр и возвращает выданный ему адрес.
-    /// `None`, если адресное пространство исчерпано.
-    pub fn fake_ip_for(&self, domain: &str) -> Option<IpAddr> {
-        let mut st = self.fake.lock().ok()?;
-        // Домен мог уже быть выдан — возвращаем тот же адрес, иначе
-        // соединения к одному сайту разъезжались бы по разным адресам.
-        if let Some(existing) = st
-            .reverse
-            .iter()
-            .find(|(d, _)| d.eq_ignore_ascii_case(domain))
-            .map(|(_, ip)| *ip)
-        {
-            return Some(existing);
-        }
-        if st.reverse.len() as u32 >= FAKE_IPV4_END {
-            return None;
-        }
-        let n = st.next;
-        st.next = st.next.wrapping_add(1);
-        let ip = IpAddr::V4(Ipv4Addr::from(u32::from(FAKE_IPV4) + (n % FAKE_IPV4_END)));
-        st.reverse.insert(domain.to_ascii_lowercase(), ip);
-        st.forward.insert(
-            ip,
-            FakeEntry {
-                domain: domain.to_ascii_lowercase(),
-                expires: Instant::now() + Duration::from_secs(3600),
-            },
-        );
-        Some(ip)
+    /// Имя, которое приложение разрешало в этот адрес. `None` — адрес не
+    /// встречался в перехваченных ответах (или запись протухла).
+    pub fn name_of(&self, ip: IpAddr) -> Option<String> {
+        let names = self.names.lock().ok()?;
+        let e = names.get(&ip)?;
+        (e.expires > Instant::now()).then(|| e.domain.clone())
     }
 
-    /// Обратное преобразование fake-ip в домен.
-    pub fn domain_of(&self, ip: &IpAddr) -> Option<String> {
-        let st = self.fake.lock().ok()?;
-        st.forward.get(ip).map(|e| e.domain.clone())
+    /// Сколько адресов сейчас в карте — для диагностики и тестов.
+    pub fn names_len(&self) -> usize {
+        self.names.lock().map(|n| n.len()).unwrap_or(0)
+    }
+
+    /// Разбирает настоящий DNS-ответ и запоминает «адрес → имя вопроса».
+    /// Возвращает число запомненных адресов. Битый пакет — не ошибка:
+    /// перехват не должен падать из-за чужих байтов.
+    pub fn remember_response(&self, response: &[u8]) -> usize {
+        let Some(answer) = parse_response(response) else {
+            return 0;
+        };
+        if answer.domain.is_empty() || answer.addrs.is_empty() {
+            return 0;
+        }
+        self.remember(&answer.domain, &answer.addrs);
+        answer.addrs.len()
+    }
+
+    /// Записывает соответствие напрямую (используется `answer_query`,
+    /// `remember_response` и тестами).
+    pub fn remember(&self, domain: &str, addrs: &[IpAddr]) {
+        if domain.is_empty() || addrs.is_empty() {
+            return;
+        }
+        let ttl = Duration::from_secs(self.cfg.cache_ttl.clamp(60, 3600));
+        let Ok(mut names) = self.names.lock() else {
+            return;
+        };
+        if names.len() > self.cfg.cache_size.saturating_mul(8) {
+            names.clear();
+        }
+        let now = Instant::now();
+        for ip in addrs {
+            names.insert(
+                *ip,
+                NameEntry {
+                    domain: domain.to_ascii_lowercase(),
+                    expires: now + ttl,
+                },
+            );
+        }
+    }
+
+    /// Ответ для правила `HIJACK-DNS`: локальное разрешение имени.
+    /// Всегда возвращает валидный DNS-ответ — при неудаче `SERVFAIL`,
+    /// чтобы приложение сразу перешло к следующему серверу, а не ждало
+    /// таймаут.
+    pub async fn answer_query(&self, query: &[u8]) -> Vec<u8> {
+        let Ok((start, end, qtype)) = parse_question(query) else {
+            return servfail(query);
+        };
+        let domain = decode_qname(query, start, end);
+        if domain.is_empty() {
+            return servfail(query);
+        }
+        if qtype != 1 && qtype != 28 {
+            // Прочие типы (TXT, HTTPS, SRV) локально не отвечаем честно —
+            // лучше SERVFAIL, чем пустой ответ, который приложение примет
+            // за «записи нет».
+            return servfail(query);
+        }
+        let addrs = match self.resolve(&domain).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(domain = %domain, error = %e, "HIJACK-DNS: имя не разрешено");
+                return servfail(query);
+            }
+        };
+        let filtered: Vec<IpAddr> = addrs
+            .into_iter()
+            .filter(|a| matches!((a, qtype), (IpAddr::V4(_), 1) | (IpAddr::V6(_), 28)))
+            .collect();
+        let ttl = self.cfg.cache_ttl.clamp(60, 3600);
+        let out = build_response(query, &filtered, ttl as u32);
+        // Ответ собран из настоящих адресов — запоминаем их, иначе
+        // доменные правила для последующих соединений не сработают.
+        self.remember(&domain, &filtered);
+        out
     }
 
     /// Резолвит домен в адреса с кэшем и TTL.
@@ -156,6 +206,21 @@ impl Resolver {
         Err(last.unwrap_or_else(|| Error::Internal(format!("не удалось разрешить {domain}"))))
     }
 
+    /// HTTP-клиент для DoH. Адреса закреплены, чтобы запрос не зависел от
+    /// системного резолвера: иначе `cloudflare-dns.com` пришлось бы
+    /// разрешать тем же DNS, который мы перехватываем.
+    fn client(&self) -> &reqwest::Client {
+        self.client.get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(concat!("proxy-for-ubuntu/", env!("CARGO_PKG_VERSION")))
+                .timeout(Duration::from_secs(10))
+                .resolve("cloudflare-dns.com", ([1, 1, 1, 1], 443).into())
+                .resolve("dns.google", ([8, 8, 8, 8], 443).into())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+    }
+
     /// Минимальный DoH-клиент: JSON-ответ Cloudflare/Google.
     async fn doh_query(&self, server: &str, domain: &str) -> Result<Vec<IpAddr>> {
         let url = match server {
@@ -163,7 +228,7 @@ impl Resolver {
             _ => format!("https://cloudflare-dns.com/dns-query?name={domain}&type=A"),
         };
         let resp = self
-            .client
+            .client()
             .get(&url)
             .header("accept", "application/dns-json")
             .send()
@@ -188,15 +253,12 @@ impl Resolver {
 
     /// Чистка протухших записей. Вызывается раз в минуту.
     pub fn gc(&self) {
+        let now = Instant::now();
         if let Ok(mut c) = self.cache.lock() {
-            let now = Instant::now();
             c.retain(|_, e| e.expires > now);
         }
-        if let Ok(mut f) = self.fake.lock() {
-            let now = Instant::now();
-            f.forward.retain(|_, e| e.expires > now);
-            let live: std::collections::HashSet<IpAddr> = f.forward.keys().copied().collect();
-            f.reverse.retain(|_, ip| live.contains(ip));
+        if let Ok(mut n) = self.names.lock() {
+            n.retain(|_, e| e.expires > now);
         }
     }
 }
@@ -248,20 +310,129 @@ pub fn decode_qname(buf: &[u8], start: usize, end: usize) -> String {
     out.to_ascii_lowercase()
 }
 
-/// Собирает ответ A/AAAA на перехваченный запрос.
+/// Читает имя из ответа с поддержкой сжатия (`0xC0`-указатели).
+fn read_name(buf: &[u8], mut i: usize) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut jumps = 0;
+    let mut next = i;
+    loop {
+        if i >= buf.len() {
+            return None;
+        }
+        let len = buf[i] as usize;
+        if len & 0xC0 == 0xC0 {
+            if i + 1 >= buf.len() {
+                return None;
+            }
+            let ptr = ((len & 0x3F) << 8) | buf[i + 1] as usize;
+            if jumps == 0 {
+                next = i + 2;
+            }
+            jumps += 1;
+            if jumps > 32 || ptr >= buf.len() {
+                return None;
+            }
+            i = ptr;
+            continue;
+        }
+        if len == 0 {
+            if jumps == 0 {
+                next = i + 1;
+            }
+            return Some((out.to_ascii_lowercase(), next));
+        }
+        if i + 1 + len > buf.len() {
+            return None;
+        }
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&String::from_utf8_lossy(&buf[i + 1..i + 1 + len]));
+        i += 1 + len;
+    }
+}
+
+/// Разбирает ответ: имя из вопроса и адреса из A/AAAA-записей.
+pub fn parse_response(buf: &[u8]) -> Option<Answer> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 {
+        return None; // это не ответ
+    }
+    let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    if qd == 0 || an == 0 {
+        return None;
+    }
+    let (start, end, _qtype) = parse_question(buf).ok()?;
+    let domain = decode_qname(buf, start, end);
+    let mut i = end + 4;
+    // Пропускаем остальные вопросы, если они есть.
+    for _ in 1..qd {
+        let (_, next) = read_name(buf, i)?;
+        i = next + 4;
+    }
+    let mut addrs = Vec::new();
+    for _ in 0..an {
+        let (_, next) = read_name(buf, i)?;
+        i = next;
+        if i + 10 > buf.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([buf[i], buf[i + 1]]);
+        let rdlen = u16::from_be_bytes([buf[i + 8], buf[i + 9]]) as usize;
+        i += 10;
+        if i + rdlen > buf.len() {
+            return None;
+        }
+        match (rtype, rdlen) {
+            (1, 4) => addrs.push(IpAddr::V4(Ipv4Addr::new(
+                buf[i],
+                buf[i + 1],
+                buf[i + 2],
+                buf[i + 3],
+            ))),
+            (28, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&buf[i..i + 16]);
+                addrs.push(IpAddr::V6(Ipv6Addr::from(octets)));
+            }
+            _ => {}
+        }
+        i += rdlen;
+    }
+    Some(Answer { domain, addrs })
+}
+
+/// Собирает ответ A/AAAA на перехваченный запрос. Копируется только сам
+/// вопрос: лишние секции (EDNS0 OPT) в ответе не нужны, а их хвост сделал
+/// бы пакет несогласованным с ARCOUNT.
 pub fn build_response(query: &[u8], addrs: &[IpAddr], ttl: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(query.len() + 64);
     out.extend_from_slice(&query[..2]);
-    // QR=1, RD скопирован, RA=1
-    let flags = u16::from_be_bytes([0x81, 0x80]);
+    // QR=1, RD — как в запросе, RA=1, RCODE=0.
+    let rd = query[2] & 0x01;
+    let flags: u16 = 0x8000 | ((rd as u16) << 8) | 0x0080;
     out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     out.extend_from_slice(&(addrs.len() as u16).to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&query[12..]); // вопрос без изменений
 
+    // Вопрос целиком: имя + qtype + qclass.
+    let question_end = parse_question(query)
+        .map(|(_, end, _)| end + 4)
+        .unwrap_or(query.len())
+        .min(query.len());
+    out.extend_from_slice(&query[12..question_end]);
+
+    // Имя записи — указатель на имя вопроса (offset 12): так делают все
+    // настоящие серверы, и пакет остаётся коротким. Пустое имя (0x00) здесь
+    // было бы корнем, а не вопросом.
     for a in addrs {
+        out.extend_from_slice(&[0xC0, 0x0C]);
         match a {
             IpAddr::V4(v4) => {
                 out.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A, IN
@@ -276,6 +447,16 @@ pub fn build_response(query: &[u8], addrs: &[IpAddr], ttl: u32) -> Vec<u8> {
                 out.extend_from_slice(&v6.octets());
             }
         }
+    }
+    out
+}
+
+/// Ответ SERVFAIL на запрос: заголовок вопроса сохраняется, ответов нет.
+pub fn servfail(query: &[u8]) -> Vec<u8> {
+    let mut out = build_response(query, &[], 0);
+    if out.len() >= 4 {
+        // RCODE=2 в младших 4 битах флагов.
+        out[3] |= 0x02;
     }
     out
 }
@@ -309,50 +490,88 @@ pub async fn read_tcp_dns(sock: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn fake_ip_is_stable_per_domain() {
-        let r = Resolver::new(DnsConfig::default()).unwrap();
-        let a = r.fake_ip_for("example.com").unwrap();
-        let b = r.fake_ip_for("EXAMPLE.COM").unwrap();
-        assert_eq!(a, b, "один домен — один адрес, регистр не важен");
-        assert_ne!(a, r.fake_ip_for("other.com").unwrap());
-    }
-
-    #[tokio::test]
-    async fn fake_ip_roundtrip() {
-        let r = Resolver::new(DnsConfig::default()).unwrap();
-        let ip = r.fake_ip_for("vk.com").unwrap();
-        assert_eq!(r.domain_of(&ip).as_deref(), Some("vk.com"));
-        assert!(r.domain_of(&"1.2.3.4".parse().unwrap()).is_none());
-    }
-
-    #[tokio::test]
-    async fn fake_ip_stays_inside_198_18_0_0_16() {
-        let r = Resolver::new(DnsConfig::default()).unwrap();
-        for i in 0..50 {
-            let ip = r.fake_ip_for(&format!("site{i}.com")).unwrap();
-            let v4 = match ip {
-                IpAddr::V4(v) => v,
-                _ => panic!("ожидался IPv4"),
-            };
-            assert_eq!(v4.octets()[0], 198);
-            assert_eq!(v4.octets()[1], 18);
+    fn query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut q = vec![0u8; 12];
+        q[0] = 0xAB;
+        q[1] = 0xCD;
+        q[2] = 0x01; // RD
+        for part in name.split('.') {
+            q.push(part.len() as u8);
+            q.extend_from_slice(part.as_bytes());
         }
+        q.push(0);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q
+    }
+
+    #[tokio::test]
+    async fn response_is_remembered_as_name() {
+        let r = Resolver::new(DnsConfig::default()).unwrap();
+        let q = query("echo.dns.test", 1);
+        let resp = build_response(&q, &["203.0.113.7".parse().unwrap()], 300);
+        assert_eq!(r.remember_response(&resp), 1);
+        assert_eq!(
+            r.name_of("203.0.113.7".parse().unwrap()).as_deref(),
+            Some("echo.dns.test")
+        );
+        assert!(r.name_of("203.0.113.8".parse().unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    async fn remember_ignores_request_and_garbage() {
+        let r = Resolver::new(DnsConfig::default()).unwrap();
+        let q = query("echo.dns.test", 1);
+        assert_eq!(r.remember_response(&q), 0, "запрос — не ответ");
+        assert_eq!(r.remember_response(&[0, 1, 2]), 0);
+        assert_eq!(r.names_len(), 0);
+    }
+
+    #[test]
+    fn uncompressed_answer_names_are_parsed() {
+        // Не все серверы сжимают имя записи. Полное имя в ответе должно
+        // разбираться так же, как указатель.
+        let q = query("example.com", 1);
+        let mut resp = build_response(&q, &[], 300);
+        resp[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT=1
+        resp.extend_from_slice(&q[12..25]); // имя целиком
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A, IN
+        resp.extend_from_slice(&300u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&[93, 184, 216, 34]);
+        let parsed = parse_response(&resp).expect("ответ разобран");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(
+            parsed.addrs,
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+    }
+
+    #[tokio::test]
+    async fn hijack_answers_localhost_with_a_record() {
+        let r = Resolver::new(DnsConfig::default()).unwrap();
+        let q = query("localhost", 1);
+        let resp = r.answer_query(&q).await;
+        assert_eq!(&resp[0..2], &[0xAB, 0xCD], "ID запроса сохраняется");
+        assert_eq!(&resp[6..8], &1u16.to_be_bytes(), "один ответ");
+        // localhost есть в /etc/hosts — внешняя сеть не нужна.
+        assert!(parse_response(&resp)
+            .unwrap()
+            .addrs
+            .contains(&"127.0.0.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn hijack_unsupported_type_is_servfail() {
+        let r = Resolver::new(DnsConfig::default()).unwrap();
+        let resp = r.answer_query(&query("localhost", 16)).await;
+        assert_eq!(resp[3] & 0x0F, 2, "RCODE=SERVFAIL");
+        assert_eq!(&resp[6..8], &0u16.to_be_bytes(), "ответов нет");
     }
 
     #[test]
     fn parses_dns_question() {
-        // a.example.com A ?
-        let mut q = vec![0u8; 12];
-        q.push(1);
-        q.extend_from_slice(b"a");
-        q.push(7);
-        q.extend_from_slice(b"example");
-        q.push(3);
-        q.extend_from_slice(b"com");
-        q.push(0);
-        q.extend_from_slice(&1u16.to_be_bytes());
-        q.extend_from_slice(&1u16.to_be_bytes());
+        let q = query("a.example.com", 1);
         let (s, e, qt) = parse_question(&q).unwrap();
         assert_eq!(decode_qname(&q, s, e), "a.example.com");
         assert_eq!(qt, 1);
@@ -360,20 +579,26 @@ mod tests {
 
     #[test]
     fn dns_response_has_answers() {
-        let mut q = vec![0u8; 12];
-        q[0] = 0xAB;
-        q[1] = 0xCD; // id
-        q.push(3);
-        q.extend_from_slice(b"com");
-        q.push(0);
-        q.extend_from_slice(&1u16.to_be_bytes());
-        q.extend_from_slice(&1u16.to_be_bytes());
+        let q = query("com", 1);
         let addrs = vec!["1.2.3.4".parse().unwrap()];
         let r = build_response(&q, &addrs, 300);
         assert_eq!(&r[0..2], &[0xAB, 0xCD], "ID запроса должен сохраняться");
         assert_eq!(&r[4..6], &1u16.to_be_bytes(), "QDCOUNT");
         assert_eq!(&r[6..8], &1u16.to_be_bytes(), "ANCOUNT");
         assert_eq!(&r[r.len() - 4..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn response_keeps_only_the_question() {
+        // Запрос с EDNS0 OPT в additional: в ответе не должно быть его хвоста,
+        // иначе пакет противоречит ARCOUNT=0.
+        let mut q = query("example.com", 1);
+        q[10] = 0;
+        q[11] = 1; // ARCOUNT=1
+        q.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0, 0, 0, 0, 0, 0]); // OPT
+        let r = build_response(&q, &["1.2.3.4".parse().unwrap()], 60);
+        assert_eq!(r.len(), 12 + 17 + 16, "вопрос 17 байт + один ответ 16");
+        assert_eq!(&r[10..12], &[0, 0], "ARCOUNT=0");
     }
 
     #[tokio::test]

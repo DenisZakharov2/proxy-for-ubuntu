@@ -47,6 +47,15 @@ impl UdpFlows {
         let key: FlowKey = (pkt.src, udp.src_port, pkt.dst, udp.dst_port);
         let data = udp.payload.to_vec();
 
+        // DNS с правилом HIJACK-DNS отвечаем локально: наружу запрос не
+        // уходит, приложение получает настоящий адрес сразу. Остальные
+        // DNS-запросы идут обычным путём через outbound — это и есть
+        // redir-host: настоящий ответ, а карту «IP → домен» заполняет
+        // `remember_response` в потоке ниже.
+        if udp.dst_port == 53 && answer_hijacked_dns(engine, io, pkt, udp, &data).await {
+            return;
+        }
+
         let mut map = self.map.lock().await;
         if let Some(tx) = map.get(&key) {
             // Очередь переполнена — поток не успевает; начинаем заново,
@@ -72,6 +81,38 @@ impl UdpFlows {
     }
 }
 
+/// Если правило требует `HIJACK-DNS`, отвечает на запрос локально и
+/// возвращает `true`: наружу ничего не уходит, поток не создаётся.
+///
+/// Иначе — `false`, и запрос идёт обычным UDP-потоком через outbound; ответ
+/// на него попадёт в карту «IP → домен» в [`flow`].
+async fn answer_hijacked_dns(
+    engine: &Arc<Engine>,
+    io: &Arc<TunIo>,
+    pkt: Ipv4<'_>,
+    udp: packet::Udp<'_>,
+    query: &[u8],
+) -> bool {
+    let flow = Flow {
+        dst_ip: Some(IpAddr::V4(pkt.dst)),
+        dst_port: udp.dst_port,
+        src_port: udp.src_port,
+        is_tcp: false,
+        ..Default::default()
+    };
+    if !matches!(engine.route(&flow).0, Decision::HijackDns) {
+        return false;
+    }
+    let response = engine.dns.answer_query(query).await;
+    engine.stats.add_up(query.len() as u64);
+    engine.stats.add_down(response.len() as u64);
+    let reply = packet::build_udp(pkt.dst, pkt.src, udp.dst_port, udp.src_port, &response);
+    if let Err(e) = io.write(&reply).await {
+        tracing::debug!(error = %e, "TUN/DNS: ответ не записан в устройство");
+    }
+    true
+}
+
 /// Один UDP-поток: своя сессия outbound'а и свои ответы в TUN.
 async fn flow(
     engine: Arc<Engine>,
@@ -83,13 +124,16 @@ async fn flow(
     first: Vec<u8>,
 ) {
     let (src_ip, src_port, dst_ip, dst_port) = key;
-    let flow = Flow {
+    let mut flow = Flow {
         dst_ip: Some(IpAddr::V4(dst_ip)),
         dst_port,
         src_port,
         is_tcp: false,
         ..Default::default()
     };
+    // Приложение уже разрешило имя: ответ перехвачен и запомнен, поэтому
+    // правило по домену должно сработать и для датаграммы по адресу.
+    engine.enrich_domain(&mut flow);
     let (decision, label, rule) = engine.route(&flow);
     if matches!(decision, Decision::Reject | Decision::RejectDrop) {
         tracing::debug!(dst = %dst_ip, dst_port, "TUN/UDP: отклонено правилом");
@@ -145,6 +189,12 @@ async fn flow(
             },
             got = session.recv_from(&mut buf, UDP_IDLE) => match got {
                 Ok((n, _from)) => {
+                    // Ответ DNS — единственное место, где видно соответствие
+                    // «адрес → домен». Запоминаем его до пересылки, чтобы
+                    // следующее соединение по этому адресу уже знало имя.
+                    if dst_port == 53 {
+                        engine.dns.remember_response(&buf[..n]);
+                    }
                     engine.stats.add_down(n as u64);
                     bytes += n as u64;
                     // Ответ собираем сами: адрес источника — настоящий

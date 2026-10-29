@@ -7,7 +7,7 @@ log:
   journal: true
 
 dns:
-  strategy: fake-ip
+  strategy: redir-host
   servers: [1.1.1.1, 8.8.8.8]
   fallback: [9.9.9.9]
 

@@ -195,13 +195,16 @@ async fn tcp_conn(
         return;
     }
 
-    let flow = Flow {
+    let mut flow = Flow {
         dst_ip: Some(dst.ip()),
         dst_port: dst.port(),
         src_port: peer.port(),
         is_tcp: true,
         ..Default::default()
     };
+    // Домен из перехваченного DNS: приложение шло по адресу, правило —
+    // по имени.
+    engine.enrich_domain(&mut flow);
     let target = Target::from_flow(&flow);
 
     let (ob, upstream, rule) = match engine.open(&target, &flow).await {
@@ -434,15 +437,31 @@ async fn udp_flow(
     first: Arc<Vec<u8>>,
 ) {
     let (client, dst) = key;
-    let flow = Flow {
+    let mut flow = Flow {
         dst_ip: Some(dst.ip()),
         dst_port: dst.port(),
         src_port: client.port(),
         is_tcp: false,
         ..Default::default()
     };
+    engine.enrich_domain(&mut flow);
     let (decision, label, rule) = engine.route(&flow);
     if matches!(decision, Decision::Reject | Decision::RejectDrop) {
+        flows.lock().await.remove(&key);
+        return;
+    }
+    if matches!(decision, Decision::HijackDns) {
+        // Локальный DNS-ответ: отправляем с сокета, привязанного к
+        // настоящему получателю, иначе клиент не примет датаграмму.
+        let response = engine.dns.answer_query(first.as_slice()).await;
+        match udp_reply_socket(dst) {
+            Ok(sock) => {
+                let _ = send_from(&sock, &response, client).await;
+            }
+            Err(e) => tracing::debug!(%dst, error = %e, "HIJACK-DNS: нет сокета для ответа"),
+        }
+        engine.stats.add_up(first.len() as u64);
+        engine.stats.add_down(response.len() as u64);
         flows.lock().await.remove(&key);
         return;
     }
@@ -497,6 +516,10 @@ async fn udp_flow(
             },
             got = session.recv_from(&mut buf, UDP_IDLE) => match got {
                 Ok((n, _from)) => {
+                    // DNS-ответ: запоминаем «адрес → домен» для правил.
+                    if dst.port() == 53 {
+                        engine.dns.remember_response(&buf[..n]);
+                    }
                     engine.stats.add_down(n as u64);
                     bytes += n as u64;
                     if send_from(&reply, &buf[..n], client).await.is_err() {

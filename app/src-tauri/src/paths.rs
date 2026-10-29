@@ -56,10 +56,6 @@ pub fn tproxy_port() -> u16 {
     15001
 }
 
-pub fn dns_port() -> u16 {
-    15002
-}
-
 pub fn builtin_profiles_dir() -> PathBuf {
     PathBuf::from("/usr/share/proxy-for-ubuntu/profiles")
 }

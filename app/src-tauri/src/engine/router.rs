@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::config::Config;
+use crate::engine::dns::{self, Resolver};
 use crate::engine::outbound::{self, Outbound, Request, UdpSession};
 use crate::engine::rules::{Decision, Flow, RuleSet, Target};
 use crate::engine::stats::{Breakdown, Counters};
@@ -102,6 +103,11 @@ pub struct Engine {
     /// Лимиты скорости и числа соединений на каждый outbound, собранные из
     /// раздела `limits` конфига при сборке движка.
     pub outbound_limits: HashMap<String, Arc<OutboundLimit>>,
+
+    /// Карта «IP → домен» из перехваченных DNS-ответов (стратегия
+    /// `redir-host`). Нужна, чтобы правила по домену работали для
+    /// соединений, которые приложение открывает уже по адресу.
+    pub dns: Arc<Resolver>,
 }
 
 impl Engine {
@@ -145,6 +151,8 @@ impl Engine {
             );
         }
 
+        let dns = dns::Resolver::new(config.dns.clone())?;
+
         Ok(Arc::new(Self {
             config,
             rules,
@@ -155,7 +163,24 @@ impl Engine {
             cache: RwLock::new(HashMap::new()),
             enabled: AtomicBool::new(false),
             outbound_limits,
+            dns,
         }))
+    }
+
+    /// Дополняет поток доменом из карты «IP → имя». Приложение уже сходило в
+    /// DNS, ответ перехвачен и запомнен, поэтому соединение по адресу можно
+    /// оценивать доменными правилами (и отдать домен прокси с `remote_dns`).
+    pub fn enrich_domain(&self, flow: &mut Flow) {
+        if flow.domain.is_some() {
+            return;
+        }
+        let Some(ip) = flow.dst_ip else {
+            return;
+        };
+        if let Some(name) = self.dns.name_of(ip) {
+            flow.domain = Some(name);
+            flow.domain_confident = true;
+        }
     }
 
     /// Ищет outbound с учётом раскрытия групп: правило может указывать на
@@ -655,5 +680,29 @@ rules:
         let (_, stream, _) = e.open(&target, &flow).await.expect("снова открыто");
         drop(stream);
         holder.abort();
+    }
+
+    #[tokio::test]
+    async fn dns_name_enriches_flow_so_domain_rules_match() {
+        // Приложение сходило в DNS, ответ перехвачен: соединение к тому же
+        // адресу обязано попасть под правило по домену, а не по IP.
+        let e = engine(BASE);
+        let ip: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        e.dns.remember("blocked.com", &[ip]);
+        let mut flow = Flow {
+            dst_ip: Some(ip),
+            dst_port: 443,
+            is_tcp: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            e.route(&flow).0,
+            Decision::Direct,
+            "без домена правило по имени не срабатывает"
+        );
+        e.enrich_domain(&mut flow);
+        assert_eq!(flow.domain.as_deref(), Some("blocked.com"));
+        assert!(flow.domain_confident);
+        assert_eq!(e.route(&flow).0, Decision::Reject);
     }
 }

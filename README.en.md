@@ -101,8 +101,14 @@ working normally — and `apt remove` restores the system on its own.
   DNS, QUIC and game traffic from the machine itself goes direct, past the
   proxy: `REDIRECT` leaves no way to learn a datagram's real destination. With
   TUN the traffic goes into `pfu0` and is parsed by the userspace stack.
-  `dns.strategy: fake-ip` still has no effect: the resolver is not wired into
-  interception.
+- **DNS is intercepted with `tun.enabled: true` and `dns.strategy: redir-host`**
+  (the default). The query travels through the outbound chosen by the rules,
+  the application receives the real address, and the daemon learns the
+  "IP → domain" pair from the answer — so domain rules apply to connections the
+  application opens by address. `fake-ip` is not implemented: a config using it
+  is rejected by validation instead of being silently ignored. Queries to
+  `127.0.0.53` (systemd-resolved) still bypass interception: it is loopback and
+  is excluded; applications that talk to an external DNS directly are caught.
 - **UDP is intercepted for forwarded traffic only** — containers. Container
   TCP is intercepted with `intercept.docker: true`, UDP with
   `intercept.udp: tproxy`.
@@ -153,7 +159,7 @@ Not supported: Reality/XTLS in VLESS, the gRPC transport, Shadowsocks plugins,
 api: 1
 
 dns:
-  strategy: fake-ip      # no effect yet: local DNS is not intercepted (see above)
+  strategy: redir-host   # DNS through the proxy, domain rules work (see "Interception limits")
   servers: [1.1.1.1, 8.8.8.8]
 
 intercept:
@@ -198,8 +204,9 @@ the button.
 
 ## Privacy
 
-- **DNS does not leak** with `fake-ip` and with proxies that resolve remotely:
-  the domain goes to the proxy and the local resolver never sees your lookups.
+- **DNS does not leak.** With `redir-host` the query goes through the outbound
+  chosen by the rules, not to the local resolver; with a proxy that supports
+  `remote_dns` the domain is handed to the server and never resolved locally.
 - **Secrets stay out of the config.** Put a password in
   `/etc/proxy-for-ubuntu/env` and reference it as `${SS_PASSWORD}`.
 - **Logs** record destination addresses and rule names, never passwords. The

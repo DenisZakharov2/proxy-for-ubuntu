@@ -16,7 +16,7 @@ log:
   journal: true         # write to journald
   file: /var/log/proxy-for-ubuntu/engine.log
 dns:
-  strategy: fake-ip     # fake-ip | redir-host
+  strategy: redir-host  # the only supported value: fake-ip is rejected
   cache_size: 4096
   cache_ttl: 300
   servers:
@@ -88,8 +88,12 @@ First-version limits (0.3.0):
 * TCP: no window scaling (65,535 bytes), no SACK or timestamps, timer-based
   retransmission — slower than the kernel stack on lossy links;
 * ICMP is not proxied;
-* `dns.strategy: fake-ip` still does not work: the built-in resolver is not
-  wired into interception, DNS travels through TUN as plain UDP.
+* `dns.strategy`: only `redir-host` works. DNS queries that pass through TUN
+  leave via the outbound chosen by the rules; the answer is remembered as
+  "IP → domain", and domain rules apply to later connections to that address.
+  `fake-ip` is not implemented and is rejected by config validation.
+  DNS over TCP (53/tcp) is proxied but not recorded; DoH/DoT is sent to
+  443/853 by the application and travels as ordinary TCP.
 
 ## `outbounds`
 
@@ -245,7 +249,7 @@ The list executes top to bottom, first match wins. Line format —
 - `DIRECT` — direct (built-in outbound, always created)
 - `REJECT` — connection closed immediately, RST/ICMP unreachable
 - `REJECT-DROP` — packet silently dropped
-- `HIJACK-DNS` — force our DNS resolver
+- `HIJACK-DNS` — the daemon answers itself (A/AAAA); the query never leaves
 
 ### Groups
 

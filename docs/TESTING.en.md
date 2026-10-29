@@ -84,20 +84,35 @@ pfu-cli metrics               # connection and byte counters
 - [ ] `git clone` from an external host goes through the proxy
 - [ ] `curl https://example.com` → 200, and `pfu-cli metrics` shows growing
       `connections` and bytes once connections close
-- [ ] Local DNS queries bypass the daemon (expected, see §5):
-      `ss -tunap | grep :53` does not show the daemon
+- [ ] DNS to external servers goes through the daemon with `tun.enabled: true`:
+      `dig @8.8.8.8 +short example.com` answers and `pfu-cli metrics` grows;
+      queries to 127.0.0.53 (systemd-resolved) still bypass it — see §5
 
-## 5. DNS — a known limitation
+## 5. DNS
 
-Local DNS is **not intercepted**: it is local UDP, and `REDIRECT` does not
-preserve a datagram's real destination (see `docs/ARCHITECTURE.md` §6.1).
-Queries go through the system resolver, `dns.strategy` does not affect them,
-`fake-ip` does not work. A DNS leak here is a documented limitation, not a
-defect; it goes away with TUN.
+With `tun.enabled: true` and `dns.strategy: redir-host`, queries to external
+DNS servers are intercepted: the datagram enters `pfu0`, leaves through the
+outbound chosen by the rules, the answer is returned to the application, and
+the "IP → domain" pair is remembered for later connections to that address
+(`docs/ARCHITECTURE.md` §6.3).
+
+What it does not do:
+
+- **`127.0.0.53` (systemd-resolved) is not intercepted** — it is loopback and
+  is excluded from every chain. System applications that use the stub resolver
+  resolve names as before, and resolved asks its upstream (usually a private
+  router address) directly.
+- DNS over TCP is proxied but not recorded in the "IP → domain" map.
 
 - [ ] After `connect` DNS still works: `dig +short example.com`
-- [ ] `dig +short example.com` returns the real address, not `198.18.x.x`
-- [ ] The limitation is described in README, not hidden
+- [ ] `dig @8.8.8.8 +short example.com` returns the real address, not
+      `198.18.x.x`
+- [ ] `DOMAIN-SUFFIX,example.com,REJECT` with TUN enabled breaks
+      `curl https://example.com` after the DNS query, while
+      `curl https://1.1.1.1` still works
+- [ ] `HIJACK-DNS` on a `DST-PORT,53` rule answers locally: the same `dig`
+      gets an answer and byte counters grow without any outbound
+- [ ] The limits are described in README and CONFIG, not hidden
 
 ## 6. UDP and QUIC
 

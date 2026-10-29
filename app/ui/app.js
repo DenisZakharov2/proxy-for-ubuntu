@@ -54,7 +54,7 @@ const I18N = {
     'set.diagnose': 'Проверка окружения', 'set.run': 'Запустить', 'set.interface': 'Интерфейс',
     'set.lang': 'Язык', 'set.theme': 'Тема', 'set.advanced': 'Параметры перехвата',
     'set.diagnose.hint': 'Проверит nftables, TUN, права и занятые порты.',
-    'set.intercept.hint': 'Локальный UDP (DNS, QUIC) пока не перехватывается: для него нужен TUN, он не реализован. DNS-стратегия на локальные запросы не влияет.',
+    'set.intercept.hint': 'Локальный UDP (DNS, QUIC) перехватывается при включённом TUN. DNS-запросы к внешним серверам идут через прокси, ответ запоминается как «IP → домен»; запросы к 127.0.0.53 идут мимо.',
     'err.daemon': 'Демон недоступен', 'err.daemon.hint': 'sudo systemctl start proxy-for-ubuntud',
     'err.generic': 'Что-то пошло не так',
     'err.untouched': 'Системные правила не менялись — откатывать было нечего.',
@@ -113,7 +113,7 @@ const I18N = {
     'set.diagnose': 'Environment check', 'set.run': 'Run', 'set.interface': 'Interface',
     'set.lang': 'Language', 'set.theme': 'Theme', 'set.advanced': 'Interception settings',
     'set.diagnose.hint': 'Checks nftables, TUN, privileges and busy ports.',
-    'set.intercept.hint': 'Local UDP (DNS, QUIC) is not intercepted yet: that needs TUN, which is not implemented. The DNS strategy does not affect local queries.',
+    'set.intercept.hint': 'Local UDP (DNS, QUIC) is intercepted when TUN is enabled. DNS queries to external servers go through the proxy and the answer is remembered as "IP → domain"; queries to 127.0.0.53 bypass it.',
     'err.daemon': 'Daemon unavailable', 'err.daemon.hint': 'sudo systemctl start proxy-for-ubuntud',
     'err.generic': 'Something went wrong',
     'err.untouched': 'System rules were never changed — there was nothing to roll back.',
@@ -181,7 +181,7 @@ function mock(method, params) {
     ],
     final: 'DIRECT',
     intercept: { tcp: 'redirect', udp: 'tproxy' },
-    dns: { strategy: 'fake-ip' },
+    dns: { strategy: 'redir-host' },
   };
   switch (method) {
     case 'daemon.status':
@@ -883,7 +883,7 @@ async function renderSettings() {
   const c = state.config || {};
   $('#tcpMode').value = (c.intercept && c.intercept.tcp) || 'redirect';
   $('#udpMode').value = (c.intercept && c.intercept.udp) || 'tproxy';
-  $('#dnsStrategy').value = (c.dns && c.dns.strategy) || 'fake-ip';
+  $('#dnsStrategy').value = (c.dns && c.dns.strategy) || 'redir-host';
   $('#langSelect').value = state.lang;
   $('#themeSelect').value = state.theme;
 }
