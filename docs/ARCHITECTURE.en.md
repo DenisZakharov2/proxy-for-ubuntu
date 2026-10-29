@@ -259,6 +259,24 @@ query never leaves the machine.
 Hostnames are also preserved where DNS is not involved: `socks5h`, `vless`,
 `vmess` and `trojan` pass the hostname to the proxy, and the proxy resolves it.
 
+**The system resolver** (`127.0.0.53`, systemd-resolved) is intercepted
+separately and without TUN. The nat output chain carries
+`meta skuid != 0 ip daddr 127.0.0.53 udp dport 53 redirect to :15053` before
+the loopback exclusion, and `skuid != 0` keeps the daemon from asking itself.
+The listener `127.0.0.1:15053` parses the question, applies the rules by name
+(`Flow::dst_ip` is empty — the stub address is technical), opens a UDP session
+of the chosen outbound and sends the **original** query to the upstream from
+`dns.servers`, so the application receives a real answer of any record type.
+The reply leaves through the same socket: conntrack rewrites the source back to
+`127.0.0.53:53`, otherwise the application's connected socket would drop the
+datagram. `remember_response` fills the "IP → domain" map, `REJECT` answers
+`SERVFAIL` immediately, `HIJACK-DNS` answers locally. If the outbound cannot
+carry UDP or does not answer within 3 s, the daemon resolves the name directly
+(system path, then DoH) — the application is never left without DNS. Turn it
+off with `dns.intercept_stub: false` (or port 53 in
+`intercept.exclude_ports`). Limits: TCP/53 to the resolver itself and IPv6
+still go direct.
+
 ### 6.4 Apply and rollback
 
 `Supervisor::apply()`:

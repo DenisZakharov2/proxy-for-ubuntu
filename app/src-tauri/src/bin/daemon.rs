@@ -308,6 +308,18 @@ async fn run_check(strict: bool) -> Result<()> {
         );
     }
 
+    // DNS-заглушка слушает UDP, поэтому проверка выше её не видит.
+    let stub_port = paths::dns_stub_port();
+    let stub_free = std::net::UdpSocket::bind(("0.0.0.0", stub_port)).is_ok();
+    println!(
+        "порт {stub_port} (DNS-заглушка 127.0.0.53): {}",
+        if stub_free {
+            "свободен"
+        } else {
+            "ЗАНЯТ"
+        }
+    );
+
     if problems > 0 {
         eprintln!("\nОбнаружены проблемы: {problems}. Запуск будет невозможен.");
         return Err(pfu::Error::NotReady);

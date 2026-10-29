@@ -47,7 +47,14 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
     // REDIRECT не нужен, иначе nat перепишет получателя раньше маршрутизации.
     let tun_on = cfg.tun.enabled;
     let redirect_tcp = tcp_on && !tun_on;
-    let disabled = !tcp_on && !udp_on && !tun_on;
+    let disabled = !cfg.interception_active();
+    // Запросы к системному резолверу перехватываем отдельным правилом: он
+    // слушает 127.0.0.53:53, а loopback из остальных цепочек исключён.
+    // Порт 53 в `exclude_ports` означает «не трогать DNS» — тогда и stub
+    // остаётся как есть.
+    let dns_stub = cfg.dns.intercept_stub
+        && !disabled
+        && !cfg.intercept.exclude_ports.iter().any(|p| p == "53");
 
     r.push_str("table inet pfu\n");
     r.push_str("delete table inet pfu\n");
@@ -111,9 +118,22 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
     // ── nat output: трафик самой системы ────────────────────────────────
     // REDIRECT переписывает адрес получателя на локальный сокет демона и
     // сохраняет настоящий адрес доступным через SO_ORIGINAL_DST.
-    if !disabled && (redirect_tcp || !tun_on) {
+    if !disabled && (redirect_tcp || !tun_on || dns_stub) {
         r.push_str("    chain nat_output {\n");
         r.push_str("        type nat hook output priority -100; policy accept;\n");
+        if dns_stub {
+            // Системный резолвер (systemd-resolved) слушает 127.0.0.53:53;
+            // приложения, которые спрашивают имена через него, иначе ходят
+            // мимо прокси. Правило стоит до исключения loopback.
+            //
+            // `meta skuid != 0` — защита от петли: собственные запросы демона
+            // к этому же адресу обязаны идти напрямую, иначе он спросит сам
+            // себя. Настоящий получатель после REDIRECT не нужен: это всегда
+            // DNS, а адрес вышестоящего сервера берётся из `dns.servers`.
+            r.push_str("        meta skuid != 0 ip daddr 127.0.0.53 meta l4proto udp th dport 53 redirect to :");
+            r.push_str(&crate::paths::dns_stub_port().to_string());
+            r.push('\n');
+        }
         push_guards(&mut r, cfg, Guard::Output);
         if redirect_tcp {
             r.push_str("        meta l4proto tcp redirect to :");
@@ -576,7 +596,8 @@ mod tests {
             .contains("type route hook output priority mangle"));
         assert!(plan.ruleset.contains("meta l4proto udp meta mark set 0x2"));
         assert!(plan.ruleset.contains("meta l4proto tcp meta mark set 0x2"));
-        assert!(!plan.ruleset.contains("redirect to :"));
+        // Слушатель 15000 при TUN не нужен; DNS-заглушка — отдельный порт.
+        assert!(!plan.ruleset.contains("redirect to :15000"));
         assert!(plan
             .ip_pre
             .iter()
@@ -587,6 +608,80 @@ mod tests {
             .ip_post
             .iter()
             .any(|c| c.contains("local default dev lo table 100")));
+    }
+
+    /// Тело одной цепочки плана: от `chain <name> {` до закрывающей скобки.
+    /// Тесты про DNS-заглушку должны смотреть именно nat output: такие же
+    /// строки есть и в других цепочках.
+    fn chain_body<'a>(ruleset: &'a str, name: &str) -> &'a str {
+        let head = format!("    chain {name} {{");
+        let start = ruleset
+            .find(&head)
+            .unwrap_or_else(|| panic!("цепочки {name} нет"));
+        let rest = &ruleset[start + head.len()..];
+        let end = rest.find("\n    }").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn dns_stub_redirect_precedes_loopback_exclusion() {
+        let plan = build_plan(&base_cfg());
+        let nat_out = chain_body(&plan.ruleset, "nat_output");
+        let line = nat_out
+            .lines()
+            .find(|l| l.contains("redirect to :15053"))
+            .expect("правило DNS-заглушки есть");
+        // Петля исключена до правила: собственные запросы демона к 127.0.0.53
+        // не должны попадать в его же слушатель.
+        assert!(line.contains("meta skuid != 0"));
+        assert!(line.contains("ip daddr 127.0.0.53"));
+        // И правило обязано стоять до `oifname "lo" return`, иначе до него
+        // просто не дойдёт: весь loopback возвращается раньше.
+        let stub_at = nat_out.find("redirect to :15053").unwrap();
+        let lo_return = nat_out.find("oifname \"lo\" return").unwrap();
+        assert!(
+            stub_at < lo_return,
+            "заглушка должна перехватывать до return"
+        );
+    }
+
+    #[test]
+    fn dns_stub_can_be_turned_off() {
+        let mut c = base_cfg();
+        c.dns.intercept_stub = false;
+        let plan = build_plan(&c);
+        assert!(!plan.ruleset.contains("15053"));
+    }
+
+    #[test]
+    fn dns_stub_respects_excluded_port_53() {
+        let mut c = base_cfg();
+        c.intercept.exclude_ports = vec!["53".into()];
+        let plan = build_plan(&c);
+        // «Порт 53 не перехватывать» относится и к системному резолверу:
+        // иначе исключение действует только на внешние DNS-запросы.
+        assert!(!plan.ruleset.contains("15053"));
+    }
+
+    #[test]
+    fn dns_stub_lives_in_nat_output_under_tun() {
+        let mut c = base_cfg();
+        c.tun.enabled = true;
+        let plan = build_plan(&c);
+        // Под TUN nat output создаётся ради заглушки, но TCP в него не
+        // отправляется: локальный TCP забирает устройство.
+        assert!(plan.ruleset.contains("chain nat_output"));
+        assert!(plan.ruleset.contains("redirect to :15053"));
+        assert!(!plan.ruleset.contains("redirect to :15000"));
+    }
+
+    #[test]
+    fn disabled_intercept_produces_no_dns_stub() {
+        let mut c = base_cfg();
+        c.intercept.tcp = TcpMode::Off;
+        c.intercept.udp = UdpMode::Off;
+        let plan = build_plan(&c);
+        assert!(!plan.ruleset.contains("15053"));
     }
 
     #[test]
@@ -606,10 +701,14 @@ mod tests {
         c.intercept.docker = true;
         c.tun.enabled = true;
         let plan = build_plan(&c);
-        // Цепочки: mangle output (TUN), mangle prerouting, nat prerouting
-        // (docker). nat output с TUN не создаётся — REDIRECT для TCP выключен.
-        assert!(!plan.ruleset.contains("chain nat_output"));
-        assert_eq!(plan.ruleset.matches("meta nfproto ipv6 return").count(), 3);
+        // Цепочки: mangle output (TUN), mangle prerouting, nat output
+        // (только DNS-заглушка — REDIRECT для TCP выключен), nat prerouting
+        // (docker). Guard'ов ровно по одному на цепочку.
+        assert!(plan.ruleset.contains("chain nat_output"));
+        assert!(!chain_body(&plan.ruleset, "nat_output").contains("redirect to :15000"));
+        // TCP форвардинга (docker) по-прежнему идёт в слушатель 15000.
+        assert!(chain_body(&plan.ruleset, "nat_prerouting").contains("redirect to :15000"));
+        assert_eq!(plan.ruleset.matches("meta nfproto ipv6 return").count(), 4);
     }
 
     #[test]

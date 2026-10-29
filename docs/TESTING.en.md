@@ -85,8 +85,10 @@ pfu-cli metrics               # connection and byte counters
 - [ ] `curl https://example.com` → 200, and `pfu-cli metrics` shows growing
       `connections` and bytes once connections close
 - [ ] DNS to external servers goes through the daemon with `tun.enabled: true`:
-      `dig @8.8.8.8 +short example.com` answers and `pfu-cli metrics` grows;
-      queries to 127.0.0.53 (systemd-resolved) still bypass it — see §5
+      `dig @8.8.8.8 +short example.com` answers and `pfu-cli metrics` grows
+- [ ] Queries to the system resolver go through the daemon when
+      `dns.intercept_stub: true`: `dig +short example.com` (default server
+      `127.0.0.53`) answers and `pfu-cli metrics` grows — see §5
 
 ## 5. DNS
 
@@ -96,13 +98,22 @@ outbound chosen by the rules, the answer is returned to the application, and
 the "IP → domain" pair is remembered for later connections to that address
 (`docs/ARCHITECTURE.md` §6.3).
 
+With `dns.intercept_stub: true` (the default) the system resolver is covered
+as well, without TUN: a nat output rule redirects `127.0.0.53:53` to the
+daemon's listener `127.0.0.1:15053`, the raw query leaves through the outbound
+chosen by the domain rules, and the reply is delivered to the application from
+`127.0.0.53:53` (conntrack restores the source). The live proof is the netns
+stand in `материалы сессии 19/`: the local fake resolver answers `203.0.113.99`,
+the real upstream answers `203.0.113.1`, and the application must see `.1`.
+
 What it does not do:
 
-- **`127.0.0.53` (systemd-resolved) is not intercepted** — it is loopback and
-  is excluded from every chain. System applications that use the stub resolver
-  resolve names as before, and resolved asks its upstream (usually a private
-  router address) directly.
-- DNS over TCP is proxied but not recorded in the "IP → domain" map.
+- **DNS over TCP to the stub** (`127.0.0.53:53/tcp`) still goes direct: only
+  UDP queries are redirected to the listener.
+- **IPv6 DNS** is not intercepted: the listeners are IPv4.
+- A resolver query is sent to the upstream from `dns.servers`; if the chosen
+  outbound cannot carry UDP, the daemon falls back to direct resolution
+  (system resolver, then DoH) instead of leaving the application without DNS.
 
 - [ ] After `connect` DNS still works: `dig +short example.com`
 - [ ] `dig @8.8.8.8 +short example.com` returns the real address, not

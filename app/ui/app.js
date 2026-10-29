@@ -54,7 +54,8 @@ const I18N = {
     'set.diagnose': 'Проверка окружения', 'set.run': 'Запустить', 'set.interface': 'Интерфейс',
     'set.lang': 'Язык', 'set.theme': 'Тема', 'set.advanced': 'Параметры перехвата',
     'set.diagnose.hint': 'Проверит nftables, TUN, права и занятые порты.',
-    'set.intercept.hint': 'Локальный UDP (DNS, QUIC) перехватывается при включённом TUN. DNS-запросы к внешним серверам идут через прокси, ответ запоминается как «IP → домен»; запросы к 127.0.0.53 идут мимо.',
+    'set.intercept.hint': 'Локальный UDP (DNS, QUIC) перехватывается при включённом TUN. Запросы к 127.0.0.53 (systemd-resolved) перехватывает отдельный слушатель — без этого системный резолвер ходит мимо прокси. Ответ запоминается как «IP → домен».',
+    'set.dnsStub': 'Системный DNS (127.0.0.53)',
     'err.daemon': 'Демон недоступен', 'err.daemon.hint': 'sudo systemctl start proxy-for-ubuntud',
     'err.generic': 'Что-то пошло не так',
     'err.untouched': 'Системные правила не менялись — откатывать было нечего.',
@@ -113,7 +114,8 @@ const I18N = {
     'set.diagnose': 'Environment check', 'set.run': 'Run', 'set.interface': 'Interface',
     'set.lang': 'Language', 'set.theme': 'Theme', 'set.advanced': 'Interception settings',
     'set.diagnose.hint': 'Checks nftables, TUN, privileges and busy ports.',
-    'set.intercept.hint': 'Local UDP (DNS, QUIC) is intercepted when TUN is enabled. DNS queries to external servers go through the proxy and the answer is remembered as "IP → domain"; queries to 127.0.0.53 bypass it.',
+    'set.intercept.hint': 'Local UDP (DNS, QUIC) is intercepted when TUN is enabled. Queries to 127.0.0.53 (systemd-resolved) are captured by a separate listener — without it the system resolver bypasses the proxy. Answers are remembered as "IP → domain".',
+    'set.dnsStub': 'System DNS (127.0.0.53)',
     'err.daemon': 'Daemon unavailable', 'err.daemon.hint': 'sudo systemctl start proxy-for-ubuntud',
     'err.generic': 'Something went wrong',
     'err.untouched': 'System rules were never changed — there was nothing to roll back.',
@@ -181,7 +183,7 @@ function mock(method, params) {
     ],
     final: 'DIRECT',
     intercept: { tcp: 'redirect', udp: 'tproxy' },
-    dns: { strategy: 'redir-host' },
+    dns: { strategy: 'redir-host', intercept_stub: true },
   };
   switch (method) {
     case 'daemon.status':
@@ -884,6 +886,8 @@ async function renderSettings() {
   $('#tcpMode').value = (c.intercept && c.intercept.tcp) || 'redirect';
   $('#udpMode').value = (c.intercept && c.intercept.udp) || 'tproxy';
   $('#dnsStrategy').value = (c.dns && c.dns.strategy) || 'redir-host';
+  // Поле не задано — значит включено: так же поступает и схема конфига.
+  $('#dnsStub').checked = !(c.dns && c.dns.intercept_stub === false);
   $('#langSelect').value = state.lang;
   $('#themeSelect').value = state.theme;
 }
@@ -1064,6 +1068,10 @@ async function boot() {
       if (id === 'dnsStrategy') (state.config.dns ||= {}).strategy = e.target.value;
     };
   }
+  $('#dnsStub').onchange = e => {
+    if (!state.config) return;
+    (state.config.dns ||= {}).intercept_stub = e.target.checked;
+  };
   $$('[data-goto]').forEach(b => b.onclick = () => goto(b.dataset.goto));
 
   goto('overview');

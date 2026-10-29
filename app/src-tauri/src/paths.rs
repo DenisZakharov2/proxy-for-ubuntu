@@ -56,6 +56,13 @@ pub fn tproxy_port() -> u16 {
     15001
 }
 
+/// Слушатель DNS-запросов, вырванных из системного резолвера (`127.0.0.53`).
+/// Отдельный порт: там уже отвечает не прокси, а сам демон, и смешивать этот
+/// трафик с общим UDP-перехватом (TPROXY) нельзя.
+pub fn dns_stub_port() -> u16 {
+    15053
+}
+
 pub fn builtin_profiles_dir() -> PathBuf {
     PathBuf::from("/usr/share/proxy-for-ubuntu/profiles")
 }

@@ -12,7 +12,7 @@ QUIC — goes through the proxy too. The core is written from scratch in
 Rust: no sing-box, no Xray, no clash. See "Interception limits".
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/Ubuntu-22.04%20|%2024.04-orange.svg)](https://ubuntu.com/)
 
 </div>
@@ -101,14 +101,18 @@ working normally — and `apt remove` restores the system on its own.
   DNS, QUIC and game traffic from the machine itself goes direct, past the
   proxy: `REDIRECT` leaves no way to learn a datagram's real destination. With
   TUN the traffic goes into `pfu0` and is parsed by the userspace stack.
-- **DNS is intercepted with `tun.enabled: true` and `dns.strategy: redir-host`**
-  (the default). The query travels through the outbound chosen by the rules,
-  the application receives the real address, and the daemon learns the
-  "IP → domain" pair from the answer — so domain rules apply to connections the
-  application opens by address. `fake-ip` is not implemented: a config using it
-  is rejected by validation instead of being silently ignored. Queries to
-  `127.0.0.53` (systemd-resolved) still bypass interception: it is loopback and
-  is excluded; applications that talk to an external DNS directly are caught.
+- **DNS is intercepted on two paths.** Queries to external servers — with
+  `tun.enabled: true`: the datagram goes into `pfu0` and leaves through the
+  outbound chosen by the rules. Queries to the system resolver `127.0.0.53`
+  (systemd-resolved) — with `dns.intercept_stub: true` (the default) and no
+  TUN at all: a nat output rule redirects them to the daemon's own listener
+  `127.0.0.1:15053`, the query goes to the upstream from `dns.servers` through
+  the proxy, and the application receives the answer from `127.0.0.53:53`.
+  The application gets the real address and the daemon learns the
+  "IP → domain" pair from the answer — so domain rules apply to connections
+  opened by address. `fake-ip` is not implemented: a config using it is
+  rejected by validation instead of being silently ignored. DNS over TCP to
+  the resolver itself (`127.0.0.53:53/tcp`) still goes direct.
 - **UDP is intercepted for forwarded traffic only** — containers. Container
   TCP is intercepted with `intercept.docker: true`, UDP with
   `intercept.udp: tproxy`.

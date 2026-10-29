@@ -234,8 +234,12 @@
               <select id="udpMode"><option value="tproxy">tproxy</option><option value="off">выключен</option></select></label>
             <label><span>DNS</span>
               <select id="dnsStrategy"><option value="redir-host">redir-host</option></select></label>
+            <div class="check" style="align-self:center">
+              <input type="checkbox" id="dnsStub">
+              <label for="dnsStub" data-i18n="set.dnsStub">Системный DNS (127.0.0.53)</label>
+            </div>
           </div>
-          <p class="hint" data-i18n="set.intercept.hint">Локальный UDP (DNS, QUIC) перехватывается при включённом TUN. DNS-запросы к внешним серверам идут через прокси, ответ запоминается как «IP → домен»; запросы к 127.0.0.53 идут мимо.</p>
+          <p class="hint" data-i18n="set.intercept.hint">Локальный UDP (DNS, QUIC) перехватывается при включённом TUN. Запросы к 127.0.0.53 (systemd-resolved) перехватывает отдельный слушатель — без этого системный резолвер ходит мимо прокси. Ответ запоминается как «IP → домен».</p>
         </div>
       </section>
     </div>

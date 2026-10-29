@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{TcpMode, UdpMode};
+use crate::engine::dns;
 use crate::engine::router::{self, Engine};
 use crate::engine::rules::{Decision, Flow, Target};
 use crate::error::{Error, Result};
@@ -38,6 +39,12 @@ const IP_ORIGDSTADDR: libc::c_int = 20;
 
 /// Сколько живёт UDP-поток без единой датаграммы в любую сторону.
 const UDP_IDLE: Duration = Duration::from_secs(60);
+
+/// Сколько ждём ответа вышестоящего DNS через прокси. glibc ждёт ответа около
+/// пяти секунд, поэтому бюджет вместе с запасным разрешением — меньше этого.
+const DNS_STUB_TIMEOUT: Duration = Duration::from_secs(3);
+/// Бюджет запасного разрешения (системный путь, затем DoH).
+const DNS_STUB_FALLBACK: Duration = Duration::from_secs(2);
 
 /// Запущенные слушатели. `stop`/`Drop` закрывают порты: после отключения
 /// перехвата приложение не оставляет открытых сокетов.
@@ -71,14 +78,20 @@ impl Capture {
         tracing::info!("слушатели перехвата останавливаются");
         self.cancel.cancel();
         let handles = std::mem::take(&mut self.tasks);
-        // `abort` только просит задачу завершиться; `await` ждёт, пока её
-        // future уничтожен и сокет закрыт. Без второго шага следующий bind
-        // на 15000/15001 ловит EADDRINUSE (так и было при reload).
-        for t in &handles {
-            t.abort();
-        }
-        for t in handles {
-            let _ = t.await;
+        // Сначала даём циклам выйти по отмене: у DNS-заглушки есть дочерние
+        // задачи на каждый запрос, и они держат её сокет. Оборвать задачу —
+        // значит не дождаться, пока future уничтожен, и следующий bind на
+        // 15053 поймает EADDRINUSE. `abort` остаётся страховкой на случай,
+        // если задача зависла.
+        for mut t in handles {
+            tokio::select! {
+                _ = &mut t => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    tracing::warn!("слушатель не остановился сам — прерываю");
+                    t.abort();
+                    let _ = t.await;
+                }
+            }
         }
     }
 
@@ -151,6 +164,24 @@ pub async fn start_with(engine: Arc<Engine>, reuse: Option<super::tun::Tun>) -> 
         if engine.config.intercept.udp != UdpMode::Off {
             let sock = Arc::new(udp_socket(paths::tproxy_port())?);
             tasks.push(tokio::spawn(udp_loop(engine.clone(), sock, cancel.clone())));
+        }
+
+        // Системный резолвер (systemd-resolved) спрашивает имена у себя на
+        // 127.0.0.53:53. Отдельный слушатель, потому что этот трафик приходит
+        // обычным REDIRECT в nat output, а не TPROXY: настоящий получатель
+        // здесь не нужен — это всегда DNS.
+        if engine.config.dns.intercept_stub && engine.config.interception_active() {
+            let port = paths::dns_stub_port();
+            let sock = UdpSocket::bind(("0.0.0.0", port)).await.map_err(|e| {
+                Error::Internal(format!(
+                    "не удалось занять порт {port} для DNS-заглушки: {e}"
+                ))
+            })?;
+            tasks.push(tokio::spawn(dns_stub_loop(
+                engine.clone(),
+                Arc::new(sock),
+                cancel.clone(),
+            )));
         }
         Ok(())
     }
@@ -628,4 +659,166 @@ async fn recv_with_origdst(
 /// к настоящему получателю, поэтому подменять что-то через `sendmsg` не нужно.
 async fn send_from(sock: &UdpSocket, data: &[u8], to: SocketAddr) -> io::Result<()> {
     sock.send_to(data, to).await.map(|_| ())
+}
+
+// ─────────────────────────── Системный резолвер ─────────────────────────────
+
+/// Слушатель перехваченных запросов к `127.0.0.53:53`.
+///
+/// Приложение шлёт запрос на stub systemd-resolved, nat-правило переписывает
+/// получателя на этот порт, а ответ возвращается тем же сокетом: conntrack
+/// подменяет источник обратно на `127.0.0.53:53`, иначе подключённый сокет
+/// приложения датаграмму отбросит.
+async fn dns_stub_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>, cancel: CancellationToken) {
+    let mut buf = vec![0u8; 4096];
+    let mut last_err_log: Option<std::time::Instant> = None;
+    // Задачи на каждый запрос живут в JoinSet, а не отдельно: они держат
+    // `Arc<UdpSocket>`, и при остановке их нужно дождаться, иначе порт 15053
+    // останется занятым и следующий `connect`/`reload` не сможет его взять.
+    let mut queries = tokio::task::JoinSet::new();
+    tracing::info!(
+        port = paths::dns_stub_port(),
+        "DNS-заглушка системного резолвера запущена"
+    );
+
+    loop {
+        let received = tokio::select! {
+            _ = cancel.cancelled() => break,
+            received = sock.recv_from(&mut buf) => received,
+            Some(_) = queries.join_next(), if !queries.is_empty() => continue,
+        };
+        match received {
+            Ok((n, client)) => {
+                let query = buf[..n].to_vec();
+                queries.spawn(dns_stub_query(engine.clone(), sock.clone(), query, client));
+            }
+            Err(e) => {
+                let now = std::time::Instant::now();
+                let should_log = match last_err_log {
+                    Some(t) => now.duration_since(t) >= Duration::from_secs(1),
+                    None => true,
+                };
+                if should_log {
+                    tracing::warn!(error = %e, "DNS-заглушка: датаграмма не принята");
+                    last_err_log = Some(now);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    // Ждём закрытия дочерних задач: сокет освободится только вместе с ними.
+    queries.abort_all();
+    while queries.join_next().await.is_some() {}
+}
+
+async fn dns_stub_query(
+    engine: Arc<Engine>,
+    sock: Arc<UdpSocket>,
+    query: Vec<u8>,
+    client: SocketAddr,
+) {
+    let reply = stub_resolve(&engine, &query, client).await;
+    if let Err(e) = sock.send_to(&reply, client).await {
+        tracing::debug!(%client, error = %e, "DNS-заглушка: ответ не отправлен");
+    }
+}
+
+/// Ответ на запрос приложения к системному резолверу.
+///
+/// Правила применяются по имени из вопроса: адрес `127.0.0.53` технический,
+/// и решать по нему нельзя. Сам запрос уходит вышестоящему серверу
+/// (`dns.servers`) через outbound, выбранный правилами, — то есть имя
+/// разрешается на стороне прокси, а не провайдера.
+async fn stub_resolve(engine: &Arc<Engine>, query: &[u8], client: SocketAddr) -> Vec<u8> {
+    let Ok((start, end, _qtype)) = dns::parse_question(query) else {
+        return dns::servfail(query);
+    };
+    let domain = dns::decode_qname(query, start, end);
+    if domain.is_empty() {
+        return dns::servfail(query);
+    }
+
+    let flow = Flow {
+        dst_ip: None,
+        dst_port: 53,
+        src_port: client.port(),
+        is_tcp: false,
+        domain: Some(domain.clone()),
+        domain_confident: true,
+        ..Default::default()
+    };
+    let (decision, label, rule) = engine.route(&flow);
+    match decision {
+        Decision::Reject | Decision::RejectDrop => {
+            tracing::debug!(%domain, rule = %rule, "DNS-заглушка: имя отклонено правилом");
+            return dns::servfail(query);
+        }
+        Decision::HijackDns => {
+            let reply = engine.dns.answer_query(query).await;
+            engine.stats.add_up(query.len() as u64);
+            engine.stats.add_down(reply.len() as u64);
+            return reply;
+        }
+        Decision::Direct | Decision::Proxy(_) => {}
+    }
+
+    let label = label.unwrap_or_else(|| "DIRECT".to_string());
+    let Some(ob) = engine.resolve_outbound(&label) else {
+        tracing::debug!(outbound = %label, "DNS-заглушка: outbound не найден");
+        return dns::servfail(query);
+    };
+
+    if let Some(session) = engine.open_udp(&ob).await {
+        // Спрашивать сам stub бессмысленно: это тот же вопрос по кругу.
+        // Адрес вышестоящего сервера — из `dns.servers`/`dns.fallback`.
+        let upstream = dns::first_upstream(&engine.config.dns.servers, &engine.config.dns.fallback);
+        let target = Target {
+            host: upstream.ip().to_string(),
+            port: upstream.port(),
+            is_tcp: false,
+        };
+        if session.send_to(query, &target).await.is_ok() {
+            let mut buf = vec![0u8; 4096];
+            let got = tokio::time::timeout(
+                DNS_STUB_TIMEOUT,
+                session.recv_from(&mut buf, DNS_STUB_TIMEOUT),
+            )
+            .await;
+            if let Ok(Ok((n, _from))) = got {
+                let reply = &buf[..n];
+                if dns::is_reply_to(query, reply) {
+                    // Ответ настоящий — из него берём пару «адрес → домен».
+                    engine.dns.remember_response(reply);
+                    engine.stats.add_up(query.len() as u64);
+                    engine.stats.add_down(n as u64);
+                    engine
+                        .breakdown
+                        .record(&rule, ob.name(), query.len() as u64 + n as u64);
+                    return reply.to_vec();
+                }
+            }
+        }
+        tracing::debug!(
+            %domain, outbound = %ob.name(),
+            "DNS-заглушка: через прокси ответа нет, разрешаем напрямую"
+        );
+    } else {
+        tracing::debug!(
+            %domain, outbound = %ob.name(),
+            "DNS-заглушка: outbound не умеет UDP, разрешаем напрямую"
+        );
+    }
+
+    // Запасной путь — прямое разрешение (системный путь, затем DoH). Демон
+    // работает от root, и его собственный запрос к 127.0.0.53 правилом не
+    // перехватывается (`meta skuid != 0`), поэтому петли нет.
+    match tokio::time::timeout(DNS_STUB_FALLBACK, engine.dns.answer_query(query)).await {
+        Ok(reply) => {
+            engine.stats.add_up(query.len() as u64);
+            engine.stats.add_down(reply.len() as u64);
+            reply
+        }
+        Err(_) => dns::servfail(query),
+    }
 }

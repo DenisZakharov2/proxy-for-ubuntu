@@ -152,6 +152,13 @@ impl Config {
         self.validate_inner(false)
     }
 
+    /// Перехват вообще что-то делает: включён хотя бы один путь (TCP, UDP или
+    /// TUN). Если всё выключено, правила не создаются целиком, и `connect`
+    /// ничего не трогает в системе.
+    pub fn interception_active(&self) -> bool {
+        self.intercept.tcp != TcpMode::Off || self.intercept.udp != UdpMode::Off || self.tun.enabled
+    }
+
     fn validate_inner(&self, strict: bool) -> Result<()> {
         if self.api > crate::API_VERSION {
             return Err(Error::ConfigInvalid(format!(
@@ -404,6 +411,12 @@ pub enum DnsStrategy {
 pub struct DnsConfig {
     #[serde(default)]
     pub strategy: DnsStrategy,
+    /// Перехватывать запросы к системному резолверу `127.0.0.53`
+    /// (systemd-resolved). Без этого приложения, которые спрашивают имена
+    /// через системный DNS, ходят мимо прокси: заблокированное по имени
+    /// остаётся недоступным, хотя перехват включён.
+    #[serde(default = "default_true")]
+    pub intercept_stub: bool,
     #[serde(default = "default_cache_size")]
     pub cache_size: usize,
     #[serde(default = "default_cache_ttl")]
@@ -431,6 +444,7 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             strategy: DnsStrategy::default(),
+            intercept_stub: true,
             cache_size: default_cache_size(),
             cache_ttl: default_cache_ttl(),
             servers: default_dns_servers(),

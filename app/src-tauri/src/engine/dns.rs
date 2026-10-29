@@ -16,7 +16,7 @@
 //! выбранный правилами outbound (`engine::tun::udp`, `engine::capture`).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -461,6 +461,40 @@ pub fn servfail(query: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Адрес вышестоящего DNS-сервера из строки конфига (`dns.servers`,
+/// `dns.fallback`). Понимает `1.1.1.1`, `1.1.1.1:5353`, `[::1]:53`.
+///
+/// Имя хоста намеренно не принимается: чтобы его разрешить, понадобился бы
+/// ровно тот DNS, который мы и перехватываем, — получился бы цикл.
+pub fn upstream_addr(server: &str) -> Option<SocketAddr> {
+    let s = server.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    s.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 53))
+}
+
+/// Первый пригодный адрес из `servers`, затем из `fallback`. Если не
+/// разобралась ни одна строка — Cloudflare: остаться совсем без DNS хуже,
+/// чем взять общеизвестный сервер.
+pub fn first_upstream(servers: &[String], fallback: &[String]) -> SocketAddr {
+    servers
+        .iter()
+        .chain(fallback.iter())
+        .find_map(|s| upstream_addr(s))
+        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53))
+}
+
+/// Ответ ли это на наш запрос. Сессия UDP своя на каждый запрос, но проверка
+/// дешёвая и отсекает чужие или запоздавшие датаграммы, которые иначе ушли бы
+/// приложению как ответ.
+pub fn is_reply_to(query: &[u8], reply: &[u8]) -> bool {
+    reply.len() >= 12 && query.len() >= 2 && reply[..2] == query[..2]
+}
+
 /// Читает UDP-датаграмму целиком.
 pub async fn recv_datagram(sock: &tokio::net::UdpSocket) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; 4096];
@@ -621,5 +655,51 @@ mod tests {
         r.gc();
         // После gc кэш пуст, но это не должно падать.
         assert!(r.resolve("localhost").await.is_ok());
+    }
+
+    #[test]
+    fn upstream_accepts_plain_and_explicit_port() {
+        assert_eq!(
+            upstream_addr("1.1.1.1"),
+            Some("1.1.1.1:53".parse().unwrap()),
+            "без порта — стандартный 53"
+        );
+        assert_eq!(
+            upstream_addr(" 9.9.9.9:5353 "),
+            Some("9.9.9.9:5353".parse().unwrap())
+        );
+        assert_eq!(
+            upstream_addr("[2606:4700:4700::1111]:53"),
+            Some("[2606:4700:4700::1111]:53".parse().unwrap())
+        );
+        // Имя хоста не принимается: его разрешение снова потребовало бы DNS.
+        assert_eq!(upstream_addr("dns.google"), None);
+        assert_eq!(upstream_addr(""), None);
+    }
+
+    #[test]
+    fn first_upstream_skips_bad_entries_and_falls_back() {
+        let servers = vec!["dns.google".to_string(), "1.0.0.1:5353".to_string()];
+        let fallback = vec!["9.9.9.9".to_string()];
+        assert_eq!(
+            first_upstream(&servers, &fallback),
+            "1.0.0.1:5353".parse().unwrap()
+        );
+        // Ни одной пригодной строки — Cloudflare, а не паника и не пустой адрес.
+        assert_eq!(
+            first_upstream(&["bad".into()], &[]),
+            "1.1.1.1:53".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn reply_is_matched_by_transaction_id() {
+        let query = query("example.com", 1);
+        let reply = build_response(&query, &["1.2.3.4".parse().unwrap()], 60);
+        assert!(is_reply_to(&query, &reply));
+        let mut other = reply.clone();
+        other[0] ^= 0xFF;
+        assert!(!is_reply_to(&query, &other), "чужой ID — не наш ответ");
+        assert!(!is_reply_to(&query, &[0xAB]), "обрезанный пакет");
     }
 }

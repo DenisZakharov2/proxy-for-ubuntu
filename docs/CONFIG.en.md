@@ -17,6 +17,7 @@ log:
   file: /var/log/proxy-for-ubuntu/engine.log
 dns:
   strategy: redir-host  # the only supported value: fake-ip is rejected
+  intercept_stub: true  # intercept queries to 127.0.0.53 (systemd-resolved)
   cache_size: 4096
   cache_ttl: 300
   servers:
@@ -92,8 +93,15 @@ First-version limits (0.3.0):
   leave via the outbound chosen by the rules; the answer is remembered as
   "IP → domain", and domain rules apply to later connections to that address.
   `fake-ip` is not implemented and is rejected by config validation.
-  DNS over TCP (53/tcp) is proxied but not recorded; DoH/DoT is sent to
-  443/853 by the application and travels as ordinary TCP.
+* `dns.intercept_stub` (default `true`): queries to the system resolver
+  `127.0.0.53:53` are captured by a dedicated nat output rule and the listener
+  `127.0.0.1:15053` — no TUN needed. The query goes to the upstream from
+  `dns.servers` through the outbound chosen by the rules, and the application
+  receives the answer from `127.0.0.53:53`. The daemon's own queries (uid 0)
+  are not intercepted, otherwise it would loop. DNS over TCP to the resolver
+  (`:53/tcp`) still goes direct; DoH/DoT is sent to 443/853 by the application
+  and travels as ordinary TCP. Port 53 in `intercept.exclude_ports` disables
+  this rule too.
 
 ## `outbounds`
 
