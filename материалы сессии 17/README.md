@@ -7,7 +7,7 @@
 | `config-live.yaml` | конфиг для живой проверки: `tun.enabled: true`, `mtu: 1500`, `dns.strategy: redir-host`, единственный outbound `DIRECT` (как в установленном конфиге) |
 | `live-check.sh` | измерения `before` / `traffic` / `after`; сам перехват не включает |
 | `quic-probe.py` | QUIC-рукопожатие (ALPN `h3`) через `aioquic` — на машине нет curl с HTTP/3 |
-| `release/` | релизный `.deb` 0.3.0 из CI + `.sha256`; появляется после публикации тега |
+| `release/` | релизный `.deb` 0.3.0 из CI + `.sha256` (4 343 468 байт, sha256 `d7059aa9…d8cb01`) |
 
 ## Что проверено на этой машине
 
