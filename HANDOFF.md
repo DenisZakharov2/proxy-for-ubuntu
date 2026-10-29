@@ -119,7 +119,7 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
 
 ### 2.4 Сессия 13 (29.10.2026): 0.2.0 в работе, фабрика `pfu-1-0`
 
-Не запушено, только локальные коммиты на `main`:
+Запушено в `main` 29.10.2026 (`262008e..b98e84b`); CI и Protocols запущены на `b98e84b`:
 
 | Коммит | Что |
 |---|---|
@@ -128,6 +128,7 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
 | `29861e2` | IPC импорта: `profile.import_uri`, `subscription.preview`, `subscription.apply`, реестр `subscriptions.json`, планировщик обновления в `Server::serve`. 175 тестов |
 | `144a99b` | GUI: хелпер `ipc` → `rpc` (WRY ставит свой `window.ipc`, из-за чего окно в поставочной сборке оставалось мёртвым), `enabled` из `daemon.status`, `engine_loaded` в окне, транспорт `tcp/ws` у vless/vmess, проверка формы до сохранения |
 | `a3f4405` | безопасность: `Debug` для `Outbound` редактирует пароли/UUID/passphrase, `${VAR}` без значения — ошибка разбора, `env`/`config.yaml` 0600 root при каждом `configure`, `UMask=0077` и `RestrictAddressFamilies` в юните. 178 тестов |
+| `b98e84b` | `protocols.yml`: шаги «обмен байтами с портом Xray» заменены на `pfu-cli test-outbound`, образ Xray закреплён по digest `sha256:192de110…`, матрица строится из фактических JSON-ответов (`TASK-004`) |
 
 Состояние фабрики (`/home/anony/autonomous-sw-factory`, прогон `pfu-1-0`,
 режим brownfield, 56 событий в журнале):
