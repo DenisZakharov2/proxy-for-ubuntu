@@ -12,7 +12,7 @@ Rust: no sing-box, no Xray, no clash. Local UDP — DNS, QUIC — still goes
 direct, see "Interception limits".
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.3-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/Ubuntu-22.04%20|%2024.04-orange.svg)](https://ubuntu.com/)
 
 </div>

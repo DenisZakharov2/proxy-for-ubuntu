@@ -1,0 +1,16 @@
+api: 1
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: VLESS-Test, type: vless, server: 127.0.0.1, port: 1443,
+     uuid: "b831381d-6324-4d53-ad4f-8cda48b30811",
+     tls: false, network: tcp, flow: "", udp: false, skip_cert_verify: true}
+  - {name: VMESS-Test, type: vmess, server: 127.0.0.1, port: 1444,
+     uuid: "c942181d-6324-4d53-ad4f-8cda48b30822",
+     tls: false, network: tcp, alter_id: 0, skip_cert_verify: true, udp: false}
+  - {name: VMESS-Chacha, type: vmess, server: 127.0.0.1, port: 1444,
+     uuid: "c942181d-6324-4d53-ad4f-8cda48b30822",
+     tls: false, network: tcp, alter_id: 0, security: chacha20-poly1305,
+     skip_cert_verify: true, udp: false}
+rules:
+  - MATCH,DIRECT
+final: DIRECT
