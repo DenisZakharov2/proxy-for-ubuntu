@@ -185,14 +185,25 @@ impl Resolver {
     }
 
     async fn resolve_uncached(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        use std::net::ToSocketAddrs;
         // Сначала пробуем системный путь: он учитывает /etc/hosts и
         // systemd-resolved, что важно для внутренних имён в сети.
-        if let Ok(addrs) = (domain, 0u16).to_socket_addrs() {
-            let v: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-            if !v.is_empty() {
-                return Ok(v);
-            }
+        //
+        // `getaddrinfo` блокирующий, и на рабочем потоке tokio он остановил
+        // бы чужие задачи на всё время таймаута резолвера. С DNS-заглушкой
+        // системного резолвера этот путь вызывается часто, поэтому уводим
+        // его в блокирующий пул.
+        let name = domain.to_string();
+        let resolved = tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            (name.as_str(), 0u16)
+                .to_socket_addrs()
+                .map(|it| it.map(|a| a.ip()).collect::<Vec<IpAddr>>())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        if !resolved.is_empty() {
+            return Ok(resolved);
         }
         // Затем DoH — работает, даже когда UDP/53 перехвачен.
         let mut last = None;
