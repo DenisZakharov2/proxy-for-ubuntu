@@ -1,0 +1,6 @@
+table inet pfutest {
+    chain out {
+        type nat hook output priority -100; policy accept;
+        udp dport 9999 redirect to :19999
+    }
+}

@@ -1,0 +1,961 @@
+From 572eac863d221b26071e57cb7e52525d88a62a0d Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Mon, 26 Oct 2026 06:41:42 -0400
+Subject: [PATCH] =?UTF-8?q?p0:=20shutdown=20UDP,=20=D0=B8=D0=B4=D0=B5?=
+ =?UTF-8?q?=D0=BC=D0=BF=D0=BE=D1=82=D0=B5=D0=BD=D1=82=D0=BD=D1=8B=D0=B9=20?=
+ =?UTF-8?q?teardown,=20=D0=BB=D0=B8=D0=BC=D0=B8=D1=82=20fd?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- capture.rs: общий CancellationToken останавливает UDP-потоки вместе с
+  циклом приёма — порт 15001 освобождается сразу, а не через UDP_IDLE;
+  ответы клиенту уходят с сокета, привязанного к настоящему получателю
+  (раньше источником был порт 15001, и клиент молча отбрасывал ответ);
+  accept при EMFILE/ENFILE — пауза 1 с и одно предупреждение в секунду.
+- nft.rs: teardown идемпотентен и возвращает список неудачных команд;
+  правило ip добавляется только при отсутствии; prerouting больше не
+  забирает в tproxy трафик к самой машине и multicast (mDNS, NTP).
+- ipc.rs: повторный connect не падает на занятом порту и не оставляет
+  enabled=true без слушателей; diagnose показывает fd и soft-лимит.
+- systemd: LimitNOFILE=65536.
+
+Проверено живьём: 5 циклов connect→curl 200→disconnect без остатков;
+UDP TPROXY через стенд из двух netns — 5/5 ответов с исходного адреса и
+порта, после disconnect все сокеты закрыты (63 мс).
+---
+ app/src-tauri/src/bin/daemon.rs             |   8 +-
+ app/src-tauri/src/engine/capture.rs         | 223 ++++++++++++------
+ app/src-tauri/src/engine/nft.rs             | 236 +++++++++++++++-----
+ app/src-tauri/src/ipc.rs                    |  77 ++++++-
+ packaging/systemd/proxy-for-ubuntud.service |   5 +
+ 5 files changed, 413 insertions(+), 136 deletions(-)
+
+diff --git a/app/src-tauri/src/bin/daemon.rs b/app/src-tauri/src/bin/daemon.rs
+index faff11d..4e06c0b 100644
+--- a/app/src-tauri/src/bin/daemon.rs
++++ b/app/src-tauri/src/bin/daemon.rs
+@@ -161,7 +161,9 @@ async fn run_daemon() -> Result<()> {
+ 
+     // Перехват, оставшийся от предыдущего аварийного завершения, снимаем на
+     // старте: иначе машина осталась бы без сети до переустановки пакета.
+-    nft::teardown().await.ok();
++    if let Err(e) = nft::teardown().await {
++        tracing::error!(error = %e, "не удалось снять правила при старте");
++    }
+     clear_stale_socket();
+ 
+     // Уже загруженный конфиг нужен, чтобы демон знал профили и geo-наборы.
+@@ -218,7 +220,9 @@ async fn run_daemon() -> Result<()> {
+     }
+     // Снимаем системные правила при любом завершении: оставленные
+     // правила nftables уводят машину в никуда после остановки демона.
+-    nft::teardown().await.ok();
++    if let Err(e) = nft::teardown().await {
++        tracing::error!(error = %e, "не удалось снять правила при остановке");
++    }
+     outcome
+ }
+ 
+diff --git a/app/src-tauri/src/engine/capture.rs b/app/src-tauri/src/engine/capture.rs
+index fac204b..5a04699 100644
+--- a/app/src-tauri/src/engine/capture.rs
++++ b/app/src-tauri/src/engine/capture.rs
+@@ -20,6 +20,7 @@ use tokio::io::Interest;
+ use tokio::net::{TcpListener, TcpStream, UdpSocket};
+ use tokio::sync::mpsc;
+ use tokio::task::JoinHandle;
++use tokio_util::sync::CancellationToken;
+ 
+ use crate::config::{TcpMode, UdpMode};
+ use crate::engine::router::{self, Engine};
+@@ -38,14 +39,30 @@ const IP_ORIGDSTADDR: libc::c_int = 20;
+ /// Сколько живёт UDP-поток без единой датаграммы в любую сторону.
+ const UDP_IDLE: Duration = Duration::from_secs(60);
+ 
+-/// Запущенные слушатели. `Drop` закрывает порты: после отключения перехвата
+-/// приложение не оставляет открытых сокетов.
++/// Запущенные слушатели. `stop`/`Drop` закрывают порты: после отключения
++/// перехвата приложение не оставляет открытых сокетов.
+ pub struct Capture {
+     tasks: Vec<JoinHandle<()>>,
++    /// Общий признак остановки. По нему завершаются не только циклы приёма,
++    /// но и уже открытые UDP-потоки: каждый держит `Arc<UdpSocket>` и без
++    /// этого жил бы до истечения `UDP_IDLE`, не давая закрыть порт 15001.
++    cancel: CancellationToken,
+ }
+ 
+ impl Capture {
+-    pub fn stop(&mut self) {
++    /// Останавливает слушатели и дожидается, пока задачи отпустят сокеты:
++    /// повторный `start` (SIGHUP, повторный `connect`) должен найти порты
++    /// свободными.
++    pub async fn stop(&mut self) {
++        tracing::info!("слушатели перехвата останавливаются");
++        self.abort();
++        for t in self.tasks.drain(..) {
++            let _ = t.await;
++        }
++    }
++
++    fn abort(&mut self) {
++        self.cancel.cancel();
+         for t in self.tasks.drain(..) {
+             t.abort();
+         }
+@@ -54,13 +71,14 @@ impl Capture {
+ 
+ impl Drop for Capture {
+     fn drop(&mut self) {
+-        self.stop();
++        self.abort();
+     }
+ }
+ 
+ /// Поднимает слушатели под текущий конфиг. Ошибка (занятый порт) приходит
+ /// до применения правил, поэтому система остаётся нетронутой.
+ pub async fn start(engine: Arc<Engine>) -> Result<Capture> {
++    let cancel = CancellationToken::new();
+     let mut tasks = Vec::new();
+ 
+     if engine.config.intercept.tcp != TcpMode::Off {
+@@ -70,35 +88,74 @@ pub async fn start(engine: Arc<Engine>) -> Result<Capture> {
+                 "не удалось занять порт {port} для перехвата TCP: {e}"
+             ))
+         })?;
+-        tasks.push(tokio::spawn(tcp_loop(engine.clone(), listener)));
++        tasks.push(tokio::spawn(tcp_loop(
++            engine.clone(),
++            listener,
++            cancel.clone(),
++        )));
+     }
+ 
+     if engine.config.intercept.udp != UdpMode::Off {
+         let sock = Arc::new(udp_socket(paths::tproxy_port())?);
+-        tasks.push(tokio::spawn(udp_loop(engine.clone(), sock)));
++        tasks.push(tokio::spawn(udp_loop(engine.clone(), sock, cancel.clone())));
+     }
+ 
+     tracing::info!(listeners = tasks.len(), "перехват включён");
+-    Ok(Capture { tasks })
++    Ok(Capture { tasks, cancel })
+ }
+ 
+ // ─────────────────────────────────── TCP ───────────────────────────────────
+ 
+-async fn tcp_loop(engine: Arc<Engine>, listener: TcpListener) {
++async fn tcp_loop(engine: Arc<Engine>, listener: TcpListener, cancel: CancellationToken) {
++    // Под нагрузкой accept ошибается каждые несколько миллисекунд (EMFILE):
++    // без паузы и ограничения частоты журнал распухает на десятки тысяч строк
++    // и хоронит остальные сообщения.
++    let mut last_log: Option<std::time::Instant> = None;
++
+     loop {
+-        match listener.accept().await {
++        let accepted = tokio::select! {
++            _ = cancel.cancelled() => break,
++            accepted = listener.accept() => accepted,
++        };
++        match accepted {
+             Ok((client, peer)) => {
+-                tokio::spawn(tcp_conn(engine.clone(), client, peer));
++                tokio::spawn(tcp_conn(engine.clone(), client, peer, cancel.clone()));
+             }
+             Err(e) => {
+-                tracing::warn!(error = %e, "не удалось принять перехваченное соединение");
+-                tokio::time::sleep(Duration::from_millis(20)).await;
++                let exhausted = matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE));
++                let now = std::time::Instant::now();
++                let should_log = match last_log {
++                    Some(t) => now.duration_since(t) >= Duration::from_secs(1),
++                    None => true,
++                };
++                if should_log {
++                    if exhausted {
++                        tracing::warn!(
++                            error = %e,
++                            "accept: кончились файловые дескрипторы — пауза 1 с, проверьте LimitNOFILE"
++                        );
++                    } else {
++                        tracing::warn!(error = %e, "не удалось принять перехваченное соединение");
++                    }
++                    last_log = Some(now);
++                }
++                let pause = if exhausted {
++                    Duration::from_secs(1)
++                } else {
++                    Duration::from_millis(50)
++                };
++                tokio::time::sleep(pause).await;
+             }
+         }
+     }
+ }
+ 
+-async fn tcp_conn(engine: Arc<Engine>, client: TcpStream, peer: SocketAddr) {
++async fn tcp_conn(
++    engine: Arc<Engine>,
++    client: TcpStream,
++    peer: SocketAddr,
++    cancel: CancellationToken,
++) {
+     let Some(dst) = original_dst(&client) else {
+         tracing::warn!(%peer, "не удалось узнать настоящий адрес получателя");
+         return;
+@@ -130,7 +187,7 @@ async fn tcp_conn(engine: Arc<Engine>, client: TcpStream, peer: SocketAddr) {
+         .get(ob.name())
+         .and_then(|l| l.rate.clone());
+     let stats = &engine.stats;
+-    let relayed = router::relay(
++    let relay = router::relay(
+         client,
+         upstream,
+         |up, down| {
+@@ -138,15 +195,24 @@ async fn tcp_conn(engine: Arc<Engine>, client: TcpStream, peer: SocketAddr) {
+             stats.add_down(down);
+         },
+         limiter.as_deref(),
+-    )
+-    .await;
++    );
++    tokio::pin!(relay);
++    let relayed = tokio::select! {
++        r = &mut relay => Some(r),
++        // Выключение перехвата обрывает и уже открытые соединения: иначе они
++        // продолжали бы идти через демон после `disconnect`.
++        _ = cancel.cancelled() => None,
++    };
+     engine.stats.conn_closed();
+ 
+     match relayed {
+-        Ok((up, down)) => tracing::debug!(
++        Some(Ok((up, down))) => tracing::debug!(
+             target = %target.key(), outbound = ob.name(), up, down, "соединение закрыто"
+         ),
+-        Err(e) => tracing::debug!(target = %target.key(), error = %e, "соединение оборвалось"),
++        Some(Err(e)) => {
++            tracing::debug!(target = %target.key(), error = %e, "соединение оборвалось")
++        }
++        None => tracing::debug!(target = %target.key(), "соединение закрыто выключением перехвата"),
+     }
+ }
+ 
+@@ -189,6 +255,22 @@ fn addr_to_sockaddr(addr: SocketAddr) -> libc::sockaddr_in {
+ /// UDP-сокет, которому ядро отдаёт TPROXY-пакеты: прозрачный (можно
+ /// принимать чужие адреса) и с контролем настоящего получателя.
+ fn udp_socket(port: u16) -> Result<UdpSocket> {
++    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
++    udp_socket_bound(bind, true, false)
++}
++
++/// Сокет для ответов клиенту, привязанный к настоящему получателю.
++///
++/// Одного `IP_PKTINFO` мало: он подменяет только IP источника, а порт берётся
++/// из `bind`. Клиент, отправивший датаграмму на `198.51.100.1:9999`, ждёт
++/// ответ именно с порта 9999 и молча отбросит пакет с порта 15001.
++/// `SO_REUSEPORT` позволяет держать такой сокет на каждый поток: несколько
++/// клиентов могут общаться с одним и тем же получателем.
++fn udp_reply_socket(dst: SocketAddr) -> Result<UdpSocket> {
++    udp_socket_bound(dst, false, true)
++}
++
++fn udp_socket_bound(bind: SocketAddr, recv_orig: bool, reuse_port: bool) -> Result<UdpSocket> {
+     unsafe {
+         let fd = libc::socket(
+             libc::AF_INET,
+@@ -202,11 +284,17 @@ fn udp_socket(port: u16) -> Result<UdpSocket> {
+             )));
+         }
+         let one: libc::c_int = 1;
+-        for (level, opt) in [
++        let mut opts = vec![
+             (libc::SOL_IP, libc::IP_TRANSPARENT),
+-            (libc::SOL_IP, IP_RECVORIGDSTADDR),
+             (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+-        ] {
++        ];
++        if recv_orig {
++            opts.push((libc::SOL_IP, IP_RECVORIGDSTADDR));
++        }
++        if reuse_port {
++            opts.push((libc::SOL_SOCKET, libc::SO_REUSEPORT));
++        }
++        for (level, opt) in opts {
+             let rc = libc::setsockopt(
+                 fd,
+                 level,
+@@ -223,7 +311,7 @@ fn udp_socket(port: u16) -> Result<UdpSocket> {
+             }
+         }
+ 
+-        let addr = addr_to_sockaddr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
++        let addr = addr_to_sockaddr(bind);
+         let rc = libc::bind(
+             fd,
+             &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+@@ -233,7 +321,7 @@ fn udp_socket(port: u16) -> Result<UdpSocket> {
+             let e = io::Error::last_os_error();
+             libc::close(fd);
+             return Err(Error::Internal(format!(
+-                "не удалось занять порт {port} для перехвата UDP: {e}"
++                "не удалось занять {bind} для перехвата UDP: {e}"
+             )));
+         }
+ 
+@@ -247,19 +335,36 @@ type FlowKey = (SocketAddr, SocketAddr);
+ /// Каналы в живые UDP-потоки: ключ — тройка «клиент, получатель».
+ type FlowSenders = Arc<tokio::sync::Mutex<HashMap<FlowKey, mpsc::Sender<Arc<Vec<u8>>>>>>;
+ 
+-async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>) {
++async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>, cancel: CancellationToken) {
+     let flows: FlowSenders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+     let mut buf = vec![0u8; 65_535];
++    let mut last_err_log: Option<std::time::Instant> = None;
++    tracing::info!(port = paths::tproxy_port(), "UDP-слушатель запущен");
+ 
+     loop {
+-        let (n, src, dst) = match recv_with_origdst(&sock, &mut buf).await {
++        let received = tokio::select! {
++            _ = cancel.cancelled() => break,
++            received = recv_with_origdst(&sock, &mut buf) => received,
++        };
++        let (n, src, dst) = match received {
+             Ok(v) => v,
+             Err(e) => {
+-                tracing::warn!(error = %e, "не удалось принять UDP-датаграмму");
++                // Одна строка в секунду: при потоке пакетов без контрольного
++                // сообщения журнал иначе распухает так же, как на accept.
++                let now = std::time::Instant::now();
++                let should_log = match last_err_log {
++                    Some(t) => now.duration_since(t) >= Duration::from_secs(1),
++                    None => true,
++                };
++                if should_log {
++                    tracing::warn!(error = %e, "не удалось принять UDP-датаграмму");
++                    last_err_log = Some(now);
++                }
+                 continue;
+             }
+         };
+         let key = (src, dst);
++        tracing::debug!(%src, %dst, n, "UDP-датаграмма принята");
+         let data = Arc::new(buf[..n].to_vec());
+ 
+         let mut map = flows.lock().await;
+@@ -275,8 +380,8 @@ async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>) {
+ 
+         tokio::spawn(udp_flow(
+             engine.clone(),
+-            sock.clone(),
+             flows.clone(),
++            cancel.clone(),
+             key,
+             rx,
+             data,
+@@ -287,8 +392,8 @@ async fn udp_loop(engine: Arc<Engine>, sock: Arc<UdpSocket>) {
+ /// Один UDP-поток: своя сессия outbound'а, свои датаграммы в обе стороны.
+ async fn udp_flow(
+     engine: Arc<Engine>,
+-    sock: Arc<UdpSocket>,
+     flows: FlowSenders,
++    cancel: CancellationToken,
+     key: FlowKey,
+     mut rx: mpsc::Receiver<Arc<Vec<u8>>>,
+     first: Arc<Vec<u8>>,
+@@ -323,6 +428,16 @@ async fn udp_flow(
+         flows.lock().await.remove(&key);
+         return;
+     };
++    // Ответы клиенту шлём со сокета, привязанного к настоящему получателю:
++    // иначе источником будет 15001 и клиент отбросит ответ.
++    let reply = match udp_reply_socket(dst) {
++        Ok(s) => Arc::new(s),
++        Err(e) => {
++            tracing::warn!(%dst, error = %e, "не удалось создать сокет для ответов UDP");
++            flows.lock().await.remove(&key);
++            return;
++        }
++    };
+ 
+     if session.send_to(first.as_slice(), &target).await.is_err() {
+         flows.lock().await.remove(&key);
+@@ -333,6 +448,9 @@ async fn udp_flow(
+     let mut buf = vec![0u8; 65_535];
+     loop {
+         tokio::select! {
++            // Выключение перехвата: поток обязан выйти и отпустить сокет,
++            // иначе порт 15001 останется занятым до UDP_IDLE.
++            _ = cancel.cancelled() => break,
+             _ = tokio::time::sleep(UDP_IDLE) => break,
+             next = rx.recv() => match next {
+                 Some(data) => {
+@@ -346,7 +464,7 @@ async fn udp_flow(
+             got = session.recv_from(&mut buf, UDP_IDLE) => match got {
+                 Ok((n, _from)) => {
+                     engine.stats.add_down(n as u64);
+-                    if send_from(&sock, &buf[..n], client, dst.ip()).await.is_err() {
++                    if send_from(&reply, &buf[..n], client).await.is_err() {
+                         break;
+                     }
+                 }
+@@ -410,47 +528,8 @@ async fn recv_with_origdst(
+     .await
+ }
+ 
+-/// Отправляет датаграмму клиенту с подменой источника на настоящего
+-/// получателя: иначе клиент не узнает ответ и соединение «зависнет».
+-async fn send_from(sock: &UdpSocket, data: &[u8], to: SocketAddr, src: IpAddr) -> io::Result<()> {
+-    let IpAddr::V4(src) = src else {
+-        return Err(io::Error::other("UDP поддерживает только IPv4"));
+-    };
+-    sock.async_io(Interest::WRITABLE, || {
+-        let mut dst = addr_to_sockaddr(to);
+-        let mut iov = libc::iovec {
+-            iov_base: data.as_ptr() as *mut libc::c_void,
+-            iov_len: data.len(),
+-        };
+-        let mut control = [0u8; 64];
+-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+-        msg.msg_name = &mut dst as *mut libc::sockaddr_in as *mut libc::c_void;
+-        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+-        msg.msg_iov = &mut iov;
+-        msg.msg_iovlen = 1;
+-
+-        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) };
+-        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+-        msg.msg_controllen = space as _;
+-
+-        unsafe {
+-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+-            (*cmsg).cmsg_level = libc::SOL_IP;
+-            (*cmsg).cmsg_type = libc::IP_PKTINFO;
+-            (*cmsg).cmsg_len =
+-                libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+-            let info = libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo;
+-            (*info).ipi_ifindex = 0;
+-            (*info).ipi_spec_dst.s_addr = u32::from_ne_bytes(src.octets());
+-            (*info).ipi_addr.s_addr = 0;
+-        }
+-
+-        let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
+-        if n < 0 {
+-            Err(io::Error::last_os_error())
+-        } else {
+-            Ok(())
+-        }
+-    })
+-    .await
++/// Отправляет датаграмму клиенту. Источник уже задан сокетом: он привязан
++/// к настоящему получателю, поэтому подменять что-то через `sendmsg` не нужно.
++async fn send_from(sock: &UdpSocket, data: &[u8], to: SocketAddr) -> io::Result<()> {
++    sock.send_to(data, to).await.map(|_| ())
+ }
+diff --git a/app/src-tauri/src/engine/nft.rs b/app/src-tauri/src/engine/nft.rs
+index 42b3056..44ab181 100644
+--- a/app/src-tauri/src/engine/nft.rs
++++ b/app/src-tauri/src/engine/nft.rs
+@@ -12,7 +12,8 @@
+ //! Исключения прописаны явно, чтобы не зацикливать собственный трафик
+ //! демона и не потерять SSH к машине, у которой «уехал» интернет.
+ 
+-use std::process::Stdio;
++use std::process::{Output, Stdio};
++use std::time::Duration;
+ 
+ use crate::config::{Config, TcpMode, UdpMode};
+ use crate::error::{Error, Result};
+@@ -30,8 +31,6 @@ pub struct NftPlan {
+     /// Команды `ip`, которые выполняются до и после `nft -f`.
+     pub ip_pre: Vec<String>,
+     pub ip_post: Vec<String>,
+-    /// Что делать для отката.
+-    pub rollback: Vec<String>,
+ }
+ 
+ /// Собирает план правил из конфигурации. Ничего не применяет — вызывающий
+@@ -78,6 +77,13 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
+         r.push_str("    chain prerouting {\n");
+         r.push_str("        type filter hook prerouting priority mangle; policy accept;\n");
+         r.push_str("        iifname \"lo\" return\n");
++        // TPROXY в prerouting видит и входящий трафик к самой машине. Без этих
++        // исключений mDNS (224.0.0.251), NTP-ответы и любые пакеты на локальный
++        // адрес уходят в прокси-сокет вместо приложения: службы ломаются, а
++        // демон захлёбывается десятками тысяч датаграмм.
++        r.push_str("        fib daddr type local return\n");
++        r.push_str("        ip daddr 224.0.0.0/4 return\n");
++        r.push_str("        ip daddr 255.255.255.255 return\n");
+         r.push_str("        ip daddr @loopback_ips return\n");
+         if cfg.intercept.bypass_private {
+             r.push_str("        ip daddr @private_ips return\n");
+@@ -100,6 +106,9 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
+         r.push_str("    chain nat_output {\n");
+         r.push_str("        type nat hook output priority -100; policy accept;\n");
+         r.push_str("        oifname \"lo\" return\n");
++        r.push_str("        fib daddr type local return\n");
++        r.push_str("        ip daddr 224.0.0.0/4 return\n");
++        r.push_str("        ip daddr 255.255.255.255 return\n");
+         r.push_str("        ip daddr @loopback_ips return\n");
+         if cfg.intercept.bypass_private {
+             r.push_str("        ip daddr @private_ips return\n");
+@@ -131,6 +140,11 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
+         r.push_str("    chain nat_prerouting {\n");
+         r.push_str("        type nat hook prerouting priority -100; policy accept;\n");
+         r.push_str("        iifname \"lo\" return\n");
++        // Тот же принцип, что в mangle prerouting: не трогаем трафик,
++        // адресованный самой машине (входящие сервисы), и multicast.
++        r.push_str("        fib daddr type local return\n");
++        r.push_str("        ip daddr 224.0.0.0/4 return\n");
++        r.push_str("        ip daddr 255.255.255.255 return\n");
+         r.push_str("        ip daddr @loopback_ips return\n");
+         if cfg.intercept.bypass_private {
+             r.push_str("        ip daddr @private_ips return\n");
+@@ -148,13 +162,13 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
+ 
+     r.push_str("}\n");
+ 
++    // Правило добавляется только если его ещё нет: после неудачного teardown
++    // и повторного `connect` дубликаты копились, и убрать их потом было нечем.
+     let mut ip_pre = vec![format!(
+-        "ip rule add fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"
++        "ip -o rule show | grep -q 'fwmark {FW_MARK:#x} lookup {ROUTE_TABLE}' \
++         || ip rule add fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100"
+     )];
+     let mut ip_post = Vec::new();
+-    for cmd in &ip_pre {
+-        let _ = cmd;
+-    }
+ 
+     // `local` обязателен: без него помеченный пакет не доставляется локально
+     // в TPROXY-сокет, а уходит в никуда по маршруту через lo.
+@@ -168,51 +182,131 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
+         ruleset: r,
+         ip_pre: std::mem::take(&mut ip_pre),
+         ip_post,
+-        rollback: vec![
+-            format!("ip rule del fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"),
+-            format!("ip route flush table {ROUTE_TABLE} 2>/dev/null || true"),
+-            "nft delete table inet pfu 2>/dev/null || true".to_string(),
+-        ],
+     }
+ }
+ 
+ /// Применяет план. Возвращает ошибку с текстом, который пользователь может
+ /// выполнить руками, если что-то пойдёт не так.
+ pub async fn apply(plan: &NftPlan) -> Result<()> {
+-    for cmd in &plan.ip_pre {
+-        run_sh(cmd).await?;
+-    }
+-    for cmd in &plan.ip_post {
+-        run_sh(cmd).await?;
++    // Сначала маршрут, потом правило пометки: пакетов с меткой до применения
++    // nft ещё нет, поэтому трафик не может уйти в пустую таблицу 100.
++    for cmd in plan.ip_post.iter().chain(plan.ip_pre.iter()) {
++        if let Err(e) = run_sh(cmd).await {
++            rollback_after_failure().await;
++            return Err(e);
++        }
+     }
+-    // Порядок важен: сначала маршрут, потом правила пометки. Иначе между
+-    // двумя операциями трафик пойдёт в пустую таблицу и пропадёт.
+     if let Err(e) = apply_ruleset(&plan.ruleset).await {
+-        for cmd in &plan.rollback {
+-            let _ = run_sh(cmd).await;
+-        }
++        rollback_after_failure().await;
+         return Err(e);
+     }
+     Ok(())
+ }
+ 
+-/// Убирает всё, что приложение добавило. Вызывается при откате, остановке и
+-/// удалении пакета.
++/// Откат после неудачного применения: ошибки не глотаются, иначе машина
++/// остаётся с полуприменёнными правилами и без следа в журнале.
++async fn rollback_after_failure() {
++    if let Err(e) = teardown().await {
++        tracing::error!(error = %e, "откат после неудачного применения не удался");
++    }
++}
++
++/// Убирает всё, что приложение добавило. Идемпотентен: отсутствие таблицы,
++/// правила или маршрута — норма, а вот неудачное удаление существующего
++/// объекта возвращается ошибкой и пишется в журнал.
+ pub async fn teardown() -> Result<()> {
+-    for cmd in &base_rollback() {
+-        let _ = run_sh(cmd).await;
++    let mut failures = Vec::new();
++    remove_ip_rules(&mut failures).await;
++    remove_route_table(&mut failures).await;
++    remove_nft_table(&mut failures).await;
++
++    if failures.is_empty() {
++        return Ok(());
++    }
++    for failure in &failures {
++        tracing::error!(failure = %failure, "teardown: не удалось снять");
++    }
++    Err(Error::Apply(format!(
++        "перехват снят не полностью: {}",
++        failures.join("; ")
++    )))
++}
++
++/// Селектор наших правил в выводе `ip rule show`.
++fn rule_selector() -> String {
++    format!("fwmark {FW_MARK:#x} lookup {ROUTE_TABLE}")
++}
++
++/// Удаляет все наши правила, а не одно: при повторных `connect` их могло
++/// накопиться несколько, в том числе с другими приоритетами.
++async fn remove_ip_rules(failures: &mut Vec<String>) {
++    let show = match run_capture("ip rule show").await {
++        Ok(v) => v,
++        Err(e) => {
++            failures.push(format!("ip rule show: {e}"));
++            return;
++        }
++    };
++    let needle = rule_selector();
++    for line in show.lines().filter(|l| l.contains(&needle)) {
++        // Строка вида `100:\tfrom all fwmark 0x1 lookup 100`.
++        let Some((prio, _)) = line.split_once(':') else {
++            continue;
++        };
++        let prio = prio.trim();
++        if prio.parse::<u32>().is_err() {
++            continue;
++        }
++        let cmd = format!("ip rule del priority {prio} fwmark {FW_MARK} lookup {ROUTE_TABLE}");
++        if let Err(e) = run_sh(&cmd).await {
++            failures.push(format!("{cmd}: {e}"));
++        }
++    }
++    match run_capture("ip rule show").await {
++        Ok(after) if after.contains(&needle) => {
++            failures.push(format!("правило «{needle}» осталось после удаления"));
++        }
++        Err(e) => failures.push(format!("ip rule show (проверка): {e}")),
++        Ok(_) => {}
+     }
+-    Ok(())
+ }
+ 
+-pub fn base_rollback() -> Vec<String> {
+-    vec![
+-        format!(
+-            "ip rule del fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100 2>/dev/null || true"
+-        ),
+-        format!("ip route flush table {ROUTE_TABLE} 2>/dev/null || true"),
+-        "nft delete table inet pfu 2>/dev/null || true".to_string(),
+-    ]
++async fn remove_route_table(failures: &mut Vec<String>) {
++    // `ip route flush` на пустой таблице завершается успешно.
++    if let Err(e) = run_sh(&format!("ip route flush table {ROUTE_TABLE}")).await {
++        failures.push(format!("ip route flush table {ROUTE_TABLE}: {e}"));
++    }
++}
++
++async fn remove_nft_table(failures: &mut Vec<String>) {
++    // `nft delete` на отсутствующей таблице — ошибка, поэтому сначала смотрим,
++    // есть ли она: teardown должен быть идемпотентным.
++    match run_output("nft list table inet pfu").await {
++        Ok(out) if out.status.success() => {
++            let mut last = String::new();
++            // Ядро может быть занято другим экземпляром nft — короткий повтор
++            // дешевле, чем оставленная таблица, уводящая трафик в никуда.
++            for attempt in 0..3 {
++                match run_sh("nft delete table inet pfu").await {
++                    Ok(()) => return,
++                    Err(e) => {
++                        last = e.to_string();
++                        if attempt < 2 {
++                            tokio::time::sleep(Duration::from_millis(100)).await;
++                        }
++                    }
++                }
++            }
++            failures.push(format!("nft delete table inet pfu: {last}"));
++        }
++        Ok(out) => {
++            let err = String::from_utf8_lossy(&out.stderr);
++            if !err.contains("No such file or directory") {
++                failures.push(format!("nft list table inet pfu: {}", err.trim()));
++            }
++        }
++        Err(e) => failures.push(format!("nft list table inet pfu: {e}")),
++    }
+ }
+ 
+ async fn apply_ruleset(ruleset: &str) -> Result<()> {
+@@ -248,14 +342,7 @@ async fn apply_ruleset(ruleset: &str) -> Result<()> {
+ }
+ 
+ async fn run_sh(cmd: &str) -> Result<()> {
+-    let out = tokio::process::Command::new("sh")
+-        .arg("-c")
+-        .arg(cmd)
+-        .stdout(Stdio::null())
+-        .stderr(Stdio::piped())
+-        .output()
+-        .await
+-        .map_err(|e| Error::Internal(format!("не удалось выполнить {cmd:?}: {e}")))?;
++    let out = run_output(cmd).await?;
+     if !out.status.success() {
+         return Err(Error::Apply(format!(
+             "команда {cmd:?} завершилась с ошибкой: {}",
+@@ -265,6 +352,30 @@ async fn run_sh(cmd: &str) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Выполняет команду и возвращает stdout. Ненулевой код — ошибка с текстом
++/// stderr: вызывающий решает, считается ли она нормальной.
++async fn run_capture(cmd: &str) -> Result<String> {
++    let out = run_output(cmd).await?;
++    if !out.status.success() {
++        return Err(Error::Apply(format!(
++            "команда {cmd:?} завершилась с ошибкой: {}",
++            String::from_utf8_lossy(&out.stderr).trim()
++        )));
++    }
++    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
++}
++
++async fn run_output(cmd: &str) -> Result<Output> {
++    tokio::process::Command::new("sh")
++        .arg("-c")
++        .arg(cmd)
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .output()
++        .await
++        .map_err(|e| Error::Internal(format!("не удалось выполнить {cmd:?}: {e}")))
++}
++
+ /// Проверка окружения для `system.diagnose`.
+ pub async fn check_available() -> (bool, String) {
+     match tokio::process::Command::new("nft")
+@@ -329,6 +440,33 @@ mod tests {
+         assert!(plan.ruleset.contains("meta skuid 0 return"));
+     }
+ 
++    #[test]
++    fn ip_rule_is_added_once() {
++        let plan = build_plan(&base_cfg());
++        // Повторный connect не должен плодить правила: перед add стоит проверка.
++        assert_eq!(
++            plan.ip_pre,
++            vec!["ip -o rule show | grep -q 'fwmark 0x1 lookup 100' \
++                 || ip rule add fwmark 1 lookup 100 priority 100"
++                .to_string()]
++        );
++    }
++
++    #[test]
++    fn prerouting_skips_local_and_multicast_traffic() {
++        let plan = build_plan(&base_cfg());
++        let pre = plan
++            .ruleset
++            .split("chain prerouting")
++            .nth(1)
++            .expect("цепочка prerouting есть");
++        // TPROXY видит и входящий трафик к самой машине: без этих исключений
++        // mDNS и ответы локальным службам уходят в прокси-сокет.
++        assert!(pre.contains("fib daddr type local return"));
++        assert!(pre.contains("ip daddr 224.0.0.0/4 return"));
++        assert!(pre.contains("ip daddr 255.255.255.255 return"));
++    }
++
+     #[test]
+     fn disabled_intercept_produces_no_marking() {
+         let mut c = base_cfg();
+@@ -356,16 +494,4 @@ mod tests {
+         let plan = build_plan(&c);
+         assert!(!plan.ruleset.contains("@private_ips"));
+     }
+-
+-    #[test]
+-    fn rollback_removes_everything_we_add() {
+-        let plan = build_plan(&base_cfg());
+-        for cmd in &plan.rollback {
+-            if cmd.contains("ip rule") || cmd.contains("ip route") || cmd.contains("nft delete") {
+-                continue;
+-            }
+-            panic!("непокрытая команда отката: {cmd}");
+-        }
+-        assert!(!plan.rollback.is_empty());
+-    }
+ }
+diff --git a/app/src-tauri/src/ipc.rs b/app/src-tauri/src/ipc.rs
+index 4d9e8be..ae514db 100644
+--- a/app/src-tauri/src/ipc.rs
++++ b/app/src-tauri/src/ipc.rs
+@@ -119,13 +119,26 @@ impl Server {
+         tracing::info!(socket = %path.display(), "IPC слушает");
+ 
+         let me = self.clone();
++        let mut last_log: Option<std::time::Instant> = None;
+         loop {
+             tokio::select! {
+                 accepted = listener.accept() => {
+                     let (stream, _) = match accepted {
+                         Ok(v) => v,
+                         Err(e) => {
+-                            tracing::warn!("accept: {e}");
++                            // Та же история, что и в перехвате: при EMFILE
++                            // accept ошибается постоянно, а warn на каждом
++                            // витке превращает журнал в мусор.
++                            let now = std::time::Instant::now();
++                            let should_log = match last_log {
++                                Some(t) => now.duration_since(t) >= std::time::Duration::from_secs(1),
++                                None => true,
++                            };
++                            if should_log {
++                                tracing::warn!("accept: {e}");
++                                last_log = Some(now);
++                            }
++                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                             continue;
+                         }
+                     };
+@@ -380,7 +393,11 @@ impl Server {
+     async fn sync_capture(&self) {
+         let engine = self.engine.read().await.clone();
+         let mut guard = self.capture.lock().await;
+-        guard.take();
++        if let Some(mut old) = guard.take() {
++            // Дожидаемся закрытия сокетов: иначе повторный bind на те же порты
++            // может упасть с «address already in use».
++            old.stop().await;
++        }
+         let Some(engine) = engine.filter(|e| e.enabled.load(std::sync::atomic::Ordering::Relaxed))
+         else {
+             return;
+@@ -393,7 +410,9 @@ impl Server {
+                 engine
+                     .enabled
+                     .store(false, std::sync::atomic::Ordering::Relaxed);
+-                nft::teardown().await.ok();
++                if let Err(t) = nft::teardown().await {
++                    tracing::error!(error = %t, "не удалось снять правила после сбоя перехвата");
++                }
+             }
+         }
+     }
+@@ -403,7 +422,7 @@ impl Server {
+             Ok(path) => {
+                 *self.engine.write().await = None;
+                 if let Some(mut c) = self.capture.lock().await.take() {
+-                    c.stop();
++                    c.stop().await;
+                 }
+                 Ok(json!({ "ok": true, "restored_from": path }))
+             }
+@@ -416,6 +435,7 @@ impl Server {
+             .get("enabled")
+             .and_then(Value::as_bool)
+             .unwrap_or(false);
++        tracing::info!(enabled, "system.toggle: переключение перехвата");
+         let mut guard = self.engine.write().await;
+ 
+         if enabled && guard.is_none() {
+@@ -431,12 +451,27 @@ impl Server {
+             e.enabled
+                 .store(enabled, std::sync::atomic::Ordering::Relaxed);
+             if enabled {
++                // Повторный `connect` не должен падать на уже занятом порту:
++                // перехват уже работает, состояние менять не нужно.
++                if self.capture.lock().await.is_some() {
++                    return Ok(json!({
++                        "enabled": true, "status": "connected",
++                        "message": "перехват уже включён",
++                    }));
++                }
+                 let plan = nft::build_plan(&e.config);
+                 // Сначала слушатели, потом правила: если порт занят, система
+                 // остаётся в прежнем состоянии, а не уходит в никуда.
+-                let mut capture = capture::start(e.clone()).await?;
++                let mut capture = match capture::start(e.clone()).await {
++                    Ok(c) => c,
++                    Err(err) => {
++                        // Иначе status показывал бы «включено» без слушателей.
++                        e.enabled.store(false, std::sync::atomic::Ordering::Relaxed);
++                        return Err(err);
++                    }
++                };
+                 if let Err(err) = nft::apply(&plan).await {
+-                    capture.stop();
++                    capture.stop().await;
+                     e.enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                     return Err(err);
+                 }
+@@ -445,7 +480,7 @@ impl Server {
+             }
+             // Выключаем: сперва закрываем порты, потом снимаем правила.
+             if let Some(mut old) = self.capture.lock().await.take() {
+-                old.stop();
++                old.stop().await;
+             }
+             nft::teardown().await?;
+             return Ok(json!({ "enabled": false, "status": "disconnected", "message": "" }));
+@@ -491,6 +526,17 @@ impl Server {
+             "fix": if is_root { Value::Null } else { json!("sudo systemctl restart proxy-for-ubuntud") },
+         }));
+ 
++        // Файловые дескрипторы: при 1024 демон ловит EMFILE под браузером.
++        let (fd_open, fd_soft) = fd_usage();
++        let fd_ok = fd_soft >= 65_536;
++        checks.push(json!({
++            "id": "fds", "name": "Файловые дескрипторы", "ok": fd_ok,
++            "detail": format!("открыто {fd_open}, soft-лимит {fd_soft}"),
++            "fix": if fd_ok { Value::Null } else {
++                json!("Добавьте LimitNOFILE=65536 в [Service] юнита proxy-for-ubuntud и выполните systemctl daemon-reload")
++            },
++        }));
++
+         // systemd-resolved на порту 53
+         let resolved = std::path::Path::new("/run/systemd/resolve").exists();
+         checks.push(json!({
+@@ -1017,6 +1063,23 @@ fn version_ge(v: &str, maj: u32, min: u32, patch: u32) -> bool {
+     (a, b, c) >= (maj, min, patch)
+ }
+ 
++/// Сколько дескрипторов открыто и каков soft-лимит (`/proc/self/limits`).
++fn fd_usage() -> (usize, u64) {
++    let open = std::fs::read_dir("/proc/self/fd")
++        .map(|d| d.count())
++        .unwrap_or(0);
++    let soft = std::fs::read_to_string("/proc/self/limits")
++        .ok()
++        .and_then(|text| {
++            text.lines()
++                .find(|l| l.starts_with("Max open files"))
++                // Max open files  1024  1048576  files
++                .and_then(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok())
++        })
++        .unwrap_or(0);
++    (open, soft)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/packaging/systemd/proxy-for-ubuntud.service b/packaging/systemd/proxy-for-ubuntud.service
+index 8e3a4c3..088f6f0 100644
+--- a/packaging/systemd/proxy-for-ubuntud.service
++++ b/packaging/systemd/proxy-for-ubuntud.service
+@@ -14,6 +14,11 @@ ExecReload=/bin/kill -HUP $MAINPID
+ Restart=always
+ RestartSec=3
+ 
++# Каждое перехваченное соединение занимает два сокета (клиент + upstream).
++# Дефолт systemd (1024) выбирается браузером за секунды: демон получает
++# EMFILE и перестаёт принимать соединения.
++LimitNOFILE=65536
++
+ # Демон управляет сетевым стеком, поэтому NeedsCapabilities. Остальные
+ # Capabilities у него нет: никаких файловых или процессных операций.
+ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_SYS_RESOURCE
+-- 
+2.53.0
+
