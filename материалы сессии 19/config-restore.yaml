@@ -1,0 +1,43 @@
+api: 1
+dns:
+  cache_size: 4096
+  cache_ttl: 300
+  fallback:
+  - 9.9.9.9
+  - 1.0.0.1
+  servers:
+  - 1.1.1.1
+  - 8.8.8.8
+  strategy: redir-host
+final: DIRECT
+geo:
+  auto_update: true
+  sources: []
+  update_interval_hours: 24
+groups: []
+intercept:
+  bypass_private: true
+  docker: false
+  exclude_ports:
+  - '22'
+  exclude_uid: []
+  loop_protect: true
+  tcp: redirect
+  udp: tproxy
+limits:
+  max_connections: null
+  outbound: {}
+  rate_limit: null
+log:
+  file: null
+  journal: true
+  level: info
+outbounds:
+- name: DIRECT
+  type: direct
+rules: []
+tun:
+  address: 198.18.0.1/15
+  device: pfu0
+  enabled: false
+  mtu: 1500
