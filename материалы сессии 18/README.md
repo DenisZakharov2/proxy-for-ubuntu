@@ -14,6 +14,7 @@ health-check и probe, без интернета они падают и пров
 | `long-test.sh` | длинная сессия с echo каждые N секунд, SIGHUP на середине, сэмплы RSS/fd |
 | `cycles-test.sh` | 5× (`connect`, повторный `connect`, трафик, `disconnect`) с проверкой остатков |
 | `config.yaml` | конфиг стенда: TUN включён, `DIRECT` + `DIRECT2` (для строгой проверки `apply`) |
+| `release/` | релизный `.deb` 0.3.1 из CI + `.sha256` (4 347 528 байт, sha256 `6afff026…e6306`) |
 
 ## Найдено
 
