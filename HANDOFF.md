@@ -5,13 +5,13 @@
 
 - **Репозиторий:** https://github.com/DenisZakharov2/proxy-for-ubuntu
 - **Ветка:** `main`, рабочее дерево чистое
-- **HEAD:** код TUN — `1096674`, поверх только документы; точный HEAD смотри `git log --oneline -1`
-- **База документации:** `a1613a4` (рабочие документы, материалы сессий 9–12) + `48ac264` (`feat(0.2.0)`: `link.rs`, `subscription.rs`, `test-outbound`, teardown без ложных ERROR) + `29861e2`, `144a99b`, `a3f4405` (сессия 13) + `40e9bc9`, `84db96f`, `0953d4a` (сессия 14)
+- **HEAD:** `94b8bbf` — перехват DNS (`redir-host`), поверх только документы; точный HEAD смотри `git log --oneline -1`
+- **База документации:** `a1613a4` (рабочие документы, материалы сессий 9–12) + `48ac264` (`feat(0.2.0)`: `link.rs`, `subscription.rs`, `test-outbound`, teardown без ложных ERROR) + `29861e2`, `144a99b`, `a3f4405` (сессия 13) + `40e9bc9`, `84db96f`, `0953d4a` (сессия 14) + `affe6f0`, `1096674` (сессия 15, TUN) + `94b8bbf` (сессия 16, DNS)
 - **Теги:** `v0.2.0` — на `050b29e`, опубликован (`.deb` + `.sha256`), ранее `v0.1.3` на `721d6d3`
-- **Версия кода:** 0.2.0 + TUN (0.3.0 не выпущена); **установленный пакет:** 0.1.2
-- **TUN:** реализован для IPv4 (TCP и UDP), проверен на netns-стенде; DNS-перехват и IPv6 — следующие сессии
-- **Тесты:** `cargo test --lib` — **203** passed (182 на релизе 0.2.0; +21 в сессии 15: TUN, пакеты, конфиг)
-- **История по сессиям:** `PROGRESS_2026-10-29.md` (сессии 13–15), `PROGRESS_2026-10-26.md` (§9 — сессия 10, §10 — сессия 11, §11 — сессия 12), `SESSION_SUMMARY.md` (сессии 1–8), `материалы сессии 14/README.md`
+- **Версия кода:** 0.2.0 + TUN + DNS (0.3.0 не выпущена); **установленный пакет:** 0.1.2
+- **TUN:** реализован для IPv4 (TCP и UDP), проверен на netns-стенде; **DNS перехватывается в режиме `redir-host`**; IPv6 — следующая сессия
+- **Тесты:** `cargo test --lib` — **208** passed (203 в сессии 15, 182 на релизе 0.2.0)
+- **История по сессиям:** `PROGRESS_2026-10-29.md` (сессии 13–16), `PROGRESS_2026-10-26.md` (§9 — сессия 10, §10 — сессия 11, §11 — сессия 12), `SESSION_SUMMARY.md` (сессии 1–8), `материалы сессии 14/README.md`, `материалы сессии 16/README.md`
 
 ---
 
@@ -24,10 +24,12 @@
    (собственный checkout пользователя). Если его нет: `git clone`, попросить
    GitHub-токен; `gh` на машине авторизован.
 4. Базовый регресс: `cargo fmt --all -- --check`,
-   `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (ожидается 203).
+   `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (ожидается 208).
 5. 0.2.0 выпущена (`v0.2.0`), §7.2 и §7.2а закрыты. TUN для IPv4 сделан
    (§7.3): устройство, маршрут по метке, TCP и UDP через userspace-стек.
-   Следующее — DNS-перехват с `fake-ip`, затем IPv6 в TUN.
+   DNS перехватывается в режиме `redir-host` (§6.4): запрос идёт через
+   прокси, карта «IP → домен» питает доменные правила. Следующее по плану —
+   запросы к `127.0.0.53` (systemd-resolved), затем IPv6 в TUN.
 6. После релиза обновить §2, §4 и §7 этого файла — он должен оставаться
    актуальным, а не превращаться в историю.
 7. Фабрика `pfu-1-0` (`/home/anony/autonomous-sw-factory`): состояние и
@@ -48,7 +50,7 @@
 | Перехват TCP всей системы | **Работает**, проверено живым трафиком |
 | UDP форвардинга (Docker/контейнеры) | **Работает**, проверено на netns-стенде (5/5) и через Docker |
 | UDP локальный (DNS, QUIC, игры) | **Работает при `tun.enabled: true`**, проверено на netns-стенде; по умолчанию выключено |
-| DNS | Идёт как обычный UDP через TUN; резолвер по-прежнему не подключён, `fake-ip` не работает |
+| DNS | **Работает при `tun.enabled: true`, режим `redir-host`**: запрос к внешнему `:53` идёт через прокси, из ответа строится карта «IP → домен»; `HIJACK-DNS` отвечает локально. Запросы к `127.0.0.53` идут мимо (§6.4) |
 | IPv6 | **Не поддерживается**, но больше не ломается: guard возвращает v6 напрямую (§6.1) |
 | TUN (`pfu0`) | **Реализован для IPv4**: TCP и UDP через userspace-стек (`engine/tun/`), живой стенд 3/3 |
 | Статистика по правилам | **Работает**: `metrics.live` отдаёт `active_rules` и `by_outbound`, проверено TCP и UDP |
@@ -67,7 +69,9 @@ IPC и GUI, безопасность, честная проверка прото
 до конца: VMess переписан по протоколу Xray и проверен живым сервером, ⚠ снят,
 матрица совместимости заполнена. Сессия 15 начала 0.3.0: TUN, устройство
 `pfu0`, собственный userspace-стек IPv4 — локальный UDP (DNS, QUIC) теперь
-идёт через прокси. Осталось: DNS-перехват с `fake-ip`, IPv6, apt-репозиторий.
+идёт через прокси. Сессия 16 сделала перехват DNS: `redir-host`, карта
+«IP → домен» для правил, настоящий `HIJACK-DNS`, `fake-ip` отклоняется
+валидацией. Осталось: `127.0.0.53`, IPv6, apt-репозиторий.
 
 ---
 
@@ -201,6 +205,31 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
 - CI и Protocols на `f4ed865` — **success** (CI: fmt/clippy/тесты/пакет,
   4 мин; Protocols: vless и vmess против живого Xray, 4 мин 37 с).
 
+### 2.6 Сессия 16 (29.10.2026): перехват DNS
+
+| Коммит | Что |
+|---|---|
+| `94b8bbf` | `engine/dns.rs`: карта «IP → домен» из настоящих DNS-ответов (`parse_response` с поддержкой сжатия имён, `remember_response`, `name_of`), `answer_query` для `HIJACK-DNS`, `build_response` с указателем на вопрос и `SERVFAIL`; `Engine::dns` + `enrich_domain`; перехват в `tun/udp.rs`, `tun/tcp.rs`, `capture.rs`; `fake-ip` отклоняется валидацией, реализация удалена; `paths::dns_port()` удалён; `postinst` мигрирует конфиг; GUI без `fake-ip`; стенд `материалы сессии 16/`; документация |
+
+Проверено на этом коммите:
+
+- `cargo fmt --check`, `clippy --all-targets -- -D warnings` — чисто;
+- `cargo test --lib` — **208** passed (было 203: +5 тестов DNS и правил);
+- netns-стенд (привилегированный контейнер, `материалы сессии 16/`): три
+  живых теста `tests/tun_live.rs`, все ok — DNS-ответ через прокси, после него
+  TCP к тому же адресу попадает под `DOMAIN-SUFFIX,…,REJECT` (до запроса
+  проходит), `HIJACK-DNS` отвечает `127.0.0.1` без выхода в сеть;
+- GUI в headless Chromium: экран настроек отдаёт только `redir-host`, подсказка
+  обновлена, `state.config` загружается (SMOKE-прогон);
+- `postinst` (`sh -n`) и миграция `strategy: fake-ip → redir-host` проверены на
+  копии конфига.
+
+Найдено по дороге: `build_response` писал имя записи как `[0x00, 0x01, 0x00,
+0x01]` — это корень плюс битый тип, а не «A, IN». Пакет был невалидным DNS, и
+никто этого не замечал, потому что функция до сессии 16 не вызывалась. Теперь
+имя — указатель `0xC0 0x0C` на вопрос, а на разбор добавлены тесты со сжатым и
+полным именем.
+
 ## 3. Машина и окружение (важно для следующей сессии)
 
 | Что | Значение |
@@ -243,10 +272,11 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
   пакет 0.2.0 скачан, `sha256sum -c` сходится, `pfu-cli version` из него
   печатает 0.2.0. Обновление при необходимости:
   `sudo apt install ./proxy-for-ubuntu_0.2.0_amd64.deb` → `systemctl reload proxy-for-ubuntud`.
-- Код 0.2.0 + TUN проверен из рабочего дерева (`target/debug`): протоколы —
-  на стенде Xray (`материалы сессии 14/`), TUN — на netns-стенде
-  (`материалы сессии 15/`), регресс — 203 теста. Живой перехват на сетевых
-  интерфейсах хоста не включался: все проверки в изолированных netns.
+- Код 0.2.0 + TUN + DNS проверен из рабочего дерева (`target/debug`):
+  протоколы — на стенде Xray (`материалы сессии 14/`), TUN и DNS — на
+  netns-стенде (`материалы сессии 15/`, `материалы сессии 16/`), регресс —
+  208 тестов. Живой перехват на сетевых интерфейсах хоста не включался: все
+  проверки в изолированных netns.
 - `proxy-for-ubuntud` — `active`, `enabled`, `LimitNOFILE=65536`.
 - Перехват **выключен**: `pfu-cli status` → `enabled: false`.
 - Порты 15000/15001 закрыты, таблицы `inet pfu` нет, `ip rule fwmark 0x1` нет,
@@ -255,7 +285,9 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
 - В `/etc/proxy-for-ubuntu/config.yaml` остался старый комментарий про fake-ip
   (postinst не перезаписывает существующий конфиг). Сам конфиг корректный:
   `tcp: redirect`, `udp: tproxy`, `exclude_ports: ["22"]`,
-  `bypass_private: true`, `docker` не задан (false).
+  `bypass_private: true`, `docker` не задан (false). **При обновлении до
+  0.3.0** postinst переведёт `strategy: fake-ip` на `redir-host` и оставит
+  копию `config.yaml.pre-0.3.0`; проверено на копии конфига.
 
 ---
 
@@ -293,7 +325,7 @@ table inet pfu {
         meta l4proto udp meta mark set 0x1 tproxy to :15001
     }
 
-    chain nat_output {            # priority -100, локальный TCP
+    chain nat_output {            # при tun.enabled: true не создаётся для TCP
         oifname "lo" return
         meta nfproto ipv6 return
         fib daddr type local return
@@ -306,6 +338,13 @@ table inet pfu {
         meta l4proto tcp redirect to :15000
     }
 
+    chain mangle_output {         # только при tun.enabled: true
+        type route hook output priority mangle; policy accept;
+        … те же исключения, что выше …
+        meta l4proto udp meta mark set 0x2
+        meta l4proto tcp meta mark set 0x2   # если intercept.tcp != off
+    }
+
     chain nat_prerouting {        # только при intercept.docker: true
         type nat hook prerouting priority -100; policy accept;
         …
@@ -314,6 +353,8 @@ table inet pfu {
 }
 ip rule add fwmark 0x1 lookup 100 priority 100
 ip route replace local default dev lo table 100
+ip rule add fwmark 0x2 lookup 101 priority 100
+ip route replace default dev pfu0 table 101
 ```
 
 - **TCP:** слушатель `0.0.0.0:15000`, настоящий получатель — `SO_ORIGINAL_DST`
@@ -322,11 +363,16 @@ ip route replace local default dev lo table 100
   `IP_RECVORIGDSTADDR`; на каждый поток — сокет, привязанный к настоящему
   получателю (`IP_TRANSPARENT` + `SO_REUSEPORT`), поэтому ответ уходит с
   правильного порта, а не с 15001.
-- **Локальный UDP:** не перехватывается. `redirect` для локально
+- **Локальный UDP без TUN:** не перехватывается. `redirect` для локально
   сгенерированной датаграммы переписывает адрес, и `IP_ORIGDSTADDR` возвращает
-  уже `127.0.0.1:15001` — восстановить получателя нечем. Нужен TUN.
-- **TUN** (`config.tun`, `pfu0`) не реализован: поле осталось от плана,
-  проверка `/dev/net/tun` в `--check` теперь только информационная (§6.7).
+  уже `127.0.0.1:15001` — восстановить получателя нечем. С TUN этот путь
+  заменяется: метка `0x2` → таблица 101 → `pfu0`.
+- **TUN** (`config.tun`, `pfu0`): при `tun.enabled: true` локальный трафик
+  идёт в устройство, userspace-стек (`engine/tun/`) поднимает TCP и UDP,
+  REDIRECT для TCP не создаётся (§6.9). `--check` считает отсутствие
+  `/dev/net/tun` проблемой только в этом режиме.
+- **DNS:** при TUN поток с `:53` дополнительно разбирается: ответ питает карту
+  «IP → домен», а правило `HIJACK-DNS` отвечает локально (§6.4).
 - Слушатели живут только при включённом перехвате: `Capture` держит
   `CancellationToken`, `disconnect` отменяет `udp_loop`, все `udp_flow` и
   `tcp_conn`, ждёт закрытия сокетов. Выключение занимает ~0,06–0,09 с.
@@ -341,18 +387,19 @@ ip route replace local default dev lo table 100
 
 | Файл | Строк | Что |
 |---|---:|---|
-| `app/src-tauri/src/engine/capture.rs` | 541 | TCP/UDP-слушатели, потоки, отмена, breakdown |
-| `app/src-tauri/src/engine/nft.rs` | 551 | план правил, apply/teardown, `is_missing_table_error` |
-| `app/src-tauri/src/engine/router.rs` | 659 | Engine, выбор outbound, relay, лимиты |
+| `app/src-tauri/src/engine/capture.rs` | 594 | TCP/UDP-слушатели, потоки, отмена, breakdown, домен из DNS |
+| `app/src-tauri/src/engine/nft.rs` | 635 | план правил, apply/teardown, `is_missing_table_error` |
+| `app/src-tauri/src/engine/router.rs` | 708 | Engine, выбор outbound, relay, лимиты, `enrich_domain` |
 | `app/src-tauri/src/engine/stats.rs` | 153 | счётчики и breakdown |
+| `app/src-tauri/src/engine/dns.rs` | 625 | резолвер, карта «IP → домен», разбор ответов, `HIJACK-DNS` |
 | `app/src-tauri/src/link.rs` | 665 | разбор `vless/vmess/ss/trojan/socks5/http` в `Outbound` |
 | `app/src-tauri/src/subscription.rs` | 550 | тело подписки, `rejected[]`, реестр и срок обновления |
-| `app/src-tauri/src/config.rs` | 1857 | схема YAML, валидация, `missing_env_refs`, редактирующий `Debug` |
-| `app/src-tauri/src/engine/tun/mod.rs` | 324 | TUN: устройство, маршрут, чтение пакетов, диспетчер |
+| `app/src-tauri/src/config.rs` | 2049 | схема YAML, валидация, `missing_env_refs`, редактирующий `Debug` |
+| `app/src-tauri/src/engine/tun/mod.rs` | 334 | TUN: устройство, маршрут, чтение пакетов, диспетчер |
 | `app/src-tauri/src/engine/tun/packet.rs` | 422 | IPv4/UDP/TCP: разбор, сборка, контрольные суммы |
-| `app/src-tauri/src/engine/tun/tcp.rs` | 629 | минимальный TCP: рукопожатие, данные, окно, повторы, FIN |
-| `app/src-tauri/src/engine/tun/udp.rs` | 164 | UDP-потоки через outbound'ы |
-| `app/src-tauri/src/ipc.rs` | 1954 | JSON-RPC, импорт ссылок и подписок, реестр, apply/rollback |
+| `app/src-tauri/src/engine/tun/tcp.rs` | 630 | минимальный TCP: рукопожатие, данные, окно, повторы, FIN |
+| `app/src-tauri/src/engine/tun/udp.rs` | 214 | UDP-потоки, запоминание DNS-ответов, `HIJACK-DNS` |
+| `app/src-tauri/src/ipc.rs` | 1961 | JSON-RPC, импорт ссылок и подписок, реестр, apply/rollback |
 | `app/src-tauri/src/engine/outbound/vmess.rs` | 1157 | VMess AEAD: KDF, заголовок, кадры тела, ответный заголовок |
 | `app/ui/app.js` / `index.html` / `style.css` | 1073 / 258 / 297 | GUI: 7 экранов, хелпер `rpc`, импорт ссылок, подписки |
 
@@ -368,9 +415,12 @@ outbound'ы — `engine/outbound/*`.
 - `intercept.docker` (bool, по умолчанию false) — цепочка `nat_prerouting`;
 - `intercept.exclude_ports` (по умолчанию `["22"]`), `exclude_uid`,
   `bypass_private`, `loop_protect`;
-- `dns.strategy`: `fake-ip | redir-host` — **на локальные запросы не влияет**,
-  пока DNS не перехватывается; валидация требует `udp: tproxy` при `fake-ip`;
-- `tun.*` — не реализовано;
+- `dns.strategy`: только `redir-host` (по умолчанию); `fake-ip` отклоняется
+  проверкой конфига с подсказкой — реализация удалена, `postinst` переводит
+  старый конфиг и оставляет копию `config.yaml.pre-0.3.0`. При включённом TUN
+  запрос к внешнему `:53` идёт через outbound, ответ запоминается как
+  «IP → домен»;
+- `tun.enabled`/`device`/`mtu`/`address` — TUN для IPv4 (см. §6.9);
 - `geo.auto_update`, `geo.update_interval_hours`;
 - `limits.rate_limit`, `limits.max_connections` (+ на outbound);
 - `outbounds`, `groups`, `rules`, `final`.
@@ -420,9 +470,22 @@ CLI печатает JSON как есть. Документация: `docs/IPC.m
 получателя датаграммы. С `tun.enabled: true` пакет попадает в `pfu0`, стек
 читает адрес из заголовка, и DNS/QUIC идут через прокси (проверено стендом).
 
-Что осталось: `dns.strategy`/`fake-ip` по-прежнему не влияют ни на что —
-встроенный резолвер (`engine/dns.rs`) не подключён к перехвату, DNS идёт как
-обычный UDP. IPv6 в TUN не поддержан.
+DNS перехватывается отдельно от остального UDP: в `tun/udp.rs` поток с
+`dst_port == 53` (и такой же поток в `capture.rs` для форвардинга) отдаёт
+ответ в `Resolver::remember_response`, откуда берётся карта «IP → домен»;
+`Engine::enrich_domain` подставляет имя в `Flow` перед решением правил. Правило
+`HIJACK-DNS` отвечает на месте (`Resolver::answer_query`), не открывая
+outbound. Подробности — `docs/ARCHITECTURE.md` §6.3, стенд —
+`материалы сессии 16/`.
+
+Что осталось:
+
+- **`127.0.0.53` (systemd-resolved) не перехватывается**: loopback исключён из
+  всех цепочек (`oifname "lo" return`, `ip daddr @loopback_ips return`), так
+  что системные приложения разрешают имена как раньше, а resolved спрашивает
+  upstream напрямую. Перехват работает для запросов к внешним адресам;
+- DNS over TCP (53/tcp) проксируется, но в карту не попадает;
+- IPv6 в TUN не поддержан.
 
 ### 6.5 Проверка vless/vmess в CI — настоящая, оба проходят
 
@@ -493,7 +556,8 @@ GET уходит через `engine::outbound`, ответ обязан быть
 
 Чего нет (осознанно, это следующие сессии):
 
-- **DNS-перехват и `fake-ip`**: резолвер не подключён, DNS идёт как обычный UDP;
+- **DNS через `127.0.0.53`**: loopback исключён, systemd-resolved ходит к
+  upstream сам; перехватываются только запросы к внешним адресам (§6.4);
 - **IPv6**: `inet6`-адрес, маршрут и разбор v6-заголовков;
 - **фрагменты**: отбрасываются, пересборки нет;
 - **ICMP** не проксируется;
@@ -553,7 +617,7 @@ GET уходит через `engine::outbound`, ответ обязан быть
 
 ### 7.3 0.3.0 — TUN и локальный UDP
 
-Сделано в сессии 15 (код `affe6f0`):
+Сделано в сессиях 15–16 (код `affe6f0`, `1096674`, `94b8bbf`):
 
 - ✅ устройство `pfu0`, адрес `198.18.0.1/15`, маршрут в таблице 101, метка
   `0x2` в `mangle output`, `ip rule fwmark 0x2`;
@@ -563,16 +627,17 @@ GET уходит через `engine::outbound`, ответ обязан быть
 - ✅ `tun.enabled`/`mtu`/`address` в конфиге и валидации; `--check` и
   `system.diagnose` учитывают TUN;
 - ✅ живой netns-стенд: UDP 1200 Б и TCP 256 КБ в обе стороны, 3/3 прогона,
-  teardown без остатков.
+  teardown без остатков;
+- ✅ **DNS-перехват** в режиме `redir-host`: запрос через прокси, карта
+  «IP → домен», доменные правила для соединений по адресу, настоящий
+  `HIJACK-DNS`, `fake-ip` отклоняется валидацией (§2.6, §6.4).
 
 Осталось на следующие сессии:
 
-- ⬜ **DNS-перехват**: слушатель на 53 через TUN, режим **`redir-host`**
-  (решение пользователя 29.10.2026), подключить `engine/dns.rs`. Запрос
-  уходит через прокси, приложению возвращается настоящий IP. `fake-ip` не
-  реализуем: если к концу работы он останется пустышкой, `Config::validate`
-  должен отклонять `dns.strategy: fake-ip` с указанием на `redir-host` —
-  настройка, которая ничего не делает, хуже отказа.
+- ⬜ **`127.0.0.53` / systemd-resolved**: перехватывать запросы системного
+  резолвера. Варианты (нужно решение пользователя): слушатель на loopback и
+  правка `resolv.conf`/resolved, либо оставить как есть и держать ограничение
+  в документации.
 - ⬜ **IPv6 в TUN**: `inet6`-адрес и маршрут, разбор v6-заголовков; слушатели
   REDIRECT/TPROXY остаются IPv4-only.
 - ⬜ **Нагрузка и пересоздание**: длинная сессия, сотни соединений,
@@ -674,10 +739,11 @@ git push origin main v0.1.3
 (дублируется), CHANGELOG — новый раздел, бейдж в README. Тег запускает
 `release.yml`; проверить, что оба matrix-джоба зелёные и ассеты на месте.
 
-### 8.7 TUN на netns-стенде
+### 8.7 TUN и DNS на netns-стенде
 
 На этой машине `systemd-run` недоступен (polkit), поэтому стенд идёт в
-привилегированном контейнере — сеть хоста не трогается:
+привилегированном контейнере — сеть хоста не трогается. В серверной netns
+нужны оба сервера: эхо TCP/UDP и мини-DNS для `echo.dns.test`:
 
 ```bash
 docker run -d --privileged --name pfu-stand \
@@ -689,14 +755,15 @@ docker exec pfu-stand bash -c 'apt-get update -qq && apt-get install -y -qq ipro
 cd app/src-tauri && cargo test --test tun_live --no-run
 docker cp target/debug/deps/tun_live-<hash> pfu-stand:/bin/tun_live
 docker exec pfu-stand bash -c '
-  bash "/src/материалы сессии 15/tun-stand.sh" setup
-  ip netns exec pfu-tun-srv python3 -u "/src/материалы сессии 15/tun-echo.py" &
+  bash "/src/материалы сессии 16/tun-stand.sh" setup
+  ip netns exec pfu-tun-srv python3 -u "/src/материалы сессии 16/tun-echo.py" &
+  ip netns exec pfu-tun-srv python3 -u "/src/материалы сессии 16/dns-echo.py" &
   sleep 1
-  ip netns exec pfu-tun /bin/tun_live --ignored --nocapture
-  bash "/src/материалы сессии 15/tun-stand.sh" teardown'
+  bash "/src/материалы сессии 16/tun-stand.sh" test /bin/tun_live
+  bash "/src/материалы сессии 16/tun-stand.sh" teardown'
 ```
 
-Ожидание: `1 passed`, приложение от uid 1000 получает свои байты обратно,
+Ожидание: `3 passed` (TUN roundtrip, DNS `redir-host`, DNS `HIJACK-DNS`),
 после `teardown` нет `pfu0`, правила `fwmark 0x2` и таблицы `inet pfu`.
 
 ### 8.8 Аварийная очистка (если сеть «пропала»)
@@ -722,11 +789,13 @@ curl -m 8 -sS -o /dev/null -w '%{http_code}\n' https://example.com
 | `материалы сессии 12/` | `README.md` — что проверено живьём (TCP, UDP 5/5, статистика); `release/` — `.deb` 0.1.3 + `.sha256` |
 | `материалы сессии 14/` | стенд Xray для проверки протоколов: `xray.config.json`, `pfu-config.yaml`, `README.md` с командами и разбором дефекта VMess |
 | `материалы сессии 15/` | TUN: netns-стенд (`tun-stand.sh`), эхо-сервер (`tun-echo.py`), `README.md` с результатами и запуском через привилегированный контейнер |
+| `материалы сессии 16/` | DNS: тот же стенд плюс мини-DNS (`dns-echo.py`) для `echo.dns.test`, `README.md` с тем, что именно доказывает каждый шаг |
 
-`PROGRESS_2026-10-29.md` — хронология сессий 13–14.
+`PROGRESS_2026-10-29.md` — хронология сессий 13–16.
 `PROGRESS_2026-10-26.md` — хронология сессий 9–12 (§11).
-`SESSION_SUMMARY.md` — итог сессий 1–8. Подробности сессии 14 — в
-`PROGRESS_2026-10-29.md`, `материалы сессии 14/README.md` и §2, §6.5, §7.
+`SESSION_SUMMARY.md` — итог сессий 1–8. Подробности сессий 14–16 — в
+`PROGRESS_2026-10-29.md`, `материалы сессии 14/README.md`,
+`материалы сессии 16/README.md` и §2, §6.4, §6.5, §7.
 
 ---
 
@@ -734,14 +803,19 @@ curl -m 8 -sS -o /dev/null -w '%{http_code}\n' https://example.com
 
 1. **IPv6:** пока только guard (v6 напрямую) или полноценная поддержка в TUN
    отдельной сессией? Сейчас v6 идёт напрямую.
-2. ~~**DNS:** `fake-ip` или `redir-host`?~~ Решено 29.10.2026: **`redir-host`**.
-   `fake-ip` не реализуем; валидация должна его отклонять, а не принимать
-   молча (см. §7.3).
-3. **PPA/apt-репозиторий:** есть ли аккаунт Launchpad и готовность подписывать
+2. ~~**DNS:** `fake-ip` или `redir-host`?~~ Решено 29.10.2026: **`redir-host`**,
+   сделано в сессии 16 (§6.4).
+3. **`127.0.0.53` (systemd-resolved):** перехватывать запросы системного
+   резолвера (нужен слушатель на loopback и правка настройки resolved) или
+   оставить как есть и держать ограничение в документации? Сейчас мимо идут
+   все запросы через резолвер.
+4. **PPA/apt-репозиторий:** есть ли аккаунт Launchpad и готовность подписывать
    пакеты, или оставить установку вручную?
-4. **Живые серверы для протоколов:** есть ли Xray/VLESS/VMess-сервер, на
+5. **Живые серверы для протоколов:** есть ли Xray/VLESS/VMess-сервер, на
    котором можно проверить e2e помимо контейнера в CI?
-5. **Целевые версии Ubuntu:** 22.04 и 24.04 — подтверждаем? Пакет в CI
+6. **Целевые версии Ubuntu:** 22.04 и 24.04 — подтверждаем? Пакет в CI
    собирается на обеих, но релизный ассет один.
 
 Решено в сессии 15: TUN — собственный минимальный стек, без `smoltcp`.
+Решено в сессии 16: `fake-ip` не реализуем, валидация его отклоняет;
+`HIJACK-DNS` отвечает локально.
