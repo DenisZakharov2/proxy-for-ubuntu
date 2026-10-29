@@ -137,7 +137,7 @@ const t = (key) => (I18N[state.lang] && I18N[state.lang][key]) || I18N.ru[key] |
 // настроено правильно. Поэтому в таком режиме показываем заметную плашку.
 const isMock = typeof window.__TAURI__ === 'undefined';
 
-async function ipc(method, params = {}) {
+async function rpc(method, params = {}) {
   if (isMock) return mock(method, params);
   const res = await window.__TAURI__.core.invoke('ipc', {
     request: { id: state.nextId++, method, params },
@@ -289,23 +289,42 @@ function goto(route) {
 // ─────────────────────────────── Обзор ─────────────────────────────────────
 
 async function renderOverview() {
-  const st = await ipc('daemon.status').catch(() => null);
+  const st = await rpc('daemon.status').catch(() => null);
+  // Состояние берём у демона, а не из памяти окна: после перезапуска GUI
+  // `state.connected` пуст, и окно показывало «Не подключено» поверх живого
+  // перехвата, пока пользователь не нажмёт переключатель.
+  if (st) state.connected = !!st.enabled;
   const dot = $('#statusDot');
   dot.className = 'status-dot' + (state.connected ? ' on' : '');
   $('#statusTitle').textContent = t(state.connected ? 'status.connected' : 'status.disconnected');
   $('#statusSub').textContent = t(state.connected ? 'status.connected.sub' : 'status.disconnected.sub');
   $('#powerToggle').checked = !!state.connected;
-  if (st) {
-    const box = $('#daemonState');
+
+  const box = $('#daemonState');
+  const engine = $('#engineState');
+  if (!st) {
+    box.classList.add('bad');
+    $('#daemonText').textContent = t('err.daemon');
+    if (engine) { engine.textContent = ''; engine.hidden = true; }
+  } else {
     box.classList.add('ok');
     $('#daemonText').textContent = `v${st.version} · ${Math.floor((st.uptime_sec || 0) / 60)} мин`;
+    if (engine) {
+      // engine_loaded — отдельный признак: `config_valid: false` у только что
+      // стартовавшего демона значит «движок ещё не применён», а не «конфиг битый».
+      engine.hidden = false;
+      engine.textContent = st.engine_loaded
+        ? 'Движок загружен: правила и перехват активны'
+        : 'Движок не загружен: конфиг ещё не применён';
+      engine.style.color = st.engine_loaded ? 'var(--ok)' : 'var(--warn)';
+    }
   }
   await refreshMetrics();
 }
 
 async function refreshMetrics() {
   let m;
-  try { m = await ipc('metrics.live'); } catch { return; }
+  try { m = await rpc('metrics.live'); } catch { return; }
   state.metrics = m;
   $('#trafficChip').hidden = false;
   $('#chipUp').textContent = bytes(m.up);
@@ -363,14 +382,20 @@ const PROTO_FIELDS = {
   shadowsocks: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['method', 'Method', 'text'], ['password', 'Password', 'password'], ['udp', 'UDP', 'bool']],
   trojan: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['password', 'Password', 'password'], ['sni', 'SNI', 'text'],
            ['skip_cert_verify', 'Skip certificate check', 'bool'], ['udp', 'UDP', 'bool']],
-  vless: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['uuid', 'UUID', 'text'], ['sni', 'SNI', 'text'],
+  vless: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['uuid', 'UUID', 'text'],
+          ['network', 'Transport', 'select'], ['sni', 'SNI', 'text'],
           ['tls', 'TLS', 'bool'], ['skip_cert_verify', 'Skip certificate check', 'bool'], ['udp', 'UDP', 'bool']],
-  vmess: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['uuid', 'UUID', 'text'], ['alter_id', 'AlterId', 'number'],
+  vmess: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['uuid', 'UUID', 'text'],
+          ['network', 'Transport', 'select'], ['alter_id', 'AlterId', 'number'],
           ['sni', 'SNI', 'text'], ['tls', 'TLS', 'bool'], ['skip_cert_verify', 'Skip certificate check', 'bool'], ['udp', 'UDP', 'bool']],
   ssh: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['username', 'User', 'text'],
         ['key_file', 'Key file', 'text'], ['password', 'Password (or key)', 'password']],
 };
 const EXPERIMENTAL = new Set(['vless', 'vmess']);
+
+// Движок умеет только эти транспорты (`engine/outbound`). `grpc` в списке нет
+// намеренно: интерфейс не должен предлагать то, что движок молча проигнорирует.
+const NETWORK_OPTIONS = ['tcp', 'ws'];
 
 function outbounds() {
   return (state.config && state.config.outbounds) || [];
@@ -420,7 +445,7 @@ async function testOne(name) {
   if (!o) return;
   toast(name, `${t('proxies.untested')}…`);
   try {
-    const r = await ipc('outbound.test', { outbound: o, timeout_ms: 8000 });
+    const r = await rpc('outbound.test', { outbound: o, timeout_ms: 8000 });
     state.tests[name] = r;
     toast(name, r.ok ? `${r.latency_ms} ms · DNS: ${r.resolved_via}` : esc(r.error || ''), r.ok ? 'ok' : 'err');
   } catch (e) {
@@ -439,6 +464,9 @@ function proxyForm(o = { type: 'direct', name: '' }) {
     </select></label>
     ${fields.map(([key, label, type]) => type === 'bool'
       ? `<label class="check full"><input type="checkbox" id="f-${key}" ${o[key] !== false ? 'checked' : ''} /><span>${esc(label)}</span></label>`
+      : type === 'select'
+      ? `<label><span>${esc(label)}</span><select id="f-${key}">${NETWORK_OPTIONS
+          .map(v => `<option value="${v}" ${(o[key] || 'tcp') === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>`
       : `<label><span>${esc(label)}</span><input id="f-${key}" type="${type === 'number' ? 'number' : type}" value="${esc(o[key] ?? '')}" /></label>`).join('')}
   </div>
   ${EXPERIMENTAL.has(o.type) ? `<p class="hint" style="color:var(--warn)">⚠ ${esc(t('experimental'))}</p>` : ''}`;
@@ -455,36 +483,57 @@ function readForm() {
     else o[key] = el.value;
   }
   if (type === 'shadowsocks' && !o.method) o.method = 'chacha20-ietf-poly1305';
+  if (o.network === '') o.network = 'tcp';
   return o;
+}
+
+/** Проверка до сохранения: сервер без адреса или порт вне 1..65535 не должны
+ *  попадать даже в память окна, иначе `config.apply` отклонит весь конфиг. */
+function validateOutbound(o) {
+  if (!o.name || !o.name.trim()) return 'Имя обязательно';
+  if (o.type === 'direct') return null;
+  if (!o.server || !String(o.server).trim()) return 'Адрес сервера обязателен';
+  if (String(o.server).includes(' ')) return 'Адрес не должен содержать пробелов';
+  const port = Number(o.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return 'Порт должен быть целым числом от 1 до 65535';
+  if ((o.type === 'vless' || o.type === 'vmess') && !String(o.uuid || '').trim()) return 'Нужен UUID';
+  if (o.type === 'trojan' && !String(o.password || '').trim()) return 'Нужен пароль';
+  if (o.type === 'shadowsocks' && !String(o.password || '').trim()) return 'Нужен пароль';
+  if (o.type === 'http' && !String(o.server || '').trim()) return 'Нужен адрес сервера';
+  if (o.type === 'ssh' && !String(o.username || '').trim()) return 'Нужно имя пользователя SSH';
+  if (o.network && !NETWORK_OPTIONS.includes(o.network)) return 'Транспорт поддержан только tcp и ws';
+  return null;
 }
 
 function addProxy() {
   const draw = (cur) => {
-    modal(t('proxies.add'), proxyForm(cur), [
-      { label: t('action.cancel') },
-      { label: t('action.save'), kind: 'btn-primary', action: () => {
-          const o = readForm();
-          if (!o.name) { toast('—', 'Имя обязательно', 'err'); return; }
-          if (EXPERIMENTAL.has(o.type)) { toast('—', t('experimental'), 'warn'); }
-          (state.config.outbounds ||= []).push(o);
-          renderProxies();
-        } },
-    ]);
+    const save = { label: t('action.save'), kind: 'btn-primary', action: () => {
+        const o = readForm();
+        const bad = validateOutbound(o);
+        if (bad) { toast(t('status.error'), esc(bad), 'err'); save.keepOpen = true; return; }
+        save.keepOpen = false;
+        if (EXPERIMENTAL.has(o.type)) toast('—', t('experimental'), 'warn');
+        (state.config.outbounds ||= []).push(o);
+        renderProxies();
+      } };
+    modal(t('proxies.add'), proxyForm(cur), [{ label: t('action.cancel') }, save]);
     $('#f-type').onchange = () => draw(readForm());
   };
-  draw({ type: 'socks', name: '', udp: true, remote_dns: true });
+  draw({ type: 'socks', name: '', port: 1080, udp: true, remote_dns: true });
 }
 
 function editProxy(i) {
   const cur = outbounds()[i];
   const draw = (next) => {
-    modal(`${t('action.edit')}: ${cur.name}`, proxyForm(next), [
-      { label: t('action.cancel') },
-      { label: t('action.save'), kind: 'btn-primary', action: () => {
-          state.config.outbounds[i] = readForm();
-          renderProxies();
-        } },
-    ]);
+    const save = { label: t('action.save'), kind: 'btn-primary', action: () => {
+        const o = readForm();
+        const bad = validateOutbound(o);
+        if (bad) { toast(t('status.error'), esc(bad), 'err'); save.keepOpen = true; return; }
+        save.keepOpen = false;
+        state.config.outbounds[i] = o;
+        renderProxies();
+      } };
+    modal(`${t('action.edit')}: ${cur.name}`, proxyForm(next), [{ label: t('action.cancel') }, save]);
     $('#f-type').onchange = () => draw(readForm());
   };
   draw({ ...cur });
@@ -593,7 +642,7 @@ function addRule() {
 
 async function validateRules() {
   try {
-    const r = await ipc('config.validate', { config: state.config });
+    const r = await rpc('config.validate', { config: state.config });
     if (r.valid) {
       toast(t('rules.valid'), (r.warnings || []).map(esc).join('<br>') || '', r.warnings && r.warnings.length ? 'warn' : 'ok');
     } else {
@@ -607,7 +656,7 @@ async function validateRules() {
 // ─────────────────────────────── Профили ───────────────────────────────────
 
 async function renderProfiles() {
-  const r = await ipc('profile.list').catch(() => ({ profiles: [] }));
+  const r = await rpc('profile.list').catch(() => ({ profiles: [] }));
   const tbl = $('#profilesTable');
   const list = r.profiles || [];
   if (!list.length) {
@@ -624,7 +673,7 @@ async function renderProfiles() {
 
 async function activateProfile(name) {
   try {
-    const r = await ipc('profile.activate', { name });
+    const r = await rpc('profile.activate', { name });
     if (r.ok) { await loadConfig(); toast(t('rules.applied'), esc(name), 'ok'); goto(state.route); }
     else toast(t('rules.rolled'), '', 'err');
   } catch (e) { toast(t('rules.rolled'), esc(e.message), 'err'); }
@@ -638,7 +687,7 @@ async function importProfile() {
     { label: t('action.cancel') },
     { label: t('action.save'), kind: 'btn-primary', action: async () => {
         try {
-          await ipc('profile.import', { name: $('#i-name').value.trim() || 'imported', yaml: $('#i-yaml').value });
+          await rpc('profile.import', { name: $('#i-name').value.trim() || 'imported', yaml: $('#i-yaml').value });
           toast(t('profiles.import'), 'ok', 'ok');
           renderProfiles();
         } catch (e) { toast(t('rules.invalid'), esc(e.message), 'err'); }
@@ -648,7 +697,7 @@ async function importProfile() {
 
 async function exportProfile() {
   try {
-    const r = await ipc('profile.export', { name: 'default', redact_secrets: true });
+    const r = await rpc('profile.export', { name: 'default', redact_secrets: true });
     modal(t('profiles.export'), `<textarea rows="16" style="width:100%">${esc(r.yaml || '')}</textarea>
       <p class="hint">${esc(t('empty.rules.hint') ? 'Секреты заменены на ***REDACTED***' : '')}</p>`,
       [{ label: t('action.close') }]);
@@ -658,7 +707,7 @@ async function exportProfile() {
 // ─────────────────────────────── Geo ───────────────────────────────────────
 
 async function renderGeo() {
-  const r = await ipc('geo.list').catch(() => ({ sets: [] }));
+  const r = await rpc('geo.list').catch(() => ({ sets: [] }));
   const tbl = $('#geoTable');
   const list = r.sets || [];
   if (!list.length) {
@@ -671,7 +720,7 @@ async function renderGeo() {
       <td class="actions-cell"><button class="btn-ghost sm" data-kind="${s.kind}" data-tag="${esc(s.tag)}">${esc(t('geo.preview'))}</button></td></tr>`).join('') +
     '</tbody>';
   $$('[data-tag]', tbl).forEach(b => b.onclick = async () => {
-    const r2 = await ipc('geo.preview', { kind: b.dataset.kind, tag: b.dataset.tag, limit: 200 }).catch(() => ({ lines: [] }));
+    const r2 = await rpc('geo.preview', { kind: b.dataset.kind, tag: b.dataset.tag, limit: 200 }).catch(() => ({ lines: [] }));
     modal(`${b.dataset.kind}:${b.dataset.tag}`, `<pre class="log">${esc((r2.lines || []).join('\n'))}</pre>`,
           [{ label: t('action.close') }]);
   });
@@ -685,8 +734,8 @@ async function renderLogs() {
   // Поиск выполняет демон: в журнале может быть десятки тысяч строк,
   // и тащить их все в браузер ради подстроки незачем.
   const r = q
-    ? await ipc('log.search', { query: q, level: lvl || null, limit: 500 }).catch(() => ({ entries: [] }))
-    : await ipc('log.tail', { lines: 500, level: lvl || null }).catch(() => ({ entries: [] }));
+    ? await rpc('log.search', { query: q, level: lvl || null, limit: 500 }).catch(() => ({ entries: [] }))
+    : await rpc('log.tail', { lines: 500, level: lvl || null }).catch(() => ({ entries: [] }));
   const rows = r.entries || [];
   $('#logView').textContent = rows.length
     ? rows.map(e => `[${when(e.ts)}] ${e.level.toUpperCase().padEnd(5)} ${e.target}: ${e.message}`).join('\n')
@@ -708,7 +757,7 @@ async function runDoctor() {
   const view = $('#doctorView');
   view.innerHTML = '<p class="muted">…</p>';
   try {
-    const r = await ipc('system.diagnose');
+    const r = await rpc('system.diagnose');
     view.innerHTML = (r.checks || []).map(c => `
       <div class="check-row ${c.ok ? 'ok' : 'bad'}">
         <span class="mark">${c.ok ? '✓' : '✕'}</span>
@@ -740,7 +789,7 @@ async function applyConfig() {
 
 async function doApply() {
   try {
-    const r = await ipc('config.apply', { config: state.config, reason: 'gui' });
+    const r = await rpc('config.apply', { config: state.config, reason: 'gui' });
     if (r.ok) {
       toast(t('rules.applied'), (r.warnings || []).map(esc).join('<br>'), (r.warnings || []).length ? 'warn' : 'ok');
       await loadConfig();
@@ -768,7 +817,7 @@ async function doApply() {
 
 async function togglePower(on) {
   try {
-    const r = await ipc('system.toggle', { enabled: on });
+    const r = await rpc('system.toggle', { enabled: on });
     state.connected = !!r.enabled;
     renderOverview();
     toast(r.enabled ? t('status.connected') : t('status.disconnected'), '', r.enabled ? 'ok' : '');
@@ -799,7 +848,7 @@ function applyLang() {
 
 async function loadConfig() {
   try {
-    const r = await ipc('config.get');
+    const r = await rpc('config.get');
     state.config = r.config;
   } catch (e) {
     state.config = null;
@@ -859,20 +908,20 @@ async function boot() {
     renderGeo();
   };
   $('#exportLogs').onclick = async () => {
-    const r = await ipc('log.export', {});
+    const r = await rpc('log.export', {});
     toast(t('logs.export'), esc(r.path || ''), 'ok');
   };
   $('#rollback').onclick = () => modal(t('logs.rollback'), `<p>${esc(t('logs.rollback.confirm'))}</p>`, [
     { label: t('action.cancel') },
     { label: t('action.confirm'), kind: 'btn-danger', action: async () => {
-        const r = await ipc('config.rollback');
+        const r = await rpc('config.rollback');
         toast(r.ok ? t('logs.rollback') : t('err.generic'), esc(r.restored_from || r.message || ''), r.ok ? 'ok' : 'err');
         await loadConfig(); renderOverview();
       } },
   ]);
   $('#subUpdate').onclick = async () => {
     try {
-      const r = await ipc('subscription.update', {
+      const r = await rpc('subscription.update', {
         name: $('#subName').value.trim() || 'subscription', url: $('#subUrl').value.trim(), auto_activate: false,
       });
       toast(t('subs.update'), `outbound: ${r.outbounds_found}, правил: ${r.rules_found}`, 'ok');

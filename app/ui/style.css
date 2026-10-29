@@ -291,3 +291,7 @@ select:focus, input:focus, textarea:focus { border-color: var(--accent); outline
   .hero-charts { grid-template-columns: 1fr; }
   .stat-cards { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* Состояние движка под заголовком статуса: «загружен» и «не загружен» — разные
+   состояния, и различать их должен цвет, а не только текст. */
+#engineState { margin: 4px 0 0; }
