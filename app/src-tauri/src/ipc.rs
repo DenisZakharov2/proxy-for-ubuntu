@@ -517,12 +517,19 @@ impl Server {
             "fix": if nft_ok { Value::Null } else { json!("sudo apt install nftables") },
         }));
 
-        // TUN
-        let tun = std::path::Path::new("/dev/net/tun").exists();
+        // TUN: устройство нужно только когда перехват через него включён.
+        let tun_device = std::path::Path::new("/dev/net/tun").exists();
+        let tun_enabled = self
+            .load_config()
+            .map(|(c, _)| c.tun.enabled)
+            .unwrap_or(false);
+        let tun_ok = !tun_enabled || tun_device;
         checks.push(json!({
-            "id": "tun", "name": "TUN/TAP", "ok": tun,
-            "detail": if tun { "/dev/net/tun" } else { "нет /dev/net/tun" },
-            "fix": if tun { Value::Null } else { json!("sudo modprobe tun && echo tun | sudo tee /etc/modules-load.d/tun.conf") },
+            "id": "tun", "name": "TUN/TAP", "ok": tun_ok,
+            "detail": if tun_device {
+                if tun_enabled { "/dev/net/tun, включён в конфиге" } else { "/dev/net/tun, выключен в конфиге" }
+            } else { "нет /dev/net/tun" },
+            "fix": if tun_ok { Value::Null } else { json!("sudo modprobe tun && echo tun | sudo tee /etc/modules-load.d/tun.conf") },
         }));
 
         // Права

@@ -7,8 +7,9 @@
 <img src="packaging/icons/proxy-for-ubuntu.svg" width="96" alt="proxy-for-ubuntu">
 
 TCP-трафик системы и UDP из контейнеров направляется через прокси по правилам
-в духе Clash. Ядро написано с нуля на Rust, без sing-box, Xray и clash.
-Локальный UDP — DNS, QUIC — пока идёт напрямую, см. «Ограничения перехвата».
+в духе Clash; при включённом TUN через прокси идёт и локальный UDP — DNS,
+QUIC. Ядро написано с нуля на Rust, без sing-box, Xray и clash.
+См. «Ограничения перехвата».
 
 [![Лицензия](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Версия](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
@@ -89,6 +90,7 @@ sudo systemctl reload proxy-for-ubuntud
 │                                 │
 │  TCP: REDIRECT → :15000            │
 │  UDP: TPROXY :15001 (mark+100)     │
+│  TUN: pfu0 (mark 0x2, table 101)   │
 │      ↓                          │
 │  rule engine → outbound         │
 │      ↓                          │
@@ -100,15 +102,19 @@ sudo systemctl reload proxy-for-ubuntud
 Маршруты системы не меняются. TCP ядро перенаправляет в сокет демона через
 `nftables` REDIRECT, а UDP — через TPROXY и политическую маршрутизацию по
 метке: пакет помечается, по метке уходит в таблицу 100, где его встречает
-слушатель демона. Нетронутым остаётся всё, что не перехватывается, — и после
+слушатель демона. При `tun.enabled: true` появляется второй путь: локальный
+трафик помечается меткой `0x2`, по ней уходит в таблицу 101 и попадает в
+устройство `pfu0`, где его разбирает userspace-стек демона. Нетронутым остаётся всё, что не перехватывается, — и после
 `apt remove` система возвращается в обычное состояние самостоятельно.
 
 ### Ограничения перехвата
 
-- **Локальный UDP не перехватывается.** DNS, QUIC и игровой трафик с самой
-  машины идут напрямую, мимо прокси: `REDIRECT` не оставляет способа узнать
-  настоящего получателя датаграммы. Для этого нужен TUN, он пока не
-  реализован. Опция `dns.strategy: fake-ip` в текущей схеме не работает.
+- **Локальный UDP перехватывается только при `tun.enabled: true`.** Без TUN
+  DNS, QUIC и игровой трафик с самой машины идут напрямую, мимо прокси:
+  `REDIRECT` не оставляет способа узнать настоящего получателя датаграммы.
+  С TUN трафик заворачивается в `pfu0` и разбирается userspace-стеком.
+  `dns.strategy: fake-ip` по-прежнему не работает: резолвер не подключён к
+  перехвату.
 - **UDP перехватывается только для форвардинга** — трафика контейнеров.
   TCP контейнеров перехватывается при `intercept.docker: true`, UDP — при
   `intercept.udp: tproxy`.
@@ -240,7 +246,7 @@ pfu-cli validate < my.yaml
 |---|---|
 | После `apt install` тумблер не работает | Не запущен демон: `sudo systemctl start proxy-for-ubuntud` |
 | «nftables отклонил набор правил» | Нет прав или правила заняты: `sudo nft list ruleset` |
-| QUIC/игры не идут через прокси | Ограничение схемы: локальный UDP не перехватывается, для него нужен TUN (не реализован). UDP перехватывается только у контейнеров |
+| QUIC/игры не идут через прокси | Локальный UDP перехватывается только при `tun.enabled: true`; по умолчанию он идёт напрямую. UDP контейнеров — `intercept.udp: tproxy` |
 | Интернет пропал после Apply | Демон не откатил изменения: `sudo systemctl stop proxy-for-ubuntud && sudo nft delete table inet pfu; sudo ip rule del fwmark 0x1 lookup 100; sudo ip route flush table 100` |
 | `Permission denied` на `/run/proxy-for-ubuntu/ctl.sock` | Пользователь не в группе `proxy-for-ubuntu`. При установке через `sudo apt` группа добавляется автоматически; если ставили из графического менеджера — `sudo usermod -aG proxy-for-ubuntu $USER` и повторный вход в систему |
 | Окно приложения открывается пустым | WebKitGTK не рисует интерфейс на LXQt/Xfce с Openbox. `proxy-for-ubuntu` сам выставляет `WEBKIT_DISABLE_DMABUF_RENDERER=1`; если не помогло — `LIBGL_ALWAYS_SOFTWARE=1 proxy-for-ubuntu`. Диагностика: `proxy-for-ubuntu --diagnose` |

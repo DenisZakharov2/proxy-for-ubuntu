@@ -25,10 +25,10 @@ dns:
   fallback: [9.9.9.9, 1.0.0.1]
 
 tun:
-  enabled: false        # not implemented, see "Interception modes"
+  enabled: false        # intercept local traffic via pfu0, see "Interception modes"
   device: pfu0
-  mtu: 9000
-  strict_route: true
+  mtu: 1500             # 576..9000; above 1500 breaks large datagrams
+  address: 198.18.0.1/15  # RFC 2544 test range
 
 intercept:
   tcp: redirect          # redirect | off (tproxy for TCP is not implemented)
@@ -66,17 +66,30 @@ final: DIRECT
 
 | Mode | Captures | Requirements | When to enable |
 |---|---|---|---|
-| `redirect` (TCP) | all outgoing TCP | `nftables`, root | default, the only supported TCP mode |
-| `tproxy` (UDP) | forwarded UDP (containers) | `nftables`, `IP_TRANSPARENT` | UDP from containers; local UDP is not intercepted |
+| `redirect` (TCP) | all outgoing TCP | `nftables`, root | default, works without TUN |
+| `tproxy` (UDP) | forwarded UDP (containers) | `nftables`, `IP_TRANSPARENT` | UDP from containers; does not capture local UDP |
+| `tun.enabled` | local IPv4: TCP and UDP (DNS, QUIC) | `nftables`, `/dev/net/tun`, root | when local UDP and DNS must go through the proxy |
 | `off` | nothing, system environment variables only | — | checking everything works after install |
 
-Why not TUN as the primary mode: TUN requires a userspace network stack to parse
-IP packets fully, and is 10x more CPU-expensive. TCP and forwarded UDP are
-caught more reliably by a pair of nftables rules. But that is exactly why local
-UDP (DNS, QUIC) goes direct today: `REDIRECT` does not preserve a datagram's
-real destination, and without a userspace stack it cannot be recovered. The
-`tun` mode exists in the config but is **not implemented**; it is needed for
-this and for non-TCP protocols (ESP, GRE).
+TUN (`tun.enabled: true`) sends local traffic into the `pfu0` interface: the
+kernel hands whole IP packets to the daemon, which parses them with its own
+userspace stack and opens connections through the regular outbounds. This
+captures what REDIRECT and TPROXY cannot: local UDP (DNS, QUIC, games). With
+TUN enabled, TCP also goes through `pfu0` — REDIRECT is not used in this mode.
+
+How it is wired: `mangle output` sets mark `0x2`, `ip rule fwmark 0x2` sends the
+packet to table 101, which holds `default dev pfu0`. Forwarded UDP (containers)
+still uses TPROXY (mark `0x1`, table 100).
+
+First-version limits (0.3.0):
+
+* IPv4 only; IPv6 still goes direct;
+* fragmented packets are dropped: there is no reassembly;
+* TCP: no window scaling (65,535 bytes), no SACK or timestamps, timer-based
+  retransmission — slower than the kernel stack on lossy links;
+* ICMP is not proxied;
+* `dns.strategy: fake-ip` still does not work: the built-in resolver is not
+  wired into interception, DNS travels through TUN as plain UDP.
 
 ## `outbounds`
 

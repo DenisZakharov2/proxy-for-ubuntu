@@ -22,7 +22,11 @@ use crate::error::{Error, Result};
 /// ссылаются скрипты диагностики в документации.
 pub const NFT_TABLE: &str = "pfu";
 pub const ROUTE_TABLE: u32 = 100;
+/// Метка «в TUN»: пакет уходит в устройство `pfu0`, а не в локальный сокет.
 pub const FW_MARK: u32 = 0x1;
+pub const FW_MARK_TUN: u32 = 0x2;
+/// Отдельная таблица маршрутизации для TUN: в ней `default dev pfu0`.
+pub const TUN_ROUTE_TABLE: u32 = 101;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NftPlan {
@@ -39,7 +43,11 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
     let mut r = String::new();
     let tcp_on = cfg.intercept.tcp != TcpMode::Off;
     let udp_on = cfg.intercept.udp != UdpMode::Off;
-    let disabled = !tcp_on && !udp_on;
+    // TUN забирает локальный трафик целиком, включая TCP: в этом режиме
+    // REDIRECT не нужен, иначе nat перепишет получателя раньше маршрутизации.
+    let tun_on = cfg.tun.enabled;
+    let redirect_tcp = tcp_on && !tun_on;
+    let disabled = !tcp_on && !udp_on && !tun_on;
 
     r.push_str("table inet pfu\n");
     r.push_str("delete table inet pfu\n");
@@ -70,31 +78,27 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         r.push_str("    }\n");
     }
 
+    // ── output: локально сгенерированный трафик ──────────────────────────
+    // При TUN метка ставится в mangle (приоритет -150), до маршрутного
+    // решения в nat-хуке: пакет уходит в таблицу 101, где `default dev pfu0`.
+    if tun_on {
+        r.push_str("    chain mangle_output {\n");
+        r.push_str("        type filter hook output priority mangle; policy accept;\n");
+        push_guards(&mut r, cfg, Guard::Output);
+        r.push_str("        meta l4proto udp meta mark set 0x2\n");
+        if tcp_on {
+            r.push_str("        meta l4proto tcp meta mark set 0x2\n");
+        }
+        r.push_str("    }\n");
+    }
+
     // ── prerouting: форвардинг (Docker и другие чужие пакеты) ────────────
     // UDP отдаём в TPROXY-сокет, TCP — в nat-хуке ниже. Метка нужна TPROXY:
     // по ней `ip rule` отправляет пакет в таблицу 100 с локальным маршрутом.
     if !disabled {
         r.push_str("    chain prerouting {\n");
         r.push_str("        type filter hook prerouting priority mangle; policy accept;\n");
-        r.push_str("        iifname \"lo\" return\n");
-        // Таблица `inet` видит оба семейства, а слушатели демона — только
-        // IPv4. Без явного возврата IPv6-TCP уходит в `redirect` и падает:
-        // получателя из IPv4-сокета не восстановить.
-        r.push_str("        meta nfproto ipv6 return\n");
-        // TPROXY в prerouting видит и входящий трафик к самой машине. Без этих
-        // исключений mDNS (224.0.0.251), NTP-ответы и любые пакеты на локальный
-        // адрес уходят в прокси-сокет вместо приложения: службы ломаются, а
-        // демон захлёбывается десятками тысяч датаграмм.
-        r.push_str("        fib daddr type local return\n");
-        r.push_str("        ip daddr 224.0.0.0/4 return\n");
-        r.push_str("        ip daddr 255.255.255.255 return\n");
-        r.push_str("        ip daddr @loopback_ips return\n");
-        if cfg.intercept.bypass_private {
-            r.push_str("        ip daddr @private_ips return\n");
-        }
-        if !cfg.intercept.exclude_ports.is_empty() {
-            r.push_str("        meta l4proto { tcp, udp } th dport @exclude_ports return\n");
-        }
+        push_guards(&mut r, cfg, Guard::Input);
         if udp_on {
             r.push_str("        meta l4proto udp meta mark set 0x1 tproxy to :");
             r.push_str(&crate::paths::tproxy_port().to_string());
@@ -106,59 +110,29 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
     // ── nat output: трафик самой системы ────────────────────────────────
     // REDIRECT переписывает адрес получателя на локальный сокет демона и
     // сохраняет настоящий адрес доступным через SO_ORIGINAL_DST.
-    if !disabled {
+    if !disabled && (redirect_tcp || !tun_on) {
         r.push_str("    chain nat_output {\n");
         r.push_str("        type nat hook output priority -100; policy accept;\n");
-        r.push_str("        oifname \"lo\" return\n");
-        // См. prerouting: IPv6 идёт напрямую, пока нет v6-слушателей.
-        r.push_str("        meta nfproto ipv6 return\n");
-        r.push_str("        fib daddr type local return\n");
-        r.push_str("        ip daddr 224.0.0.0/4 return\n");
-        r.push_str("        ip daddr 255.255.255.255 return\n");
-        r.push_str("        ip daddr @loopback_ips return\n");
-        if cfg.intercept.bypass_private {
-            r.push_str("        ip daddr @private_ips return\n");
-        }
-        if !cfg.intercept.exclude_ports.is_empty() {
-            r.push_str("        meta l4proto { tcp, udp } th dport @exclude_ports return\n");
-        }
-        // Трафик демона (uid 0) обязан идти напрямую, иначе бесконечный цикл.
-        r.push_str("        meta skuid 0 return\n");
-        for uid in &cfg.intercept.exclude_uid {
-            r.push_str(&format!("        meta skuid {uid} return\n"));
-        }
-        if tcp_on {
+        push_guards(&mut r, cfg, Guard::Output);
+        if redirect_tcp {
             r.push_str("        meta l4proto tcp redirect to :");
             r.push_str(&crate::paths::redirect_port().to_string());
             r.push('\n');
         }
         // UDP здесь не перехватываем: REDIRECT переписывает адрес получателя,
         // и настоящий адрес из сокета уже не достать (IP_ORIGDSTADDR вернёт
-        // 127.0.0.1). Локальный UDP идёт напрямую, TPROXY работает только
-        // для форвардинга — см. цепочку prerouting.
+        // 127.0.0.1). Локальный UDP забирает TUN, форвардинг — TPROXY выше.
         r.push_str("    }\n");
     }
 
     // ── nat prerouting: TCP из контейнеров (только при `docker: true`) ───
     // Приоритет dstnat (-100) ниже mangle (-150), поэтому TPROXY успевает
-    // разобрать UDP раньше, а TCP уходит в REDIRECT.
+    // разобрать UDP раньше, а TCP уходит в REDIRECT. Форвардинг TUN не
+    // трогает: метка ставится только в output, чужие пакеты идут прежним путём.
     if !disabled && cfg.intercept.docker {
         r.push_str("    chain nat_prerouting {\n");
         r.push_str("        type nat hook prerouting priority -100; policy accept;\n");
-        r.push_str("        iifname \"lo\" return\n");
-        r.push_str("        meta nfproto ipv6 return\n");
-        // Тот же принцип, что в mangle prerouting: не трогаем трафик,
-        // адресованный самой машине (входящие сервисы), и multicast.
-        r.push_str("        fib daddr type local return\n");
-        r.push_str("        ip daddr 224.0.0.0/4 return\n");
-        r.push_str("        ip daddr 255.255.255.255 return\n");
-        r.push_str("        ip daddr @loopback_ips return\n");
-        if cfg.intercept.bypass_private {
-            r.push_str("        ip daddr @private_ips return\n");
-        }
-        if !cfg.intercept.exclude_ports.is_empty() {
-            r.push_str("        meta l4proto { tcp, udp } th dport @exclude_ports return\n");
-        }
+        push_guards(&mut r, cfg, Guard::Input);
         if tcp_on {
             r.push_str("        meta l4proto tcp redirect to :");
             r.push_str(&crate::paths::redirect_port().to_string());
@@ -171,10 +145,13 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
 
     // Правило добавляется только если его ещё нет: после неудачного teardown
     // и повторного `connect` дубликаты копились, и убрать их потом было нечем.
-    let mut ip_pre = vec![format!(
-        "ip -o rule show | grep -q 'fwmark {FW_MARK:#x} lookup {ROUTE_TABLE}' \
-         || ip rule add fwmark {FW_MARK} lookup {ROUTE_TABLE} priority 100"
-    )];
+    let mut ip_pre = Vec::new();
+    if !disabled && udp_on {
+        ip_pre.push(rule_add(FW_MARK, ROUTE_TABLE));
+    }
+    if tun_on {
+        ip_pre.push(rule_add(FW_MARK_TUN, TUN_ROUTE_TABLE));
+    }
     let mut ip_post = Vec::new();
 
     // `local` обязателен: без него помеченный пакет не доставляется локально
@@ -189,6 +166,54 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
         ruleset: r,
         ip_pre: std::mem::take(&mut ip_pre),
         ip_post,
+    }
+}
+
+/// Команда `ip rule add`, которая не плодит дубликаты при повторном connect.
+fn rule_add(mark: u32, table: u32) -> String {
+    format!(
+        "ip -o rule show | grep -q 'fwmark {mark:#x} lookup {table}' \
+         || ip rule add fwmark {mark} lookup {table} priority 100"
+    )
+}
+
+/// Какие исключения попадают в цепочку. Набор одинаковый, различаются только
+/// хуки: `output` смотрит на исходящий интерфейс, `prerouting` — на входящий,
+/// а `skuid` имеет смысл только для локального трафика.
+#[derive(Clone, Copy)]
+enum Guard {
+    Input,
+    Output,
+}
+
+fn push_guards(r: &mut String, cfg: &Config, guard: Guard) {
+    match guard {
+        Guard::Input => r.push_str("        iifname \"lo\" return\n"),
+        Guard::Output => r.push_str("        oifname \"lo\" return\n"),
+    }
+    // Таблица `inet` видит оба семейства, а стек TUN и слушатели — только
+    // IPv4. Без явного возврата IPv6-TCP уходит в `redirect` и падает.
+    r.push_str("        meta nfproto ipv6 return\n");
+    // TPROXY в prerouting и метка в output видят и трафик к самой машине.
+    // Без этих исключений mDNS (224.0.0.251), NTP-ответы и пакеты к локальным
+    // адресам уходят в прокси-сокет вместо приложения: службы ломаются, а
+    // демон захлёбывается десятками тысяч датаграмм.
+    r.push_str("        fib daddr type local return\n");
+    r.push_str("        ip daddr 224.0.0.0/4 return\n");
+    r.push_str("        ip daddr 255.255.255.255 return\n");
+    r.push_str("        ip daddr @loopback_ips return\n");
+    if cfg.intercept.bypass_private {
+        r.push_str("        ip daddr @private_ips return\n");
+    }
+    if !cfg.intercept.exclude_ports.is_empty() {
+        r.push_str("        meta l4proto { tcp, udp } th dport @exclude_ports return\n");
+    }
+    if matches!(guard, Guard::Output) {
+        // Трафик демона (uid 0) обязан идти напрямую, иначе бесконечный цикл.
+        r.push_str("        meta skuid 0 return\n");
+        for uid in &cfg.intercept.exclude_uid {
+            r.push_str(&format!("        meta skuid {uid} return\n"));
+        }
     }
 }
 
@@ -223,8 +248,12 @@ async fn rollback_after_failure() {
 /// объекта возвращается ошибкой и пишется в журнал.
 pub async fn teardown() -> Result<()> {
     let mut failures = Vec::new();
-    remove_ip_rules(&mut failures).await;
-    remove_route_table(&mut failures).await;
+    for (mark, table) in MARK_TABLES {
+        remove_ip_rules(mark, table, &mut failures).await;
+    }
+    for (_, table) in MARK_TABLES {
+        remove_route_table(table, &mut failures).await;
+    }
     remove_nft_table(&mut failures).await;
 
     if failures.is_empty() {
@@ -239,14 +268,18 @@ pub async fn teardown() -> Result<()> {
     )))
 }
 
+/// Все пары «метка — таблица маршрутизации», которые ставит приложение.
+/// TPproxy-сокет (0x1/100) и TUN (0x2/101) снимаются одинаково.
+const MARK_TABLES: [(u32, u32); 2] = [(FW_MARK, ROUTE_TABLE), (FW_MARK_TUN, TUN_ROUTE_TABLE)];
+
 /// Селектор наших правил в выводе `ip rule show`.
-fn rule_selector() -> String {
-    format!("fwmark {FW_MARK:#x} lookup {ROUTE_TABLE}")
+fn rule_selector(mark: u32, table: u32) -> String {
+    format!("fwmark {mark:#x} lookup {table}")
 }
 
-/// Удаляет все наши правила, а не одно: при повторных `connect` их могло
-/// накопиться несколько, в том числе с другими приоритетами.
-async fn remove_ip_rules(failures: &mut Vec<String>) {
+/// Удаляет все правила для одной метки, а не одно: при повторных `connect`
+/// их могло накопиться несколько, в том числе с другими приоритетами.
+async fn remove_ip_rules(mark: u32, table: u32, failures: &mut Vec<String>) {
     let show = match run_capture("ip rule show").await {
         Ok(v) => v,
         Err(e) => {
@@ -254,7 +287,7 @@ async fn remove_ip_rules(failures: &mut Vec<String>) {
             return;
         }
     };
-    let needle = rule_selector();
+    let needle = rule_selector(mark, table);
     for line in show.lines().filter(|l| l.contains(&needle)) {
         // Строка вида `100:\tfrom all fwmark 0x1 lookup 100`.
         let Some((prio, _)) = line.split_once(':') else {
@@ -264,7 +297,7 @@ async fn remove_ip_rules(failures: &mut Vec<String>) {
         if prio.parse::<u32>().is_err() {
             continue;
         }
-        let cmd = format!("ip rule del priority {prio} fwmark {FW_MARK} lookup {ROUTE_TABLE}");
+        let cmd = format!("ip rule del priority {prio} fwmark {mark} lookup {table}");
         if let Err(e) = run_sh(&cmd).await {
             failures.push(format!("{cmd}: {e}"));
         }
@@ -278,17 +311,17 @@ async fn remove_ip_rules(failures: &mut Vec<String>) {
     }
 }
 
-async fn remove_route_table(failures: &mut Vec<String>) {
-    // На системе, где таблица 100 ещё ни разу не создавалась, ядро отвечает
+async fn remove_route_table(table: u32, failures: &mut Vec<String>) {
+    // На системе, где таблица ещё ни разу не создавалась, ядро отвечает
     // «Error: ipv4: FIB table does not exist». Это не сбой очистки: удалять
     // нечего. Раньше такая строка попадала в журнал как ERROR при каждом
     // первом старте демона и обесценивала диагностику.
-    if let Err(e) = run_sh(&format!("ip route flush table {ROUTE_TABLE}")).await {
+    if let Err(e) = run_sh(&format!("ip route flush table {table}")).await {
         let text = e.to_string();
         if is_missing_table_error(&text) {
             return;
         }
-        failures.push(format!("ip route flush table {ROUTE_TABLE}: {e}"));
+        failures.push(format!("ip route flush table {table}: {e}"));
     }
 }
 
@@ -526,6 +559,52 @@ mod tests {
         c.intercept.bypass_private = false;
         let plan = build_plan(&c);
         assert!(!plan.ruleset.contains("@private_ips"));
+    }
+
+    #[test]
+    fn tun_marks_traffic_and_disables_redirect() {
+        let mut c = base_cfg();
+        c.tun.enabled = true;
+        let plan = build_plan(&c);
+        // Локальный трафик уходит в TUN по метке 0x2; REDIRECT для TCP
+        // отключён, иначе nat перепишет получателя до маршрутизации.
+        assert!(plan.ruleset.contains("hook output priority mangle"));
+        assert!(plan.ruleset.contains("meta l4proto udp meta mark set 0x2"));
+        assert!(plan.ruleset.contains("meta l4proto tcp meta mark set 0x2"));
+        assert!(!plan.ruleset.contains("redirect to :"));
+        assert!(plan
+            .ip_pre
+            .iter()
+            .any(|c| c.contains("fwmark 0x2 lookup 101")));
+        // Таблица 100 нужна только TPROXY: локальный UDP теперь в TUN, но
+        // форвардинг (docker) по-прежнему через tproxy — маршрут остаётся.
+        assert!(plan
+            .ip_post
+            .iter()
+            .any(|c| c.contains("local default dev lo table 100")));
+    }
+
+    #[test]
+    fn tun_off_keeps_redirect_and_no_tun_rule() {
+        let plan = build_plan(&base_cfg());
+        assert!(plan.ruleset.contains("redirect to :"));
+        assert!(!plan.ruleset.contains("meta mark set 0x2"));
+        assert!(!plan
+            .ip_pre
+            .iter()
+            .any(|c| c.contains("fwmark 0x2 lookup 101")));
+    }
+
+    #[test]
+    fn tun_docker_and_prerouting_keep_one_guard_per_chain() {
+        let mut c = base_cfg();
+        c.intercept.docker = true;
+        c.tun.enabled = true;
+        let plan = build_plan(&c);
+        // Цепочки: mangle output (TUN), mangle prerouting, nat prerouting
+        // (docker). nat output с TUN не создаётся — REDIRECT для TCP выключен.
+        assert!(!plan.ruleset.contains("chain nat_output"));
+        assert_eq!(plan.ruleset.matches("meta nfproto ipv6 return").count(), 3);
     }
 
     #[test]

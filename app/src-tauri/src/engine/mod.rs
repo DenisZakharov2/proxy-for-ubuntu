@@ -13,6 +13,7 @@ pub mod router;
 pub mod rules;
 pub mod stats;
 pub mod tls;
+pub mod tun;
 
 /// HTTP-клиент для обновления geo-наборов и подписок. Один на процесс:
 /// переиспользование соединений к одному и тому же CDN заметно ускоряет

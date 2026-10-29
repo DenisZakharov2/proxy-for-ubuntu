@@ -7,9 +7,9 @@
 <img src="packaging/icons/proxy-for-ubuntu.svg" width="96" alt="proxy-for-ubuntu">
 
 All of the system's TCP traffic and UDP from containers is routed through a
-proxy according to Clash-style rules. The core is written from scratch in
-Rust: no sing-box, no Xray, no clash. Local UDP — DNS, QUIC — still goes
-direct, see "Interception limits".
+proxy according to Clash-style rules; with TUN enabled, local UDP — DNS,
+QUIC — goes through the proxy too. The core is written from scratch in
+Rust: no sing-box, no Xray, no clash. See "Interception limits".
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
@@ -78,6 +78,7 @@ rerouting an entire system is not something a package should do on your behalf.
 │                                 │
 │  TCP: REDIRECT → :15000          │
 │  UDP: TPROXY :15001 (mark+100)   │
+│  TUN: pfu0 (mark 0x2, table 101) │
 │      ↓                          │
 │  rule engine → outbound         │
 │      ↓                          │
@@ -89,16 +90,19 @@ rerouting an entire system is not something a package should do on your behalf.
 The system's routes are never modified. The kernel redirects TCP into the
 daemon's socket with `nftables` REDIRECT, and UDP goes through TPROXY and
 policy routing by mark: the packet is marked, routed by that mark into table
-100, where the daemon's listener picks it up. Everything not intercepted keeps
+100, where the daemon's listener picks it up. With `tun.enabled: true` a
+second path appears: local traffic is marked with `0x2`, routed into table 101
+and lands in the `pfu0` device, where the daemon's userspace stack parses it. Everything not intercepted keeps
 working normally — and `apt remove` restores the system on its own.
 
 ### Interception limits
 
-- **Local UDP is not intercepted.** DNS, QUIC and game traffic from the
-  machine itself goes direct, past the proxy: `REDIRECT` leaves no way to
-  learn the datagram's real destination. That needs TUN, which is not
-  implemented yet. `dns.strategy: fake-ip` has no effect in the current
-  scheme.
+- **Local UDP is intercepted only with `tun.enabled: true`.** Without TUN,
+  DNS, QUIC and game traffic from the machine itself goes direct, past the
+  proxy: `REDIRECT` leaves no way to learn a datagram's real destination. With
+  TUN the traffic goes into `pfu0` and is parsed by the userspace stack.
+  `dns.strategy: fake-ip` still has no effect: the resolver is not wired into
+  interception.
 - **UDP is intercepted for forwarded traffic only** — containers. Container
   TCP is intercepted with `intercept.docker: true`, UDP with
   `intercept.udp: tproxy`.
@@ -228,7 +232,7 @@ sudo pfu-cli apply < my.yaml
 |---|---|
 | Toggle does nothing after `apt install` | Daemon not running: `sudo systemctl start proxy-for-ubuntud` |
 | "nftables rejected the ruleset" | Missing privileges or conflicting rules: `sudo nft list ruleset` |
-| QUIC/games bypass the proxy | A scheme limitation: local UDP is not intercepted, that needs TUN (not implemented). UDP is intercepted for containers only |
+| QUIC/games bypass the proxy | Local UDP is intercepted only with `tun.enabled: true`; by default it goes direct. Container UDP needs `intercept.udp: tproxy` |
 | Internet gone after Apply | Daemon did not roll back: `sudo systemctl stop proxy-for-ubuntud && sudo nft delete table inet pfu; sudo ip rule del fwmark 0x1 lookup 100; sudo ip route flush table 100` |
 | `Permission denied` на `/run/proxy-for-ubuntu/ctl.sock` | Пользователь не в группе `proxy-for-ubuntu`. При установке через `sudo apt` группа добавляется автоматически; если ставили из графического менеджера — `sudo usermod -aG proxy-for-ubuntu $USER` и повторный вход в систему |
 | Окно приложения открывается пустым | WebKitGTK не рисует интерфейс на LXQt/Xfce с Openbox. `proxy-for-ubuntu` сам выставляет `WEBKIT_DISABLE_DMABUF_RENDERER=1`; если не помогло — `LIBGL_ALWAYS_SOFTWARE=1 proxy-for-ubuntu`. Диагностика: `proxy-for-ubuntu --diagnose` |

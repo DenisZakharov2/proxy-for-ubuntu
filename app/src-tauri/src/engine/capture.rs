@@ -43,6 +43,9 @@ const UDP_IDLE: Duration = Duration::from_secs(60);
 /// перехвата приложение не оставляет открытых сокетов.
 pub struct Capture {
     tasks: Vec<JoinHandle<()>>,
+    /// TUN-стек, если он включён в конфиге. Живёт вместе со слушателями:
+    /// без него правила увели бы TCP в устройство, которое никто не читает.
+    tun: Option<super::tun::Tun>,
     /// Общий признак остановки. По нему завершаются не только циклы приёма,
     /// но и уже открытые UDP-потоки: каждый держит `Arc<UdpSocket>` и без
     /// этого жил бы до истечения `UDP_IDLE`, не давая закрыть порт 15001.
@@ -52,12 +55,16 @@ pub struct Capture {
 impl Capture {
     /// Останавливает слушатели и дожидается, пока задачи отпустят сокеты:
     /// повторный `start` (SIGHUP, повторный `connect`) должен найти порты
-    /// свободными.
+    /// свободными. TUN останавливается последним — сначала отменяем потоки,
+    /// которые пишут в устройство.
     pub async fn stop(&mut self) {
         tracing::info!("слушатели перехвата останавливаются");
         self.abort();
         for t in self.tasks.drain(..) {
             let _ = t.await;
+        }
+        if let Some(mut tun) = self.tun.take() {
+            tun.stop().await;
         }
     }
 
@@ -80,28 +87,51 @@ impl Drop for Capture {
 pub async fn start(engine: Arc<Engine>) -> Result<Capture> {
     let cancel = CancellationToken::new();
     let mut tasks = Vec::new();
+    let mut tun = None;
 
-    if engine.config.intercept.tcp != TcpMode::Off {
-        let port = paths::redirect_port();
-        let listener = TcpListener::bind(("0.0.0.0", port)).await.map_err(|e| {
-            Error::Internal(format!(
-                "не удалось занять порт {port} для перехвата TCP: {e}"
-            ))
-        })?;
-        tasks.push(tokio::spawn(tcp_loop(
-            engine.clone(),
-            listener,
-            cancel.clone(),
-        )));
+    // TUN первым: он создаёт устройство и маршрут в таблице 101. Если
+    // дальше не получится занять порт, устройство снимается ниже — иначе
+    // правила увели бы трафик в интерфейс, который никто не читает.
+    if engine.config.tun.enabled {
+        tun = Some(super::tun::Tun::start(engine.clone()).await?);
     }
 
-    if engine.config.intercept.udp != UdpMode::Off {
-        let sock = Arc::new(udp_socket(paths::tproxy_port())?);
-        tasks.push(tokio::spawn(udp_loop(engine.clone(), sock, cancel.clone())));
+    let listeners: Result<()> = async {
+        if engine.config.intercept.tcp != TcpMode::Off {
+            let port = paths::redirect_port();
+            let listener = TcpListener::bind(("0.0.0.0", port)).await.map_err(|e| {
+                Error::Internal(format!(
+                    "не удалось занять порт {port} для перехвата TCP: {e}"
+                ))
+            })?;
+            tasks.push(tokio::spawn(tcp_loop(
+                engine.clone(),
+                listener,
+                cancel.clone(),
+            )));
+        }
+
+        if engine.config.intercept.udp != UdpMode::Off {
+            let sock = Arc::new(udp_socket(paths::tproxy_port())?);
+            tasks.push(tokio::spawn(udp_loop(engine.clone(), sock, cancel.clone())));
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = listeners {
+        if let Some(mut started) = tun.take() {
+            started.stop().await;
+        }
+        return Err(e);
     }
 
-    tracing::info!(listeners = tasks.len(), "перехват включён");
-    Ok(Capture { tasks, cancel })
+    tracing::info!(
+        listeners = tasks.len(),
+        tun = tun.is_some(),
+        "перехват включён"
+    );
+    Ok(Capture { tasks, tun, cancel })
 }
 
 // ─────────────────────────────────── TCP ───────────────────────────────────

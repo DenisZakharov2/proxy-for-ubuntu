@@ -9,7 +9,7 @@
 //! вызывается отдельно — здесь держим только «сырое» представление.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -175,6 +175,8 @@ impl Config {
             ));
         }
 
+        self.validate_tun()?;
+
         // Имена outbound'ов должны быть уникальны, DIRECT — присутствовать.
         let mut names: HashSet<String> = HashSet::new();
         for ob in &self.outbounds {
@@ -246,12 +248,78 @@ impl Config {
             }
         }
 
-        if self.dns.strategy == DnsStrategy::FakeIp && self.intercept.udp == UdpMode::Off {
+        if self.dns.strategy == DnsStrategy::FakeIp
+            && self.intercept.udp == UdpMode::Off
+            && !self.tun.enabled
+        {
             return Err(Error::ConfigInvalid(
-                "dns.strategy: fake-ip требует перехвата UDP (intercept.udp: tproxy)".into(),
+                "dns.strategy: fake-ip требует перехвата UDP (intercept.udp: tproxy или tun.enabled)"
+                    .into(),
             ));
         }
 
+        Ok(())
+    }
+
+    /// Проверяет поля TUN даже при `enabled: false`: опечатка в имени
+    /// устройства или MTU должна всплыть при `validate`, а не в момент
+    /// включения перехвата.
+    fn validate_tun(&self) -> Result<()> {
+        let tun = &self.tun;
+        let name_ok = !tun.device.is_empty()
+            && tun.device.len() < 16
+            && tun.device != "lo"
+            && tun
+                .device
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        if !name_ok {
+            return Err(Error::ConfigInvalid(format!(
+                "tun.device: недопустимое имя {:?} — до 15 символов, буквы/цифры/._-, не lo",
+                tun.device
+            )));
+        }
+        if !(576..=9000).contains(&tun.mtu) {
+            return Err(Error::ConfigInvalid(format!(
+                "tun.mtu: {} вне диапазона 576..9000",
+                tun.mtu
+            )));
+        }
+        let Some((addr, prefix)) = tun.address.split_once('/') else {
+            return Err(Error::ConfigInvalid(format!(
+                "tun.address: {:?} — нужен формат 198.18.0.1/15",
+                tun.address
+            )));
+        };
+        let addr: Ipv4Addr = addr.parse().map_err(|_| {
+            Error::ConfigInvalid(format!("tun.address: {:?} — не IPv4-адрес", tun.address))
+        })?;
+        let prefix: u8 = prefix.parse().map_err(|_| {
+            Error::ConfigInvalid(format!("tun.address: {:?} — префикс не число", tun.address))
+        })?;
+        if prefix > 32 {
+            return Err(Error::ConfigInvalid(format!(
+                "tun.address: префикс /{prefix} больше 32"
+            )));
+        }
+        if tun.enabled {
+            if self.intercept.tcp == TcpMode::Off && self.intercept.udp == UdpMode::Off {
+                return Err(Error::ConfigInvalid(
+                    "tun.enabled требует intercept.tcp или intercept.udp: интерфейсу нечего \
+                     перехватывать"
+                        .into(),
+                ));
+            }
+            // Адрес должен быть в тестовом диапазоне или хотя бы не пересекаться
+            // с типичными локальными сетями — иначе локальный трафик уедет в TUN.
+            if addr.is_loopback() || addr.is_private() || addr.is_link_local() {
+                tracing::warn!(
+                    address = %tun.address,
+                    "адрес TUN пересекается с локальными сетями: локальный трафик к этим адресам \
+                     уйдёт в прокси"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -440,21 +508,30 @@ impl Default for InterceptConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
+    /// Включён ли перехват через TUN. Это отдельный режим: локальный трафик
+    /// уходит в устройство целиком, а не в сокет демона.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_tun_device")]
     pub device: String,
+    /// MTU интерфейса. 1500 по умолчанию: больший MTU на обычной сети
+    /// приводит к тому, что крупные датаграммы не проходят наружу.
     #[serde(default = "default_mtu")]
     pub mtu: u16,
-    #[serde(default = "default_true")]
-    pub strict_route: bool,
+    /// Адрес интерфейса. Диапазон 198.18.0.0/15 — тестовый (RFC 2544),
+    /// в реальных сетях не используется.
+    #[serde(default = "default_tun_address")]
+    pub address: String,
 }
 
 fn default_tun_device() -> String {
     "pfu0".into()
 }
 fn default_mtu() -> u16 {
-    9000
+    1500
+}
+fn default_tun_address() -> String {
+    "198.18.0.1/15".into()
 }
 
 impl Default for TunConfig {
@@ -463,7 +540,7 @@ impl Default for TunConfig {
             enabled: false,
             device: default_tun_device(),
             mtu: default_mtu(),
-            strict_route: true,
+            address: default_tun_address(),
         }
     }
 }
@@ -1495,6 +1572,107 @@ rules:
         assert_eq!(cfg.rules.len(), 2);
         assert_eq!(cfg.outbounds[1].kind(), "socks5");
         assert!(cfg.outbounds[1].remote_dns());
+    }
+
+    #[test]
+    fn tun_defaults_are_safe() {
+        let cfg = Config::default();
+        assert!(!cfg.tun.enabled, "TUN по умолчанию выключен");
+        assert_eq!(cfg.tun.device, "pfu0");
+        // 1500, а не 9000: крупная датаграмма в обычной сети не пролезет.
+        assert_eq!(cfg.tun.mtu, 1500);
+        assert_eq!(cfg.tun.address, "198.18.0.1/15");
+        cfg.validate_for_read().unwrap();
+    }
+
+    #[test]
+    fn tun_requires_interception() {
+        let yaml = r#"
+tun:
+  enabled: true
+intercept:
+  tcp: off
+  udp: off
+outbounds:
+  - {name: DIRECT, type: direct}
+"#;
+        let err = Config::parse(yaml, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("tun.enabled"), "{err}");
+    }
+
+    #[test]
+    fn tun_fields_are_validated() {
+        for (block, needle) in [
+            ("enabled: false\n  device: \"\"", "tun.device"),
+            ("enabled: false\n  mtu: 100", "tun.mtu"),
+            ("enabled: false\n  address: 198.18.0.1", "tun.address"),
+            ("enabled: false\n  address: 10.0.0.1/40", "префикс"),
+        ] {
+            let yaml = format!(
+                "tun:\n  {block}\noutbounds:\n  - {{name: DIRECT, type: direct}}\n"
+            );
+            let err = Config::parse(&yaml, &HashMap::new()).unwrap_err();
+            assert!(err.to_string().contains(needle), "{yaml}: {err}");
+        }
+    }
+
+    #[test]
+    fn removed_strict_route_is_rejected() {
+        // Поле убрано вместе с TUN-реализацией: оно никогда ничего не делало,
+        // а молча игнорировать настройку хуже, чем отказать.
+        let yaml = r#"
+tun:
+  enabled: false
+  strict_route: true
+outbounds:
+  - {name: DIRECT, type: direct}
+"#;
+        let err = Config::parse(yaml, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("strict_route"), "{err}");
+    }
+
+    #[test]
+    fn tun_block_round_trips() {
+        let yaml = r#"
+tun:
+  enabled: true
+  device: pfu9
+  mtu: 1400
+  address: 172.19.0.1/30
+intercept:
+  tcp: redirect
+  udp: off
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: X, type: http, server: a, port: 80}
+"#;
+        let cfg = Config::parse(yaml, &HashMap::new()).unwrap();
+        assert!(cfg.tun.enabled);
+        assert_eq!(cfg.tun.device, "pfu9");
+        assert_eq!(cfg.tun.mtu, 1400);
+        assert_eq!(cfg.tun.address, "172.19.0.1/30");
+        let back = serde_yaml::to_string(&cfg).unwrap();
+        assert!(back.contains("address: 172.19.0.1/30"));
+        assert!(!back.contains("strict_route"));
+    }
+
+    #[test]
+    fn dns_fake_ip_accepts_tun_as_udp_capture() {
+        let yaml = r#"
+dns:
+  strategy: fake-ip
+tun:
+  enabled: true
+intercept:
+  tcp: redirect
+  udp: off
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: X, type: http, server: a, port: 80}
+"#;
+        // fake-ip пока не реализован, но требование «нужен перехват UDP»
+        // выполнено: TUN ловит локальный UDP.
+        Config::parse(yaml, &HashMap::new()).unwrap();
     }
 
     #[test]

@@ -244,13 +244,27 @@ async fn run_check(strict: bool) -> Result<()> {
         problems += 1;
     }
 
-    let tun = std::path::Path::new("/dev/net/tun").exists();
-    // TUN не реализован, поэтому отсутствие устройства не мешает работе:
-    // строка нужна только для диагностики.
+    let tun_device = std::path::Path::new("/dev/net/tun").exists();
+    // TUN нужен только когда включён в конфиге: на хосте без модуля tun
+    // демон обязан стартовать, если пользователь TUN не просил.
+    let tun_enabled = pfu::config::Config::load(
+        &paths::config_path(),
+        &pfu::config::read_env_file(&paths::env_file()),
+    )
+    .map(|c| c.tun.enabled)
+    .unwrap_or(false);
     println!(
-        "/dev/net/tun: {} (необязательно: TUN не реализован)",
-        if tun { "есть" } else { "НЕТ" }
+        "/dev/net/tun: {} (TUN {})",
+        if tun_device { "есть" } else { "НЕТ" },
+        if tun_enabled {
+            "включён в конфиге"
+        } else {
+            "выключен в конфиге"
+        }
     );
+    if tun_enabled && !tun_device {
+        problems += 1;
+    }
 
     let root = unsafe { libc::geteuid() } == 0;
     println!("права: {}", if root { "root" } else { "не root" });
