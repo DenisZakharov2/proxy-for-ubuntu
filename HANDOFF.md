@@ -126,6 +126,21 @@ GitHub). На remote осталась только `main`.
 `Protocols` на промежуточном `40e9bc9` был failure по vmess — это и был тот
 самый честный сигнал, после которого `vmess.rs` переписали (`84db96f`).
 
+### 2.3 Release v0.4.0
+
+- URL: https://github.com/DenisZakharov2/proxy-for-ubuntu/releases/tag/v0.4.0
+- `proxy-for-ubuntu_0.4.0_amd64.deb` — 4 362 656 байт (сборка 22.04)
+- sha256: `b397b8068afce78bbf9630b9d56d31d5e8bf91808987e34cc52d6e26bff1abc3`
+- Проверено: скачанный `.deb` сходится с `.sha256`, `pfu-cli version` из пакета
+  печатает `pfu-cli 0.4.0 (IPC api 1, протокол 0.4.0)`, в
+  `usr/share/proxy-for-ubuntu/profiles/default.yaml` есть
+  `dns.intercept_stub: true`; в пакете 52 записи.
+- Копия — `материалы сессии 19/release/` (на диске; `*.deb` в `.gitignore`).
+- `release.yml` на тег `v0.4.0` (run `40965213809`) — success, оба
+  matrix-джоба; ассеты грузит только 22.04 (§6.6).
+- На хосте стоит **локальная** сборка `0.4.0-1` из `dist/` — для проверки
+  (§2.9); для раздачи она не годится.
+
 ### 2.3 Release v0.3.1
 
 - URL: https://github.com/DenisZakharov2/proxy-for-ubuntu/releases/tag/v0.3.1
@@ -366,7 +381,9 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
   журнал без warning/error; `disconnect` убрал порты, `ip rule`, `pfu0` —
   сеть и DNS работают;
 - CI на `c8661ac` (run `40962636587`) — success; Protocols
-  (`40962636666`) — success; `release.yml` на тег `v0.4.0` — см. §2.3.
+  (`40962636666`) — success; `release.yml` на тег `v0.4.0` (run `40965213809`) —
+  success, ассеты проверены (§2.3). CI и Protocols на docs-коммите
+  `4f2d525` — success.
 
 Найдено по дороге: `Capture::stop_listeners` прерывал задачи до того, как они
 отпускали сокеты. С заглушкой это стало опасным: дочерние задачи держат
