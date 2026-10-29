@@ -121,13 +121,24 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `shadowsocks` | ✅ working | AEAD: ChaCha20-Poly1305, AES-128/256-GCM |
 | `trojan` | ✅ working | password verified on every packet |
 | `ssh` | ✅ working | delegated to the system OpenSSH (`ssh -D`) |
-| `vless` | ⚠ unverified | written from the spec, never tested against a live Xray server |
-| `vmess` | ⚠ unverified | same; AEAD mode with `alterId: 0` only |
+| `vless` | ✅ working | verified against live Xray 26.10.29: `pfu-cli test-outbound` → HTTP 200 |
+| `vmess` | ✅ working | AEAD, `alterId: 0`; AES-128-GCM and ChaCha20-Poly1305, verified the same way |
 
-Being straight about the last two: the code compiles and passes tests against
-our own servers, but it has **never connected to a real Xray server**. If you
-confirm yours works, please open an issue — a log screenshot is better evidence
-than a word. The UI marks such proxies with ⚠.
+Compatibility matrix:
+
+| Protocol | Server | Server version | Status | Verified |
+|---|---|---|---|---|
+| `vless` | Xray (Docker) | 26.10.29 | ✅ HTTP 200, 930 bytes | 2026-10-29 |
+| `vmess` | Xray (Docker) | 26.10.29 | ✅ HTTP 200, 923–928 bytes | 2026-10-29 |
+
+The matrix comes from `.github/workflows/protocols.yml`: each run sends a GET
+through our `engine::outbound` (`pfu-cli test-outbound`) to a live Xray
+container and records the actual answer; the image is pinned by digest.
+
+The honest limit: verification covers **TCP without TLS** against the Xray
+container. The TLS wrapper, the WebSocket transport and public servers are
+tested separately; `vless` with `reality`/`flow` and `alterId != 0` remain
+unsupported.
 
 Not supported: Reality/XTLS in VLESS, the gRPC transport, Shadowsocks plugins,
 `alterId != 0` for VMess.

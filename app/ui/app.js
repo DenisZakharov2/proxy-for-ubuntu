@@ -64,7 +64,6 @@ const I18N = {
     'empty.rules': 'Правил нет', 'empty.rules.hint': 'Весь трафик идёт по правилу final',
     'rules.finalRow': 'Всё, что не попало ни под одно правило выше',
     'empty.profiles': 'Профилей нет',
-    'experimental': 'Не проверен на живом сервере',
     'udp.dnsLeak': 'DNS разрешается локально — есть риск утечки',
     'rule.add': 'Новое правило', 'rule.type': 'Тип условия', 'rule.value': 'Значение', 'rule.policy': 'Действие',
     'save.apply.hint': 'Применение изменит маршрутизацию всей системы. Если что-то пойдёт не так, proxy-for-ubuntu вернёт прежние настройки автоматически.'
@@ -124,7 +123,6 @@ const I18N = {
     'empty.rules': 'No rules', 'empty.rules.hint': 'All traffic follows the final rule',
     'rules.finalRow': 'Everything that matched no rule above',
     'empty.profiles': 'No profiles',
-    'experimental': 'Not verified against a live server',
     'udp.dnsLeak': 'DNS is resolved locally — possible leak',
     'rule.add': 'New rule', 'rule.type': 'Condition type', 'rule.value': 'Value', 'rule.policy': 'Action',
     'save.apply.hint': 'Applying will change routing for the entire system. If anything goes wrong, proxy-for-ubuntu restores the previous settings automatically.'
@@ -420,8 +418,6 @@ const PROTO_FIELDS = {
   ssh: [['server', 'Server', 'text'], ['port', 'Port', 'number'], ['username', 'User', 'text'],
         ['key_file', 'Key file', 'text'], ['password', 'Password (or key)', 'password']],
 };
-const EXPERIMENTAL = new Set(['vless', 'vmess']);
-
 // Движок умеет только эти транспорты (`engine/outbound`). `grpc` в списке нет
 // намеренно: интерфейс не должен предлагать то, что движок молча проигнорирует.
 const NETWORK_OPTIONS = ['tcp', 'ws'];
@@ -449,11 +445,10 @@ async function renderProxies() {
         ? (r.ok ? `<span class="badge ok">${r.latency_ms ?? ''} ${esc(t('proxies.ok'))}</span>`
                  : `<span class="badge reject">${esc(t('proxies.broken'))}</span>`)
         : `<span class="badge">${esc(t('proxies.untested'))}</span>`;
-      const exp = EXPERIMENTAL.has(ty) ? ` <span class="badge exp" title="${esc(t('experimental'))}">⚠</span>` : '';
       const leak = (o.type === 'socks' && o.remote_dns === false && o.udp)
         ? `<span class="badge warn" title="${esc(t('udp.dnsLeak'))}">DNS</span>` : '';
       return `<tr>
-        <td><b>${esc(name)}</b> ${exp}${leak}</td>
+        <td><b>${esc(name)}</b>${leak}</td>
         <td><span class="badge ${ty === 'direct' ? 'direct' : 'proxy'}">${esc(ty)}</span></td>
         <td class="num" style="text-align:left">${addr}</td>
         <td>${badge}</td>
@@ -498,7 +493,7 @@ function proxyForm(o = { type: 'direct', name: '' }) {
           .map(v => `<option value="${v}" ${(o[key] || 'tcp') === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>`
       : `<label><span>${esc(label)}</span><input id="f-${key}" type="${type === 'number' ? 'number' : type}" value="${esc(o[key] ?? '')}" /></label>`).join('')}
   </div>
-  ${EXPERIMENTAL.has(o.type) ? `<p class="hint" style="color:var(--warn)">⚠ ${esc(t('experimental'))}</p>` : ''}`;
+`;
 }
 
 function readForm() {
@@ -541,7 +536,6 @@ function addProxy() {
         const bad = validateOutbound(o);
         if (bad) { toast(t('status.error'), esc(bad), 'err'); save.keepOpen = true; return; }
         save.keepOpen = false;
-        if (EXPERIMENTAL.has(o.type)) toast('—', t('experimental'), 'warn');
         (state.config.outbounds ||= []).push(o);
         renderProxies();
       } };

@@ -731,11 +731,6 @@ impl Outbound {
         }
     }
 
-    /// Протокол не проверялся против живого сервера. GUI помечает ⚠.
-    pub fn is_experimental(&self) -> bool {
-        matches!(self, Outbound::Vless(_) | Outbound::Vmess(_))
-    }
-
     /// Умеет ли этот outbound пересылать UDP (нужно для QUIC, DNS, игр).
     pub fn supports_udp(&self) -> bool {
         match self {

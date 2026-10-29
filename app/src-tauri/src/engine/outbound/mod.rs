@@ -387,11 +387,7 @@ pub fn describe(cfg: &OutboundConfig) -> String {
         OutboundConfig::Vmess(o) => format!("VMess {}:{} alterId={}", o.server, o.port, o.alter_id),
         OutboundConfig::Ssh(o) => format!("SSH {}@{}:{}", o.username, o.server, o.port),
     };
-    if cfg.is_experimental() {
-        format!("{base}  [НЕ ПРОВЕРЕН на живом сервере]")
-    } else {
-        base
-    }
+    base
 }
 
 #[cfg(test)]
@@ -448,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn describe_marks_experimental() {
+    fn describe_names_the_protocol_and_endpoint() {
         let vless = OutboundConfig::Vless(crate::config::OutboundVless {
             name: "V".into(),
             server: "a".into(),
@@ -465,7 +461,8 @@ mod tests {
             test_url: None,
             test_timeout_ms: None,
         });
-        assert!(describe(&vless).contains("НЕ ПРОВЕРЕН"));
+        assert!(describe(&vless).contains("VLESS"));
+        assert!(describe(&vless).contains("a:443"));
         let dir = OutboundConfig::Direct(crate::config::OutboundDirect {
             name: "DIRECT".into(),
             test_url: None,

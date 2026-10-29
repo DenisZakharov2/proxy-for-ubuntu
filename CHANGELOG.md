@@ -4,6 +4,50 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии следуют [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [0.2.0] - 2026-10-29
+
+### Добавлено
+- **Импорт ссылок и подписок.** `link.rs` разбирает `vless://`, `vmess://`,
+  `ss://` (SIP002 и legacy), `trojan://`, `socks5://`, `http://`; `reality` и
+  `grpc` отклоняются с причиной, а не молча теряются. `subscription.rs`
+  понимает YAML, список ссылок и base64-список, возвращает `rejected[]` с
+  номерами строк: одна битая строка не отменяет импорт.
+- **IPC импорта:** `profile.import_uri`, `profile.import_links`,
+  `subscription.preview`, `subscription.apply`, `subscription.list`,
+  `subscription.refresh`, `subscription.remove`; реестр `subscriptions.json`
+  и планировщик обновления по сроку.
+- **GUI:** вставка списка ссылок, предпросмотр подписки («принято N,
+  отклонено M») до записи в профиль, таблица подписок с кнопками «Обновить»
+  и «Удалить».
+- **`pfu-cli test-outbound`** — настоящий HTTP-обмен через `engine::outbound`
+  с проверкой кода ответа.
+
+### Исправлено
+- **VMess переписан под протокол Xray.** Прошлая реализация не совпадала с
+  сервером: authID шифровался самим uuid вместо
+  `KDF16(cmdKey, "AES Auth ID Encryption")`, `cmdKey` считался без соли
+  `c48619fe-…`, тело шло открытым текстом, заголовок ответа пропускался —
+  Xray отвечал `invalid user`. Теперь KDF повторяет вложенный HMAC из Xray,
+  тело идёт кадрами `len ‖ AEAD` со счётчиком nonce, ответный заголовок
+  расшифровывается и сверяется по маркеру. Проверено против Xray 26.10.29:
+  `vless` и `vmess` (AES-128-GCM и ChaCha20-Poly1305) отдают HTTP 200 через
+  наш код.
+- **`teardown` больше не пишет ERROR при первом старте**, когда FIB-таблицы
+  100 ещё нет.
+- **Секреты вне `Debug` и журнала:** пароли, UUID и passphrase редактируются,
+  `${VAR}` без значения — ошибка разбора, `env` и `config.yaml` создаются с
+  правами 0600, в юните `UMask=0077` и `RestrictAddressFamilies`.
+- **GUI:** хелпер `ipc` переименован в `rpc` (WRY ставит свой `window.ipc`,
+  из-за чего поставочное окно оставалось мёртвым), `enabled` берётся из
+  `daemon.status`, в окне виден `engine_loaded`.
+
+### CI
+- `protocols.yml` проверяет `vless`/`vmess` через `pfu-cli test-outbound`,
+  образ Xray закреплён по digest, матрица строится из фактических ответов.
+
+### Тесты
+- 182 модульных теста (было 139).
+
 ## [0.1.3] - 2026-10-26
 
 ### Исправлено

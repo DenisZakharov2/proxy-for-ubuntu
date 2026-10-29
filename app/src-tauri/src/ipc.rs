@@ -334,15 +334,6 @@ impl Server {
                         ));
                     }
                 }
-                for ob in &cfg.outbounds {
-                    if ob.is_experimental() {
-                        warnings.push(format!(
-                            "outbound {:?} ({}) не проверялся против живого сервера",
-                            ob.name(),
-                            ob.kind()
-                        ));
-                    }
-                }
                 Ok(json!({ "valid": true, "warnings": warnings, "errors": [] }))
             }
             Err(e) => Ok(json!({
@@ -766,20 +757,11 @@ impl Server {
             .unwrap_or("imported");
         let yaml = params.get("yaml").and_then(Value::as_str).unwrap_or("");
         let env = crate::config::read_env_file(&paths::env_file());
-        let cfg = Config::parse(yaml, &env)?;
+        Config::parse(yaml, &env)?;
         paths::ensure_dir(&paths::user_profiles_dir())?;
         let path = paths::user_profiles_dir().join(format!("{}.yaml", sanitize_name(name)));
         paths::atomic_write(&path, yaml.as_bytes())?;
-        let mut warnings = Vec::new();
-        for ob in &cfg.outbounds {
-            if ob.is_experimental() {
-                warnings.push(format!(
-                    "outbound {:?} не проверен на живом сервере",
-                    ob.name()
-                ));
-            }
-        }
-        Ok(json!({ "ok": true, "warnings": warnings, "errors": [] }))
+        Ok(json!({ "ok": true, "warnings": Vec::<String>::new(), "errors": [] }))
     }
 
     fn profile_export(&self, params: &Value) -> Result<Value> {
@@ -899,13 +881,7 @@ impl Server {
         paths::ensure_dir(&paths::user_profiles_dir())?;
         paths::atomic_write(&path, yaml.as_bytes())?;
 
-        let mut warnings = Vec::new();
-        if outbound.is_experimental() {
-            warnings.push(format!(
-                "outbound {:?} не проверен на живом сервере",
-                outbound.name()
-            ));
-        }
+        let warnings = Vec::<String>::new();
         Ok(json!({
             "ok": true,
             "name": name,
