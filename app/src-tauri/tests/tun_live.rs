@@ -51,6 +51,11 @@ async fn tun_udp_and_tcp_roundtrip() {
     let udp = run_client("udp").await;
     let tcp = run_client("tcp").await;
 
+    // Сколько байт реально прошло через устройство. Без этой проверки
+    // «успех» мог бы означать, что трафик ушёл по обычному маршруту мимо
+    // TUN: клиент и сервер соединены напрямую, и эхо вернулось бы всё равно.
+    let through_tun = stat("rx_bytes") + stat("tx_bytes");
+
     // Снимаем всё до проверок: стенд одноразовый, но правила должны уйти
     // в любом случае.
     capture.stop().await;
@@ -80,6 +85,22 @@ async fn tun_udp_and_tcp_roundtrip() {
         "правило fwmark 0x2 осталось после teardown"
     );
     assert!(!leftover_nft, "таблица inet pfu осталась после teardown");
+    assert!(
+        through_tun >= 500_000,
+        "через pfu0 прошло только {through_tun} байт — трафик шёл мимо TUN"
+    );
+
+    // Статистика: TCP закрылся штатно, UDP-поток записывается при остановке
+    // перехвата. 256 КБ вверх и вниз плюс 1,2 КБ UDP.
+    let (up, down, _) = engine.stats.snapshot();
+    assert!(up >= 262_144, "учтено вверх только {up} байт");
+    assert!(down >= 262_144, "учтено вниз только {down} байт");
+    let rows = engine.breakdown.snapshot();
+    assert!(
+        rows.iter()
+            .any(|r| r.policy == "DIRECT" && r.bytes >= 512 * 1024),
+        "breakdown пуст или мал: {rows:?}"
+    );
 }
 
 /// Запускает python-клиента от uid 1000: трафик root'а исключён из перехвата
@@ -140,4 +161,14 @@ else:
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Счётчик интерфейса из sysfs. `rx_bytes` — пакеты, записанные в устройство
+/// из userspace, `tx_bytes` — прочитанные из него; для проверки «трафик шёл
+/// через TUN» годится сумма.
+fn stat(name: &str) -> u64 {
+    std::fs::read_to_string(format!("/sys/class/net/pfu0/statistics/{name}"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }

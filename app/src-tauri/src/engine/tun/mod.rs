@@ -294,7 +294,17 @@ async fn run(engine: Arc<Engine>, io: Arc<TunIo>, cancel: CancellationToken) {
         }
     }
 
-    joins.shutdown().await;
+    // Штатное завершение: потоки слушают `cancel` и успевают записать
+    // статистику в breakdown. Ждать вечно нельзя — запись в зависший upstream
+    // не должна задерживать выключение, поэтому через 2 с обрываем.
+    let drain = async { while joins.join_next().await.is_some() {} };
+    if tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+        .await
+        .is_err()
+    {
+        tracing::debug!("часть потоков TUN не закрылась за 2 с — обрываем");
+        joins.shutdown().await;
+    }
 }
 
 /// Общий реестр UDP-потоков, чтобы завершающаяся задача убирала себя сама.

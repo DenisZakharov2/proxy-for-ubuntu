@@ -177,9 +177,10 @@ xray-сервера. Формально в UI такие протоколы по
 - **TCP из контейнеров** (`intercept.docker: true`) перехватывается в
   `nat prerouting` тем же `redirect to :15000`.
 
-- **TUN** (`tun.enabled: true`, интерфейс `pfu0`). `mangle output` ставит
-  метку `0x2`, `ip rule fwmark 0x2` отправляет пакет в таблицу 101, где лежит
-  `default dev pfu0`. Демон читает IPv4-пакеты из `pfu0`, разбирает TCP/UDP
+- **TUN** (`tun.enabled: true`, интерфейс `pfu0`). Цепочка `mangle output`
+  **типа `route`** ставит метку `0x2` (с типом `filter` netfilter не
+  пересчитывает маршрут, и пакет уходит мимо TUN), `ip rule fwmark 0x2`
+  отправляет пакет в таблицу 101, где лежит `default dev pfu0`. Демон читает IPv4-пакеты из `pfu0`, разбирает TCP/UDP
   собственным userspace-стеком (`engine/tun/`) и открывает соединение через
   обычные outbound'ы. Ответ собирается в IP-пакет и пишется в `pfu0` — ядро
   доставляет его приложению. В этом режиме `nat output` с REDIRECT для TCP

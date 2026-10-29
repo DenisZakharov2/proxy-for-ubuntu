@@ -79,11 +79,12 @@ pub fn build_plan(cfg: &Config) -> NftPlan {
     }
 
     // ── output: локально сгенерированный трафик ──────────────────────────
-    // При TUN метка ставится в mangle (приоритет -150), до маршрутного
-    // решения в nat-хуке: пакет уходит в таблицу 101, где `default dev pfu0`.
+    // Тип `route`, а не `filter`: после `meta mark set` netfilter обязан
+    // пересчитать маршрут. С `filter` метка ставится, но пакет уходит по
+    // прежнему маршруту — трафик проходит мимо TUN, и внешне всё работает.
     if tun_on {
         r.push_str("    chain mangle_output {\n");
-        r.push_str("        type filter hook output priority mangle; policy accept;\n");
+        r.push_str("        type route hook output priority mangle; policy accept;\n");
         push_guards(&mut r, cfg, Guard::Output);
         r.push_str("        meta l4proto udp meta mark set 0x2\n");
         if tcp_on {
@@ -568,7 +569,11 @@ mod tests {
         let plan = build_plan(&c);
         // Локальный трафик уходит в TUN по метке 0x2; REDIRECT для TCP
         // отключён, иначе nat перепишет получателя до маршрутизации.
-        assert!(plan.ruleset.contains("hook output priority mangle"));
+        // Тип цепочки обязан быть `route`: с `filter` метка ставится, но
+        // маршрут не пересчитывается, и пакет уходит мимо TUN.
+        assert!(plan
+            .ruleset
+            .contains("type route hook output priority mangle"));
         assert!(plan.ruleset.contains("meta l4proto udp meta mark set 0x2"));
         assert!(plan.ruleset.contains("meta l4proto tcp meta mark set 0x2"));
         assert!(!plan.ruleset.contains("redirect to :"));
