@@ -95,6 +95,16 @@ impl Default for Config {
 impl Config {
     /// Разбирает YAML с подстановкой переменных окружения.
     pub fn parse(text: &str, env: &HashMap<String, String>) -> Result<Self> {
+        // Подстановка не должна молча превращать отсутствующий секрет в пустую
+        // строку: тогда конфиг «валиден», а соединение падает с невнятной
+        // ошибкой аутентификации. Список имён — без значений.
+        let missing = missing_env_refs(text, env);
+        if !missing.is_empty() {
+            return Err(Error::ConfigInvalid(format!(
+                "в конфиге есть переменные без значения: {} — добавьте их в /etc/proxy-for-ubuntu/env или задайте значение по умолчанию ${{VAR:-...}}",
+                missing.join(", ")
+            )));
+        }
         let expanded = expand_env(text, env);
         let cfg: Config =
             serde_yaml::from_str(&expanded).map_err(|e| Error::ConfigInvalid(format!("{e}")))?;
@@ -585,7 +595,10 @@ pub struct OutboundLimit {
 // ──────────────────────────────── outbound'ы ────────────────────────────────
 
 /// Именованный исходящий канал. Вариант соответствует полю `type` в YAML.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` реализован вручную (см. ниже): производный печатал пароли, UUID и
+/// паролевые фразы открытым текстом, а `{:?}` уезжает в журнал и в отчёты.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Outbound {
     Direct(OutboundDirect),
@@ -599,6 +612,96 @@ pub enum Outbound {
     Vless(OutboundVless),
     Vmess(OutboundVmess),
     Ssh(OutboundSsh),
+}
+
+/// Значение секретного поля для `Debug`: сам секрет не печатается.
+fn secret(value: &str) -> &'static str {
+    if value.is_empty() {
+        "<пусто>"
+    } else {
+        "***"
+    }
+}
+
+impl std::fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Секреты не попадают в `{:?}`: этого требуют `REQ-013` и правило
+        // «секретов нет в логах и артефактах». Имя, адрес, порт и транспорт
+        // остаются — по ним отладка и возможна.
+        match self {
+            Outbound::Direct(o) => f
+                .debug_struct("Outbound::Direct")
+                .field("name", &o.name)
+                .finish(),
+            Outbound::Http(o) => f
+                .debug_struct("Outbound::Http")
+                .field("name", &o.name)
+                .field("server", &o.server)
+                .field("port", &o.port)
+                .field("username", &o.username)
+                .field("password", &secret(&o.password))
+                .field("password_file", &o.password_file)
+                .finish(),
+            Outbound::Socks(o) => f
+                .debug_struct("Outbound::Socks")
+                .field("name", &o.name)
+                .field("server", &o.server)
+                .field("port", &o.port)
+                .field("username", &o.username)
+                .field("password", &secret(&o.password))
+                .field("udp", &o.udp)
+                .field("remote_dns", &o.remote_dns)
+                .finish(),
+            Outbound::Shadowsocks(o) => f
+                .debug_struct("Outbound::Shadowsocks")
+                .field("name", &o.name)
+                .field("server", &o.server)
+                .field("port", &o.port)
+                .field("method", &o.method)
+                .field("password", &secret(&o.password))
+                .field("udp", &o.udp)
+                .finish(),
+            Outbound::Trojan(o) => f
+                .debug_struct("Outbound::Trojan")
+                .field("name", &o.name)
+                .field("server", &o.server)
+                .field("port", &o.port)
+                .field("password", &secret(&o.password))
+                .field("sni", &o.sni)
+                .field("tls", &true)
+                .finish(),
+            Outbound::Vless(o) => f
+                .debug_struct("Outbound::Vless")
+                .field("name", &o.name)
+                .field("server", &o.server)
+                .field("port", &o.port)
+                .field("uuid", &secret(&o.uuid))
+                .field("network", &o.network)
+                .field("tls", &o.tls)
+                .field("sni", &o.sni)
+                .finish(),
+            Outbound::Vmess(o) => f
+                .debug_struct("Outbound::Vmess")
+                .field("name", &o.name)
+                .field("server", &o.server)
+                .field("port", &o.port)
+                .field("uuid", &secret(&o.uuid))
+                .field("network", &o.network)
+                .field("tls", &o.tls)
+                .field("sni", &o.sni)
+                .finish(),
+            Outbound::Ssh(o) => f
+                .debug_struct("Outbound::Ssh")
+                .field("name", &o.name)
+                .field("server", &o.server)
+                .field("port", &o.port)
+                .field("username", &o.username)
+                .field("password", &secret(&o.password))
+                .field("passphrase", &secret(&o.passphrase))
+                .field("key_file", &o.key_file)
+                .finish(),
+        }
+    }
 }
 
 impl Outbound {
@@ -1286,9 +1389,41 @@ impl ParsedRule {
 
 // ──────────────────────────── подстановка переменных ───────────────────────
 
+/// Имена `${VAR}`, для которых в `env` нет значения и нет `:-default`.
+///
+/// Проверка нужна до подстановки: `expand_env` подставляет пустую строку, и
+/// секрет молча становится пустым. Для чтения конфига (`load_for_read`,
+/// `config.get`) это допустимо, для применения — нет.
+pub fn missing_env_refs(text: &str, env: &HashMap<String, String>) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let expr = &after[..end];
+        let (name, has_default) = match expr.split_once(":-") {
+            Some((name, _)) => (name, true),
+            None => (expr, false),
+        };
+        let name = name.trim();
+        if !name.is_empty()
+            && !has_default
+            && !env.contains_key(name)
+            && !missing.iter().any(|known| known == name)
+        {
+            missing.push(name.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    missing
+}
+
 /// Подставляет `${VAR}` и `${VAR:-default}` из карты. Неизвестная переменная
-/// без default — ошибка: лучше не применить конфиг, чем положить в коннект
-/// строку `password: "${SMTP_PASSWORD_BUT_NOT_REALLY}"`.
+/// без default подставляется пустой строкой; `Config::parse` такую ситуацию
+/// отвергает через [`missing_env_refs`], чтобы не отправить в коннект пустой
+/// пароль вместо секрета.
 pub fn expand_env(text: &str, env: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes: Vec<char> = text.chars().collect();
@@ -1423,6 +1558,71 @@ rules: []
         assert_eq!(expand_env("a=${NOPE}b", &e), "a=b");
         assert_eq!(expand_env("a=$NOPE", &e), "a=$NOPE");
         assert_eq!(expand_env("no vars", &e), "no vars");
+    }
+
+    #[test]
+    fn debug_output_never_prints_secrets() {
+        let yaml = r#"
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: HTTP, type: http, server: 1.2.3.4, port: 8080, username: u, password: "http-secret"}
+  - {name: SS, type: shadowsocks, server: 5.6.7.8, port: 8388, method: chacha20-ietf-poly1305, password: "ss-secret"}
+  - {name: VLESS, type: vless, server: a.example, port: 443, uuid: "11111111-2222-3333-4444-555555555555"}
+  - {name: SSH, type: ssh, server: b.example, username: root, password: "ssh-secret"}
+"#;
+        let cfg = Config::parse(yaml, &env(&[])).expect("конфиг должен разобраться");
+        let dump = format!("{cfg:?}");
+        for secret in [
+            "http-secret",
+            "ss-secret",
+            "11111111-2222-3333-4444-555555555555",
+            "ssh-secret",
+        ] {
+            assert!(
+                !dump.contains(secret),
+                "секрет {secret:?} попал в Debug: {dump}"
+            );
+        }
+        // Отладка без несекретных полей бесполезна — они должны остаться.
+        assert!(dump.contains("1.2.3.4"), "{dump}");
+        assert!(dump.contains("VLESS"), "{dump}");
+        assert!(
+            dump.contains("***"),
+            "метка редактирования отсутствует: {dump}"
+        );
+    }
+
+    #[test]
+    fn missing_env_variable_without_default_is_an_error() {
+        let yaml = r#"
+outbounds:
+  - {name: DIRECT, type: direct}
+  - {name: S, type: http, server: 1.2.3.4, port: 8080, username: u, password: "${SMTP_PASSWORD}"}
+"#;
+        let err = Config::parse(yaml, &env(&[])).expect_err("без значения — ошибка");
+        let text = err.to_string();
+        assert!(text.contains("SMTP_PASSWORD"), "{text}");
+        assert!(
+            !text.contains("${SMTP_PASSWORD}"),
+            "сообщение повторяет выражение вместо имени переменной: {text}"
+        );
+
+        // Значение по умолчанию — законный способ обойтись без env-файла.
+        let with_default = yaml.replace("${SMTP_PASSWORD}", "${SMTP_PASSWORD:-fallback}");
+        let cfg = Config::parse(&with_default, &env(&[])).expect("default допустим");
+        match &cfg.outbounds[1] {
+            Outbound::Http(o) => assert_eq!(o.password, "fallback"),
+            other => panic!("ожидался http, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_env_refs_lists_each_name_once() {
+        let text = "a: ${A} b: ${B} c: ${A} d: ${C:-x} e: $NOT_A_REF";
+        assert_eq!(
+            missing_env_refs(text, &env(&[("B", "1")])),
+            vec!["A".to_string()]
+        );
     }
 
     #[test]

@@ -19,6 +19,15 @@ RestartSec=3
 # EMFILE и перестаёт принимать соединения.
 LimitNOFILE=65536
 
+# Демон сам пишет файлы с секретами: профили пользователей, реестр подписок,
+# точки отката. При умолчании 0022 они создавались бы 0644 и были бы читаемы
+# любому локальному пользователю. `REQ-013`.
+UMask=0077
+
+# Сетевой демон не должен уметь ничего, кроме unix-сокета IPC, IPv4/IPv6
+# (перехват, DNS, outbound'ы) и netlink (nftables, маршруты).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
 # Демон управляет сетевым стеком, поэтому NeedsCapabilities. Остальные
 # Capabilities у него нет: никаких файловых или процессных операций.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_SYS_RESOURCE

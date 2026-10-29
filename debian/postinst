@@ -138,6 +138,24 @@ ENVEOF
             chmod 0640 /etc/proxy-for-ubuntu/env
         fi
 
+        # ── права на секреты — при каждом configure ───────────────────────
+        # Не только при создании: обновление пакета не должно оставлять файлы
+        # с 0640 из версий до 0.2.0 и не должно зависеть от порядка блоков
+        # выше. `REQ-013`: секреты читает только демон, то есть root.
+        for SECRET_FILE in /etc/proxy-for-ubuntu/env /etc/proxy-for-ubuntu/config.yaml; do
+            [ -f "$SECRET_FILE" ] || continue
+            chown root:root "$SECRET_FILE"
+            chmod 0600 "$SECRET_FILE"
+        done
+        # Профили содержат те же секреты, что и конфиг. Каталог должен быть
+        # закрыт для всех, кроме root и группы демона (GUI ходит через сокет).
+        if [ -d /etc/proxy-for-ubuntu/profiles ]; then
+            chown root:"$PFU_GROUP" /etc/proxy-for-ubuntu/profiles
+            chmod 0750 /etc/proxy-for-ubuntu/profiles
+            find /etc/proxy-for-ubuntu/profiles -maxdepth 1 -type f -name '*.yaml' \
+                -exec chown root:root {} + -exec chmod 0600 {} + 2>/dev/null || true
+        fi
+
         # ── systemd ───────────────────────────────────────────────────────
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true
