@@ -14,11 +14,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # ⚠ ВНИМАНИЕ: этот тег нужно заменить на конкретный digest образа перед
-  # первым запуском в production (см. риск в дорожной карте №1).
-  # Xray не pubblicует официальные Docker-образы; ниже — widely-used образ
-  # сообщества. Версию выбираем осознанно и фиксируем.
-  XRAY_IMAGE: docker.io/teddysun/xray:latest
+  # Xray не публикует официальные Docker-образы; ниже — образ сообщества,
+  # закреплённый по digest, а не по тегу: тег `latest` мог смениться между
+  # прогонами, и тогда «зелёная» проверка проверяла бы уже другую программу.
+  # Обновление: `docker buildx imagetools inspect docker.io/teddysun/xray:latest`
+  # и подставить новый Digest в строку ниже вместе с датой.
+  # Закреплено 29.10.2026.
+  XRAY_IMAGE: docker.io/teddysun/xray@sha256:192de11069f271816eda94840d7940fd8dcdb8a7e5d67b5e1c68ab9a3afd9ff7
   PFU_WORK: /tmp/pfu-protocols
 
 jobs:
@@ -160,43 +162,65 @@ jobs:
         working-directory: app/src-tauri
         run: cargo run --bin pfu-cli -- validate < "${PFU_WORK}/config.yaml"
 
-      # ── Проверяем vless: реальный обмен байтами с Xray ────────────────
-      - name: Проверить vless — обмен байтами с живым Xray
+      # ── Проверяем vless: настоящий HTTP-запрос через наш outbound ──────
+      # Раньше здесь открывался TCP до порта Xray мимо нашего кода — такой шаг
+      # зелёный даже при полностью сломанном vless. Теперь запрос уходит через
+      # `engine::outbound` и обязан вернуться ответом 2xx–3xx.
+      - name: Проверить vless через наш outbound
+        working-directory: app/src-tauri
         run: |
-          bash -c '
-            exec 3<>/dev/tcp/127.0.0.1/1443
-            printf "\x00\x00\x01\x00\x50\x02example.com\x01\xbb" >&3
-            read -r -t 5 -n 100 resp <&3
-            echo "vless: enviados 12 байт, получено ${#resp} байт"
-            exec 3>&-
-          '
-          # Убеждаемся, что порт действительно слушает (TCP-соединение прошло).
-          sudo docker port pfu-xray | grep -q "0.0.0.0:1443"
-          echo "vless: TCP-соединение к Xray inbound установлено (реальный обмен байтами)."
+          rc=0
+          cargo run --bin pfu-cli -- test-outbound \
+            --config "${PFU_WORK}/config.yaml" \
+            --name VLESS-Test \
+            --url http://example.com/ \
+            --timeout-ms 15000 \
+            > "${PFU_WORK}/vless.json" || rc=$?
+          cat "${PFU_WORK}/vless.json" || true
+          exit $rc
 
-      # ── Проверяем vmess: реальный обмен байтами с Xray ────────────────
-      - name: Проверить vmess — обмен байтами с живым Xray
+      # ── Проверяем vmess тем же путём ──────────────────────────────────
+      - name: Проверить vmess через наш outbound
+        working-directory: app/src-tauri
         run: |
-          bash -c '
-            exec 3<>/dev/tcp/127.0.0.1/1444
-            printf "VMESS-TEST" >&3
-            read -r -t 5 -n 100 resp <&3
-            echo "vmess: enviados 10 байт, получено ${#resp} байт"
-            exec 3>&-
-          '
-          sudo docker port pfu-xray | grep -q "0.0.0.0:1444"
-          echo "vmess: TCP-соединение к Xray inbound установлено (реальный обмен байтами)."
+          rc=0
+          cargo run --bin pfu-cli -- test-outbound \
+            --config "${PFU_WORK}/config.yaml" \
+            --name VMESS-Test \
+            --url http://example.com/ \
+            --timeout-ms 15000 \
+            > "${PFU_WORK}/vmess.json" || rc=$?
+          cat "${PFU_WORK}/vmess.json" || true
+          exit $rc
 
-      # ── Итоговый verdict ──────────────────────────────────────────────
+      # ── Итоговый verdict: матрица из фактических JSON-ответов ─────────
       - name: Зафиксировать вердикт совместимости
+        if: always()
         run: |
           echo "## Результат проверки протоколов" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Протокол | Xray | Статус | Примечание |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| vless | ${XRAY_IMAGE} | ✅ соединение установлено | TCP до inbound 1443 проходит, байты уходят |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| vmess | ${XRAY_IMAGE} | ✅ соединение установлено | TCP до inbound 1444 проходит, байты уходят |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Ограничение: pfu-cli apply требует root и nftables, поэтому полный цикл «применить → соединиться → получить ответ» невозможен в GitHub Actions без привилегированного контейнера. Для сквозной проверки см. [docs/TESTING.md](docs/TESTING.md)." >> "$GITHUB_STEP_SUMMARY"
+          echo "| Протокол | Образ Xray | HTTP | Байт | мс | Вердикт |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for name in vless vmess; do
+            file="${PFU_WORK}/${name}.json"
+            if [ -s "$file" ]; then
+              ok=$(jq -r '.ok // false' "$file")
+              code=$(jq -r '.status // "—"' "$file")
+              bytes=$(jq -r '.bytes // 0' "$file")
+              ms=$(jq -r '.latency_ms // 0' "$file")
+              err=$(jq -r '.error // ""' "$file")
+              if [ "$ok" = "true" ]; then
+                verdict="✅ HTTP-ответ получен"
+              else
+                verdict="❌ ${err:-нет ответа}"
+              fi
+            else
+              code="—"; bytes=0; ms=0; verdict="❌ шаг не выполнился"
+            fi
+            echo "| ${name} | ${XRAY_IMAGE} | ${code} | ${bytes} | ${ms} | ${verdict} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Проверка идёт через наш код: `pfu-cli test-outbound` отправляет GET через `engine::outbound` и требует ответ 2xx–3xx. `sudo` и `nftables` нужны только для `apply`, поэтому перехват системы в Actions не проверяется — это отдельная job на netns-стенде (`TASK-012`).' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Остановить Xray-контейнер
         if: always()
