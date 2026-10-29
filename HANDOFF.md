@@ -197,7 +197,9 @@ Release v0.1.2 (для истории): `.deb` 3 629 108 байт, sha256
 - `cargo test --lib` — 203 passed;
 - netns-стенд (привилегированный контейнер): UDP 1200 Б и TCP 256 КБ в обе
   стороны через `pfu0`, 3 прогона подряд, `teardown` без остатков;
-- `proxy-for-ubuntud --check` печатает состояние TUN из конфига.
+- `proxy-for-ubuntud --check` печатает состояние TUN из конфига;
+- CI и Protocols на `f4ed865` — **success** (CI: fmt/clippy/тесты/пакет,
+  4 мин; Protocols: vless и vmess против живого Xray, 4 мин 37 с).
 
 ## 3. Машина и окружение (важно для следующей сессии)
 
