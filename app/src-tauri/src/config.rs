@@ -1608,9 +1608,7 @@ outbounds:
             ("enabled: false\n  address: 198.18.0.1", "tun.address"),
             ("enabled: false\n  address: 10.0.0.1/40", "префикс"),
         ] {
-            let yaml = format!(
-                "tun:\n  {block}\noutbounds:\n  - {{name: DIRECT, type: direct}}\n"
-            );
+            let yaml = format!("tun:\n  {block}\noutbounds:\n  - {{name: DIRECT, type: direct}}\n");
             let err = Config::parse(&yaml, &HashMap::new()).unwrap_err();
             assert!(err.to_string().contains(needle), "{yaml}: {err}");
         }
