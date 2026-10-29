@@ -245,9 +245,15 @@ impl Engine {
                 )));
             }
             Decision::HijackDns => {
-                return Err(Error::Internal(
-                    "HIJACK-DNS обрабатывается DNS-модулем".into(),
-                ));
+                // UDP-запросы с этим правилом отвечает DNS-модуль, до этой
+                // точки они не доходят. TCP (DNS over TCP) локально не
+                // обслуживается: сообщение должно говорить правду, а не
+                // «обрабатывается», иначе пользователь ищет дефект в DNS.
+                return Err(Error::Internal(format!(
+                    "HIJACK-DNS: локальный ответ поддерживается только для UDP/53, \
+                     а это {} — уберите HIJACK-DNS для TCP",
+                    target.key()
+                )));
             }
             Decision::Direct | Decision::Proxy(_) => {}
         }
