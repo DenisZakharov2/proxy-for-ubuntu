@@ -25,10 +25,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::TunConfig;
 use crate::engine::nft::{FW_MARK_TUN, TUN_ROUTE_TABLE};
 use crate::engine::router::Engine;
 use crate::error::{Error, Result};
@@ -44,6 +45,12 @@ pub type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
 /// Запущенное TUN-устройство вместе с читающей задачей.
 pub struct Tun {
     device: String,
+    /// Конфиг, с которым создано устройство. По нему `reload` решает,
+    /// можно ли оставить TUN живым или его надо пересоздать.
+    cfg: TunConfig,
+    /// Активный движок. `reload` подменяет его, не трогая устройство и уже
+    /// открытые соединения: каждое держит свой снимок движка.
+    engine: Arc<RwLock<Arc<Engine>>>,
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
@@ -67,7 +74,8 @@ impl Tun {
             return Err(e);
         }
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(engine, io, cancel.clone()));
+        let shared = Arc::new(RwLock::new(engine));
+        let task = tokio::spawn(run(shared.clone(), io, cancel.clone()));
         tracing::info!(
             device = %cfg.device,
             mtu = cfg.mtu,
@@ -77,10 +85,25 @@ impl Tun {
             "TUN запущен"
         );
         Ok(Self {
-            device: cfg.device,
+            device: cfg.device.clone(),
+            cfg,
+            engine: shared,
             cancel,
             task: Some(task),
         })
+    }
+
+    /// Конфиг, с которым создано устройство: по нему решается, можно ли
+    /// переиспользовать TUN после `reload`.
+    pub fn config(&self) -> &TunConfig {
+        &self.cfg
+    }
+
+    /// Подменяет движок для новых пакетов. Открытые соединения продолжают
+    /// жить со своим снимком: их правило и счётчики не должны меняться
+    /// задним числом.
+    pub async fn swap_engine(&self, engine: Arc<Engine>) {
+        *self.engine.write().await = engine;
     }
 
     /// Останавливает разбор пакетов и дожидается закрытия дескриптора:
@@ -250,7 +273,7 @@ async fn run_cmd(cmd: &str) -> Result<()> {
 /// Читает пакеты из TUN и раздаёт их обработчикам TCP/UDP. Потоки
 /// (соединения) живут в `JoinSet` этой задачи, поэтому остановка TUN
 /// гарантированно дожидается их завершения и закрытия дескриптора.
-async fn run(engine: Arc<Engine>, io: Arc<TunIo>, cancel: CancellationToken) {
+async fn run(engine: Arc<RwLock<Arc<Engine>>>, io: Arc<TunIo>, cancel: CancellationToken) {
     let mut joins: JoinSet<()> = JoinSet::new();
     let udp = udp::UdpFlows::new();
     let tcp = tcp::TcpFlows::new();
@@ -279,6 +302,9 @@ async fn run(engine: Arc<Engine>, io: Arc<TunIo>, cancel: CancellationToken) {
         let Some(packet) = packet::parse_ipv4(&buf[..n]) else {
             continue;
         };
+        // Снимок движка на пакет: `reload` мог только что его подменить.
+        // Held-лок не переживает await — клонируем и отпускаем.
+        let engine = engine.read().await.clone();
         match packet.protocol {
             packet::PROTO_UDP => {
                 udp.dispatch(packet, &io, &engine, &cancel, &mut joins)

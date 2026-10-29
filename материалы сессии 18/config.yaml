@@ -1,0 +1,45 @@
+# Конфиг стенда нагрузки (материалы сессии 18).
+# TUN включён, единственный outbound — DIRECT: проверяем сам стек, а не
+# удалённый прокси.
+api: 1
+
+log:
+  level: info
+  journal: false
+
+dns:
+  strategy: redir-host
+  cache_size: 4096
+  cache_ttl: 300
+  servers: [1.1.1.1, 8.8.8.8]
+  fallback: [9.9.9.9, 1.0.0.1]
+
+intercept:
+  tcp: redirect
+  udp: tproxy
+  exclude_ports: ["22"]
+  bypass_private: true
+  loop_protect: true
+
+tun:
+  enabled: true
+  device: pfu0
+  mtu: 1500
+
+geo:
+  auto_update: false
+  update_interval_hours: 24
+  sources: []
+
+outbounds:
+  - name: DIRECT
+    type: direct
+  # Второй outbound нужен только для `reload`/`config.apply`: строгая
+  # проверка отвергает конфиг с единственным DIRECT, а нам надо дойти до
+  # пересоздания перехвата. Оба ходят напрямую.
+  - name: DIRECT2
+    type: direct
+
+rules: []
+
+final: DIRECT2

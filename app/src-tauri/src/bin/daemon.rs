@@ -202,8 +202,11 @@ async fn run_daemon() -> Result<()> {
                     Ok(report) if report.ok => {
                         tracing::info!("конфигурация перезагружена после SIGHUP")
                     }
-                    Ok(_) => tracing::warn!(
-                        "перезагрузка конфигурации после SIGHUP не удалась: откат выполнен"
+                    Ok(report) => tracing::warn!(
+                        stage = %report.stage,
+                        message = %report.message,
+                        errors = ?report.errors,
+                        "перезагрузка конфигурации после SIGHUP не удалась"
                     ),
                     Err(e) => tracing::error!("ошибка перезагрузки конфигурации после SIGHUP: {e}"),
                 }

@@ -352,17 +352,27 @@ impl Server {
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or("user");
+        // Перехват выключен: конфиг применяется только в памяти. Иначе
+        // `Apply` при выключенном тумблере писал бы nftables-правила и
+        // `ip rule` в никуда — устройство и слушатели не подняты.
+        if !self.enabled_now().await {
+            let report = self.apply_in_memory(cfg).await?;
+            return serde_json::to_value(report).map_err(Error::from);
+        }
         let report: ApplyReport = self.supervisor.apply(cfg, reason).await;
 
         if report.ok {
             // Перечитываем конфиг и пересобираем движок в памяти — это и есть
             // «применение без перезапуска демона».
+            // Перехват остаётся в том состоянии, в котором был: применять
+            // конфиг при выключенном перехвате не значит его включить.
+            let was_enabled = self.enabled_now().await;
             if let Ok((loaded, _)) = self.load_config() {
                 let geo = GeoRegistry::load(&[]);
                 if let Ok(engine) = Engine::build(loaded, &geo) {
                     engine
                         .enabled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                        .store(was_enabled, std::sync::atomic::Ordering::Relaxed);
                     *self.engine.write().await = Some(engine);
                     self.sync_capture().await;
                 }
@@ -377,16 +387,26 @@ impl Server {
     /// соединения) сохраняется: меняется только активная конфигурация.
     pub async fn reload_config(&self) -> Result<ApplyReport> {
         let (cfg, _) = self.load_config()?;
-        let report = self.supervisor.apply(cfg, "reload").await;
+        // Перехват выключен: перечитываем конфиг только в памяти. Без этой
+        // ветки `systemctl reload` выключенного демона возвращал nftables
+        // и `ip rule` на место, хотя ни устройства, ни слушателей нет.
+        if !self.enabled_now().await {
+            return self.apply_in_memory(cfg).await;
+        }
+        let report = self.supervisor.apply_with(cfg, "reload", false).await;
         if report.ok {
             // Перечитываем конфиг и пересобираем движок в памяти — так же,
             // как в `config.apply`, чтобы новые настройки вступили сразу.
+            // Состояние перехвата сохраняем: `reload` выключенного демона не
+            // должен включать его — иначе пакеты уходят в TUN посреди
+            // сессии, которую никто не просил проксировать.
+            let was_enabled = self.enabled_now().await;
             if let Ok((loaded, _)) = self.load_config() {
                 let geo = GeoRegistry::load(&[]);
                 if let Ok(engine) = Engine::build(loaded, &geo) {
                     engine
                         .enabled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                        .store(was_enabled, std::sync::atomic::Ordering::Relaxed);
                     *self.engine.write().await = Some(engine);
                     self.sync_capture().await;
                 }
@@ -395,21 +415,79 @@ impl Server {
         Ok(report)
     }
 
+    /// Включён ли перехват прямо сейчас.
+    async fn enabled_now(&self) -> bool {
+        self.engine
+            .read()
+            .await
+            .as_ref()
+            .map(|e| e.enabled.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// Применяет конфиг только в памяти, не трогая систему: перехват
+    /// выключен, значит править nftables и `ip rule` нечего, а движок с
+    /// новыми правилами нужен — следующий `connect` возьмёт его.
+    async fn apply_in_memory(&self, cfg: Config) -> Result<ApplyReport> {
+        // Мягкая проверка: конфиг без единого прокси — норма, пока перехват
+        // выключен (это состояние сразу после установки).
+        cfg.validate_for_read()?;
+        let geo = GeoRegistry::load(&[]);
+        let engine = Engine::build(cfg, &geo)?;
+        engine
+            .enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.engine.write().await = Some(engine);
+        Ok(ApplyReport {
+            ok: true,
+            stage: "done".into(),
+            message: "конфигурация применена; перехват выключен, системные правила не менялись"
+                .into(),
+            rolled_back: false,
+            system_touched: false,
+            backup: None,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
     /// Переподнимает слушатели под текущий движок: после нового конфига
     /// старые задачи держали бы старые правила.
+    ///
+    /// TUN не пересоздаётся, если его настройки не менялись: устройство и
+    /// уже открытые через него соединения переживают `reload`, а новый
+    /// движок получают только новые пакеты. Пересоздание рвало бы всё, что
+    /// качается или держит сессию в момент `systemctl reload`.
     async fn sync_capture(&self) {
         let engine = self.engine.read().await.clone();
         let mut guard = self.capture.lock().await;
+        let new_tun = engine.as_ref().map(|e| &e.config.tun).filter(|t| t.enabled);
+        let mut kept_tun = None;
         if let Some(mut old) = guard.take() {
-            // Дожидаемся закрытия сокетов: иначе повторный bind на те же порты
-            // может упасть с «address already in use».
-            old.stop().await;
+            let reuse = tun_reusable(old.tun_config(), new_tun);
+            tracing::debug!(
+                reuse,
+                old = ?old.tun_config(),
+                new = ?new_tun,
+                "sync_capture: решаю судьбу TUN"
+            );
+            if reuse {
+                kept_tun = old.take_tun();
+                old.stop_listeners().await;
+            } else {
+                old.stop().await;
+            }
         }
         let Some(engine) = engine.filter(|e| e.enabled.load(std::sync::atomic::Ordering::Relaxed))
         else {
+            // Перехват выключили: удержанный TUN всё равно надо снять,
+            // иначе устройство останется без читателя.
+            if let Some(mut tun) = kept_tun {
+                tun.stop().await;
+            }
             return;
         };
-        match capture::start(engine.clone()).await {
+        match capture::start_with(engine.clone(), kept_tun).await {
             Ok(c) => *guard = Some(c),
             Err(e) => {
                 // Без слушателей правила увели бы трафик в закрытые порты.
@@ -1558,6 +1636,24 @@ fn fd_usage() -> (usize, u64) {
     (open, soft)
 }
 
+/// Можно ли оставить работающий TUN при применении нового конфига.
+///
+/// Устройство переживает `reload` только когда оба конфига просят TUN с
+/// теми же `device`/`mtu`/`address`: адрес и MTU применяются к интерфейсу
+/// один раз при старте. Смена любого поля (или выключение TUN) требует
+/// пересоздания — иначе новый конфиг описывал бы не то устройство, которое
+/// работает.
+fn tun_reusable(
+    old: Option<&crate::config::TunConfig>,
+    new: Option<&crate::config::TunConfig>,
+) -> bool {
+    match (old, new) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,6 +1662,47 @@ mod tests {
     /// переменная процесса, а каталоги у тестов разные — иначе `apply`
     /// пишет профиль в чужой временный каталог.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn tun_survives_reload_only_when_its_settings_unchanged() {
+        let base = crate::config::TunConfig {
+            enabled: true,
+            device: "pfu0".into(),
+            mtu: 1500,
+            address: "198.18.0.1/15".into(),
+        };
+        assert!(tun_reusable(None, None), "без TUN пересоздавать нечего");
+        assert!(
+            tun_reusable(Some(&base), Some(&base)),
+            "тот же TUN остаётся"
+        );
+        let mut other_mtu = base.clone();
+        other_mtu.mtu = 1400;
+        assert!(
+            !tun_reusable(Some(&base), Some(&other_mtu)),
+            "MTU требует пересоздания"
+        );
+        let mut other_dev = base.clone();
+        other_dev.device = "pfu1".into();
+        assert!(
+            !tun_reusable(Some(&base), Some(&other_dev)),
+            "имя требует пересоздания"
+        );
+        let mut other_addr = base.clone();
+        other_addr.address = "198.19.0.1/15".into();
+        assert!(
+            !tun_reusable(Some(&base), Some(&other_addr)),
+            "адрес требует пересоздания"
+        );
+        assert!(
+            !tun_reusable(Some(&base), None),
+            "выключение TUN его снимает"
+        );
+        assert!(
+            !tun_reusable(None, Some(&base)),
+            "включение TUN создаёт устройство"
+        );
+    }
 
     /// Мини-сервер на localhost: один запрос — один ответ. Внешняя сеть не
     /// трогается, поэтому тест годится и для машины, где живой сети нет.

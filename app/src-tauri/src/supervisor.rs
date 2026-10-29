@@ -129,7 +129,19 @@ impl Supervisor {
 
     /// Полный цикл применения. Возвращает отчёт, а не падает: GUI должен
     /// показать, что именно сломалось и был ли выполнен откат.
+    ///
+    /// Строгая проверка: конфиг без единого прокси — ошибка. Так `Apply`
+    /// из GUI не «применяет» бессмысленный конфиг.
     pub async fn apply(&self, config: Config, reason: &str) -> ApplyReport {
+        self.apply_with(config, reason, true).await
+    }
+
+    /// То же, но с выбором строгости проверки.
+    ///
+    /// `reload` (SIGHUP) идёт сюда с `strict = false`: демон уже работает на
+    /// этом конфиге, и `connect` его принял — отказываться перечитать ту же
+    /// самую настройку только потому, что в ней один `DIRECT`, бессмысленно.
+    pub async fn apply_with(&self, config: Config, reason: &str, strict: bool) -> ApplyReport {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
 
@@ -152,7 +164,12 @@ impl Supervisor {
         let backup = Some(point.config_path.clone());
 
         // ── 2. Валидация без сети ─────────────────────────────────────────
-        if let Err(e) = config.validate() {
+        let valid = if strict {
+            config.validate()
+        } else {
+            config.validate_for_read()
+        };
+        if let Err(e) = valid {
             return ApplyReport {
                 ok: false,
                 stage: "validate".into(),

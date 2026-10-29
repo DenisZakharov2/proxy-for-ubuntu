@@ -14,6 +14,12 @@ use pfu::error::{Error, Result};
 use pfu::paths;
 
 fn main() -> ExitCode {
+    // Rust игнорирует SIGPIPE, и `println!` паникует на закрытом пайпе:
+    // `pfu-cli status | head -1` печатал трейсбек вместо тихого выхода.
+    // Возвращаем поведение обычных unix-утилит.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(code) => code,

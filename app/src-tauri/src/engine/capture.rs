@@ -53,19 +53,45 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Останавливает слушатели и дожидается, пока задачи отпустят сокеты:
-    /// повторный `start` (SIGHUP, повторный `connect`) должен найти порты
-    /// свободными. TUN останавливается последним — сначала отменяем потоки,
-    /// которые пишут в устройство.
+    /// Останавливает слушатели и TUN, дожидаясь, пока задачи отпустят
+    /// сокеты: повторный `start` (SIGHUP, повторный `connect`) должен найти
+    /// порты свободными. TUN останавливается последним — сначала отменяем
+    /// потоки, которые пишут в устройство.
     pub async fn stop(&mut self) {
-        tracing::info!("слушатели перехвата останавливаются");
-        self.abort();
-        for t in self.tasks.drain(..) {
-            let _ = t.await;
-        }
+        self.stop_listeners().await;
         if let Some(mut tun) = self.tun.take() {
             tun.stop().await;
         }
+    }
+
+    /// Останавливает только слушатели, оставляя TUN живым. Так `reload`
+    /// подменяет правила, не рвя уже открытые соединения: устройство и
+    /// потоки TUN принадлежат `Tun`, а не слушателям.
+    pub async fn stop_listeners(&mut self) {
+        tracing::info!("слушатели перехвата останавливаются");
+        self.cancel.cancel();
+        let handles = std::mem::take(&mut self.tasks);
+        // `abort` только просит задачу завершиться; `await` ждёт, пока её
+        // future уничтожен и сокет закрыт. Без второго шага следующий bind
+        // на 15000/15001 ловит EADDRINUSE (так и было при reload).
+        for t in &handles {
+            t.abort();
+        }
+        for t in handles {
+            let _ = t.await;
+        }
+    }
+
+    /// Забирает TUN, не останавливая его, — для переиспользования в
+    /// `start_with` при `reload`.
+    pub fn take_tun(&mut self) -> Option<super::tun::Tun> {
+        self.tun.take()
+    }
+
+    /// Конфиг работающего TUN: `reload` сравнивает его с новым, чтобы
+    /// понять, можно ли оставить устройство.
+    pub fn tun_config(&self) -> Option<&crate::config::TunConfig> {
+        self.tun.as_ref().map(|t| t.config())
     }
 
     fn abort(&mut self) {
@@ -85,15 +111,26 @@ impl Drop for Capture {
 /// Поднимает слушатели под текущий конфиг. Ошибка (занятый порт) приходит
 /// до применения правил, поэтому система остаётся нетронутой.
 pub async fn start(engine: Arc<Engine>) -> Result<Capture> {
+    start_with(engine, None).await
+}
+
+/// То же, но с готовым TUN: `reload` передаёт сюда живое устройство, чтобы
+/// не рвать открытые соединения. Движок TUN подменяется на новый — новые
+/// пакеты пойдут по свежим правилам, старые потоки останутся на своём.
+pub async fn start_with(engine: Arc<Engine>, reuse: Option<super::tun::Tun>) -> Result<Capture> {
     let cancel = CancellationToken::new();
     let mut tasks = Vec::new();
-    let mut tun = None;
+    let mut tun = reuse;
 
     // TUN первым: он создаёт устройство и маршрут в таблице 101. Если
     // дальше не получится занять порт, устройство снимается ниже — иначе
     // правила увели бы трафик в интерфейс, который никто не читает.
-    if engine.config.tun.enabled {
-        tun = Some(super::tun::Tun::start(engine.clone()).await?);
+    match tun.as_ref() {
+        Some(t) => t.swap_engine(engine.clone()).await,
+        None if engine.config.tun.enabled => {
+            tun = Some(super::tun::Tun::start(engine.clone()).await?);
+        }
+        None => {}
     }
 
     let listeners: Result<()> = async {

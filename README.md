@@ -12,7 +12,7 @@ QUIC. Ядро написано с нуля на Rust, без sing-box, Xray и 
 См. «Ограничения перехвата».
 
 [![Лицензия](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Версия](https://img.shields.io/badge/version-0.3.0-blue.svg)](CHANGELOG.md)
+[![Версия](https://img.shields.io/badge/version-0.3.1-blue.svg)](CHANGELOG.md)
 [![Платформа](https://img.shields.io/badge/Ubuntu-22.04%20|%2024.04-orange.svg)](https://ubuntu.com/)
 
 </div>

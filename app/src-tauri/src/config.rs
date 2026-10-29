@@ -505,7 +505,7 @@ impl Default for InterceptConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
     /// Включён ли перехват через TUN. Это отдельный режим: локальный трафик
