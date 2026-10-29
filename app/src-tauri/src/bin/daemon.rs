@@ -247,7 +247,13 @@ async fn run_check(strict: bool) -> Result<()> {
     let tun_device = std::path::Path::new("/dev/net/tun").exists();
     // TUN нужен только когда включён в конфиге: на хосте без модуля tun
     // демон обязан стартовать, если пользователь TUN не просил.
-    let tun_enabled = pfu::config::Config::load(
+    //
+    // Читаем мягкой проверкой (`load_for_read`): строгая `Config::load`
+    // отвергает конфиг без единого прокси, а это ровно состояние сразу
+    // после установки. С ней здесь `unwrap_or(false)` сообщал «TUN
+    // выключен» даже при `tun.enabled: true` и прятал отсутствующий
+    // `/dev/net/tun` от `--strict`.
+    let tun_enabled = pfu::config::Config::load_for_read(
         &paths::config_path(),
         &pfu::config::read_env_file(&paths::env_file()),
     )

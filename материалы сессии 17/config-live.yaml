@@ -1,0 +1,52 @@
+# Конфигурация для живой проверки TUN + DNS на этой машине (сессия 17).
+#
+# Отличия от установленной (0.1.2):
+#   * dns.strategy: redir-host  (миграция 0.3.0, fake-ip удалён);
+#   * tun.enabled: true         (проверяем локальный TCP/UDP через pfu0);
+#   * tun.mtu: 1500             (в старом файле было 9000 — крупные
+#                               датаграммы в обычную сеть не пролезают).
+#
+# Ставить: sudo install -m 0600 -o root -g root <этот файл> \
+#            /etc/proxy-for-ubuntu/config.yaml
+# Вернуть: sudo install -m 0600 -o root -g root \
+#            /etc/proxy-for-ubuntu/config.yaml.pre-0.3.0 \
+#            /etc/proxy-for-ubuntu/config.yaml
+api: 1
+
+log:
+  level: info
+  journal: true
+
+dns:
+  strategy: redir-host
+  cache_size: 4096
+  cache_ttl: 300
+  servers: [1.1.1.1, 8.8.8.8]
+  fallback: [9.9.9.9, 1.0.0.1]
+
+intercept:
+  tcp: redirect
+  udp: tproxy
+  # SSH наружу не перехватываем: иначе потеряете доступ к самой машине,
+  # если прокси ляжет.
+  exclude_ports: ["22"]
+  bypass_private: true
+  loop_protect: true
+
+tun:
+  enabled: true
+  device: pfu0
+  mtu: 1500
+
+geo:
+  auto_update: true
+  update_interval_hours: 24
+  sources: []
+
+outbounds:
+  - name: DIRECT
+    type: direct
+
+rules: []
+
+final: DIRECT

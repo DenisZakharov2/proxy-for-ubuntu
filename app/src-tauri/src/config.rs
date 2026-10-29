@@ -1586,6 +1586,21 @@ rules:
     }
 
     #[test]
+    fn load_for_read_sees_tun_in_a_direct_only_config() {
+        // Свежая установка: единственный outbound — DIRECT. Строгий `load`
+        // такой конфиг отвергает, поэтому `--check` обязан читать
+        // `load_for_read`: иначе `unwrap_or(false)` сообщает «TUN выключен»
+        // при `tun.enabled: true` и прячет отсутствующий /dev/net/tun.
+        let yaml = "tun:\n  enabled: true\noutbounds:\n  - {name: DIRECT, type: direct}\n";
+        let p = std::env::temp_dir().join(format!("pfu-tun-{}.yaml", std::process::id()));
+        std::fs::write(&p, yaml).unwrap();
+        assert!(Config::load(&p, &HashMap::new()).is_err());
+        let cfg = Config::load_for_read(&p, &HashMap::new()).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert!(cfg.tun.enabled);
+    }
+
+    #[test]
     fn tun_requires_interception() {
         let yaml = r#"
 tun:

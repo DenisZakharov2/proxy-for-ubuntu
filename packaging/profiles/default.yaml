@@ -31,7 +31,9 @@ intercept:
 tun:
   enabled: false
   device: pfu0
-  mtu: 9000
+  # 1500, а не 9000: крупная датаграмма в обычной сети не пролезет,
+  # а TUN-стек её не фрагментирует.
+  mtu: 1500
 
 geo:
   auto_update: true
